@@ -30,8 +30,11 @@ class DQNAgent:
         self.device = device or torch.device("cpu")
 
         self.model = DQNCNN(input_channels, num_actions).to(self.device)
-        self.target_model = copy.deepcopy(self.model).to(self.device)
+        self.target_model = DQNCNN(input_channels, num_actions).to(self.device)
+        self.target_model.load_state_dict(self.model.state_dict())
         self.target_model.eval()
+
+
 
         self.target_update_freq = target_update_freq
         self.learn_steps = 0
@@ -51,13 +54,15 @@ class DQNAgent:
 
         self.last_loss = None
 
+
     def select_action(self, state):
         if random.random() < self.epsilon:
             return random.randrange(self.num_actions)
 
         # ✅ state는 항상 float32로
         state = np.asarray(state, dtype=np.float32)
-        state_t = torch.from_numpy(state).unsqueeze(0).unsqueeze(0).to(self.device)
+        state_t = torch.from_numpy(state).unsqueeze(0).to(self.device)
+
 
         with torch.no_grad():
             q_values = self.model(state_t)
@@ -77,8 +82,9 @@ class DQNAgent:
         dones = np.array(dones, dtype=np.float32)  # 0.0/1.0
         actions = np.array(actions, dtype=np.int64)
 
-        states_t = torch.from_numpy(states).unsqueeze(1).to(self.device)       # (B,1,84,84)
-        next_states_t = torch.from_numpy(next_states).unsqueeze(1).to(self.device)
+        states_t = torch.from_numpy(states).to(self.device)
+        next_states_t = torch.from_numpy(next_states).to(self.device)
+
         actions_t = torch.from_numpy(actions).to(self.device)                  # (B,)
         rewards_t = torch.from_numpy(rewards).to(self.device)                  # (B,)
         dones_t = torch.from_numpy(dones).to(self.device)                      # (B,)
@@ -87,7 +93,14 @@ class DQNAgent:
         q_value = q_values.gather(1, actions_t.unsqueeze(1)).squeeze(1)
 
         with torch.no_grad():
-            next_q = self.target_model(next_states_t).max(1)[0]
+            # 1) 다음 상태에서 행동 선택은 model
+            next_actions = self.model(next_states_t).argmax(dim=1)
+
+            # 2) 선택된 행동의 가치는 target_model로 평가
+            next_q = self.target_model(next_states_t) \
+                .gather(1, next_actions.unsqueeze(1)) \
+                .squeeze(1)
+
 
         target = rewards_t + self.gamma * next_q * (1.0 - dones_t)
 
@@ -119,14 +132,34 @@ class DQNAgent:
             "optimizer": self.optimizer.state_dict(),
             "epsilon": self.epsilon,
             "learn_steps": self.learn_steps,
+            "replay": self.memory.state_dict(),   # ✅ 추가
         }, path)
 
-    def load(self, path, load_optimizer=True):
-        ckpt = torch.load(path, map_location=self.device)
+
+    def load(self, path, load_optimizer=True, load_replay=True):
+        # ✅ PyTorch 2.6+ 대응: replay 같은 객체 포함이면 weights_only=False 필요
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
+
         self.model.load_state_dict(ckpt["model"])
         self.target_model.load_state_dict(ckpt.get("target_model", ckpt["model"]))
+        self.target_model.eval()
+
         if load_optimizer and "optimizer" in ckpt:
             self.optimizer.load_state_dict(ckpt["optimizer"])
+
         self.epsilon = float(ckpt.get("epsilon", self.epsilon))
         self.learn_steps = int(ckpt.get("learn_steps", self.learn_steps))
-        self.target_model.eval()
+
+        if load_replay and ("replay" in ckpt):
+            self.memory.load_state_dict(ckpt["replay"])
+            print(f"[DEBUG] replay buffer loaded: {len(self.memory)} samples")
+
+    def select_action_eval(self, state):
+        # 평가 모드: 탐험 없이(거의) greedy
+        state = np.asarray(state, dtype=np.float32)
+        state_t = torch.from_numpy(state).unsqueeze(0).to(self.device)
+
+        with torch.no_grad():
+            q_values = self.model(state_t)
+
+        return int(q_values.argmax(dim=1).item())

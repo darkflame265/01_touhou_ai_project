@@ -1,4 +1,3 @@
-# models/low/cnn_dqn.py
 import torch
 import torch.nn as nn
 
@@ -16,6 +15,9 @@ class DQNCNN(nn.Module):
             nn.ReLU()
         )
 
+        # ✅ 해상도 무관 핵심
+        self.pool = nn.AdaptiveAvgPool2d((7, 7))
+
         self.fc = nn.Sequential(
             nn.Linear(64 * 7 * 7, 512),
             nn.ReLU(),
@@ -25,5 +27,6 @@ class DQNCNN(nn.Module):
     def forward(self, x):
         x = x / 255.0
         x = self.conv(x)
+        x = self.pool(x)                 # 🔥 이 줄이 핵심
         x = x.view(x.size(0), -1)
         return self.fc(x)

@@ -18,7 +18,8 @@ def find_touhou_window():
     return target_hwnd
 
 class Screen:
-    def __init__(self):
+    def __init__(self, mode="low"):
+        self.mode = mode
         self.sct = mss.mss()
         self.hwnd = find_touhou_window()
 
@@ -52,9 +53,12 @@ class Screen:
 
     def preprocess(self, img):
         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        resized = cv2.resize(gray, (84, 84))
-        normalized = (resized / 255.0).astype(np.float32)
-        return normalized
+        if self.mode == "low":
+            resized = cv2.resize(gray, (84, 84), interpolation=cv2.INTER_AREA)
+        else:
+            resized = cv2.resize(gray, (160, 120), interpolation=cv2.INTER_AREA)
+        return resized.astype(np.float32)
+
 
 
     def detect_death(self, img):
