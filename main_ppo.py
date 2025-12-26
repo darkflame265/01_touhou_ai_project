@@ -7,6 +7,8 @@ from collections import Counter
 import re
 import tempfile
 
+import cv2
+
 from env.game_env import GameEnv
 from env.controller import release_all, set_attack_hold
 from env.controller import cleanup_inputs_on_exit
@@ -50,7 +52,6 @@ def boot_print_state(env):
     st = detect_location(env.screen)
     print(f"[BOOT] state={st.get('state')} selected={st.get('selected_name')}")
 
-    # 철학: OTHER는 정상임(난이도/옵션/인게임/일러스트 전부 OTHER)
     if st.get("state") == "SCORE":
         print("[BOOT] SCORE 감지됨: boot_into_practice()가 알아서 복구할 것")
     elif st.get("state") == "LOBBY":
@@ -90,9 +91,6 @@ def _safe_save_checkpoint(agent, ckpt_path: str) -> bool:
         return False
 
 
-# =========================================================
-# ✅ 누적 최고기록(STATS) 관리
-# =========================================================
 STATS_BEGIN = "# === PPO_STATS_BEGIN ==="
 STATS_END = "# === PPO_STATS_END ==="
 
@@ -255,20 +253,17 @@ def _stats_one_line(stats: dict) -> str:
 
 
 def _apply_no_render(env: GameEnv):
-    # reimu heatmap/debug 창
     try:
         env.show_reimu_debug = False
     except Exception:
         pass
 
-    # ObsBuilder crop 디버그 창
     try:
         if hasattr(env, "obs") and hasattr(env.obs, "show_obs_debug"):
             env.obs.show_obs_debug = False
     except Exception:
         pass
 
-    # (구 DebugViz가 남아있으면 끄기)
     dbg = getattr(env, "debug", None)
     if dbg is not None:
         for name, val in (
@@ -292,12 +287,33 @@ def _append_run_header(log_path: str, run_ts: str, episodes: int, is_eval: bool,
         f.write("idx\treward\tsurvival_sec\tnote\n")
 
 
+def _pump_cv_key_and_forward_to_obs(env: GameEnv) -> int:
+    """
+    ✅ OpenCV 이벤트 펌프는 main loop에서 1번만.
+    - 여기서 waitKey로 키를 읽고
+    - obs_builder(=env.obs) 쪽에 pump_key가 있으면 전달한다.
+    """
+    key = cv2.waitKey(1) & 0xFF
+    if key == 255:
+        return -1
+
+    obs = getattr(env, "obs", None)
+    if obs is not None:
+        pump = getattr(obs, "pump_key", None)
+        if callable(pump):
+            try:
+                pump(key)
+            except Exception:
+                pass
+
+    return int(key)
+
+
 def main():
     args = parse_args()
     is_eval = bool(args.eval)
 
     CKPT_PATH = "checkpoints/lunatic_v1_ch4.pth"
-
     os.makedirs(os.path.dirname(CKPT_PATH), exist_ok=True)
 
     pth_name = os.path.splitext(os.path.basename(CKPT_PATH))[0]
@@ -324,25 +340,19 @@ def main():
     agent = PPOAgent(
         input_channels=input_channels,
         num_actions=len(ACTIONS),
-        obs_channels_per_frame=obs_channels,   # ✅ 이거 추가!
+        obs_channels_per_frame=obs_channels,
     )
 
-    # ✅ eval이면 "로드만" 권장, 그래도 파일 있으면 로드하고 없으면 그냥 진행
     if os.path.exists(CKPT_PATH):
         agent.load(CKPT_PATH, load_optimizer=False)
         print(f"[PPO] checkpoint loaded: {CKPT_PATH}")
     else:
         print("[PPO] no checkpoint found, training from scratch" if not is_eval else "[PPO][EVAL] no checkpoint found (evaluating random policy)")
 
-    # =========================================================
-    # ✅ 액션공간 전환기: ckpt 로드 후 하이퍼파라미터 강제 재설정
-    #    (8방향 고정 + 상시 slow 최적화)
-    # =========================================================
     agent.ent_coef = 0.04
     agent.ent_min = 0.005
     agent.ent_decay = 0.9995
     agent.ent_warmup_updates = 30
-
     agent.clip_eps = 0.15
     agent.rollout_steps = 128
     agent.update_epochs = 5
@@ -355,7 +365,6 @@ def main():
         f"rollout_steps={agent.rollout_steps}, "
         f"update_epochs={agent.update_epochs}"
     )
-
 
     print("\n[INFO] ESC 중단: Windows 전역 감지(GetAsyncKeyState)")
     print(" - 게임 창이 포커스여도 ESC를 잡고 즉시 종료합니다.\n")
@@ -382,7 +391,10 @@ def main():
             safe_release_inputs()
             state = env.reset()
 
-            # 디버그(원하면 지워도 됨)
+            # reset 직후에도 창이 “바로” 떠야 하면, 여기서도 1번 펌프해줘도 좋다.
+            if not args.no_render:
+                _pump_cv_key_and_forward_to_obs(env)
+
             try:
                 print("[DBG] state.shape =", state.shape, "dtype=", state.dtype, "min/max=", float(state.min()), float(state.max()))
             except Exception:
@@ -415,7 +427,6 @@ def main():
 
                 next_state, reward, done = env.step(action_idx)
 
-                # ✅ eval 모드면 학습 버퍼에 저장하지 않음
                 if not is_eval:
                     exec_idx = getattr(env.s, "exec_action_idx", action_idx)
                     agent.store(state, exec_idx, reward, done, log_prob, value)
@@ -424,9 +435,12 @@ def main():
                 total_reward += reward
                 steps += 1
 
-                # ✅ eval 모드면 update 자체를 하지 않음
                 if (not is_eval) and agent.should_update():
                     agent.update(last_state=state, last_done=done)
+
+                # ✅ OpenCV 이벤트 펌프: 여기서만 1번 + obs_builder로 키 전달
+                if not args.no_render:
+                    _pump_cv_key_and_forward_to_obs(env)
 
             survival_sec = time.time() - ep_t0
             slow_ratio = slow_count / max(1, steps)
@@ -445,12 +459,10 @@ def main():
                 f"top_actions={top_actions_str} {note}"
             )
 
-            # ✅ (중요) eval이어도 에피소드 결과 라인은 항상 로그에 남긴다
             ep_tag = f"({ep}/{args.episodes})"
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"{ep_tag}\t{total_reward:.6f}\t{survival_sec:.3f}\t{note}\n")
 
-            # ✅ eval이면 STATS/체크포인트 갱신은 절대 안 함
             if aborted:
                 if not is_eval:
                     _try_clear_agent_rollout(agent)
@@ -470,7 +482,6 @@ def main():
                 else:
                     print("[WARN] checkpoint save failed -> continue training without stopping")
             else:
-                # eval은 stats 고정 출력(변화 없음)
                 print(_stats_one_line(stats))
 
             if stop_requested:
@@ -482,6 +493,11 @@ def main():
 
     finally:
         cleanup_inputs_on_exit()
+        if not args.no_render:
+            try:
+                cv2.destroyAllWindows()
+            except Exception:
+                pass
 
     print("\n[PPO] Finished.")
 

@@ -10,21 +10,16 @@ from env.env_state import EnvState
 from env.episode_guard import EpisodeGuard
 from env.ui_guard import UIGuard
 from env.reward_engine import RewardEngine
-from env.debug_viz import DebugViz
 from env.obs_builder import ObsBuilder
-from env.reimu_debug_viz import ReimuDebugViz
 
 from env.action_masking import ActionMasker, MaskingConfig
 
 
 class GameEnv:
     """
-    ✅ 루나틱 회피 학습용
-    + ✅ 성능 프로파일링(중복 프레임 누적, 구간별 ms)
-    + ✅ (NEW) 중복 프레임 스킵/재캡처 로직
-       - 같은 프레임이 잡히면: (1) 짧게 sleep 후 재캡처 몇 번 시도
-       - 그래도 같은 프레임이면: "관측/판정/마스킹 재적용"을 스킵하고
-         prev_state 유지 + reward를 0 처리(기본)
+    루나틱 회피 학습용
+    - DUP FRAME SKIP 포함
+    - frame_stack을 채널 concat으로 반환 (C_total,H,W)
     """
 
     def __init__(self, screen_mode="low"):
@@ -39,11 +34,9 @@ class GameEnv:
         self.s.action_repeat = 1
         self.s.frame_sleep = 0.012
 
-        # 관측
-        self.debug = DebugViz()
+        # 관측 (debug_viz 제거: 필요없음)
         self.obs = ObsBuilder(
             self.screen,
-            debug_viz=self.debug,
             obs_out_size=128,
             crop_size=256,
             use_fallback_full_preprocess=True,
@@ -60,7 +53,7 @@ class GameEnv:
         self.y_floor = 0.60
         self.y_zone_enter_pen = 1.5
         self.y_zone_stay_pen_k = 0.08
-        self.y_pen_conf_thr = 0.02
+        self.y_pen_conf_thr = 0.02  # (기본 OFF 로직 유지)
 
         self.top_soft_y = 0.20
         self.right_soft_x = 0.80
@@ -81,7 +74,7 @@ class GameEnv:
         )
         self.masker = ActionMasker(self.screen, self.obs, self.mask_cfg)
 
-        # 기록/디버그
+        # 기록
         self.s.exec_action_idx = 0
         self.s.exec_was_masked = False
         self._masked_count = 0
@@ -91,18 +84,15 @@ class GameEnv:
         self.s.episode_end_reason = ""
         self.s.episode_end_pen = 0.0
 
-        self.show_reimu_debug = True
-        self.reimu_debug = ReimuDebugViz()
-
         # =========================
-        # ✅ DUP FRAME SKIP (NEW)
+        # DUP FRAME SKIP
         # =========================
         self.skip_dup_frames = True
-        self.dup_retry = 2           # dup면 추가로 몇 번 더 캡처해볼지
-        self.dup_sleep = 0.012       # 재캡처 사이 sleep(초)
-        self.dup_reward_zero = True  # True면 dup 프레임에서 reward=0, False면 alive_reward 유지
-        self.dup_thr_mean_abs = 0.05 # dup 판정 mean_abs 기준(너의 기존값)
-        self.dup_sample_stride = 8   # 샘플 다운샘플 간격(너의 기존값)
+        self.dup_retry = 2
+        self.dup_sleep = 0.012
+        self.dup_reward_zero = True
+        self.dup_thr_mean_abs = 0.05
+        self.dup_sample_stride = 8
 
         # PROFILING
         self._prof_enable = True
@@ -119,41 +109,26 @@ class GameEnv:
         self._prof_sum_obs = 0.0
         self._prof_sum_mask = 0.0
         self._prof_sum_ctrl = 0.0
-        self._prof_sum_dbg = 0.0
 
         self._prof_last_mean_abs = None
         self._prof_last_max_abs = None
 
     def _as_chw(self, obs: np.ndarray) -> np.ndarray:
-        """
-        ObsBuilder가 (H,W) 또는 (C,H,W)를 반환한다고 가정.
-        - (H,W)면 (1,H,W)로 변환
-        - (H,W,C) 같은 형태는 여기선 지원 안 함(필요하면 추가 가능)
-        """
         if obs is None:
             return None
         obs = np.asarray(obs)
         if obs.ndim == 2:
-            return obs[None, :, :]  # (1,H,W)
+            return obs[None, :, :]
         if obs.ndim == 3:
-            return obs  # (C,H,W)
+            return obs
         raise ValueError(f"Unexpected obs shape: {obs.shape}")
 
     def _pack_frames_concat(self) -> np.ndarray:
-        """
-        frame_stack(list of obs)를 채널 축으로 concat해서 (C_total,H,W)로 반환.
-        """
         if len(self.s.frame_stack) == 0:
-            # 안전장치
             return self._as_chw(self.s.prev_state)
-
         frames = [self._as_chw(x) for x in list(self.s.frame_stack)]
-        # frames: [(C,H,W), (C,H,W), ...]
-        return np.concatenate(frames, axis=0)  # (T*C, H, W)
+        return np.concatenate(frames, axis=0)
 
-    # -------------------------
-    # Utils
-    # -------------------------
     def _ep_add(self, x: float):
         try:
             self.s.ep_total_reward += float(x)
@@ -161,15 +136,14 @@ class GameEnv:
             pass
 
     def _end_episode(self, pen: float, reason: str):
-            self.guard.set_terminated()
-            self.s.episode_end_reason = str(reason)
-            self.s.episode_end_pen = float(pen)
-            self._ep_add(pen)
+        self.guard.set_terminated()
+        self.s.episode_end_reason = str(reason)
+        self.s.episode_end_pen = float(pen)
+        self._ep_add(pen)
 
-            # ✅ prev_state를 frame_stack에 넣고 concat 반환
-            self.s.frame_stack.append(self.s.prev_state)
-            packed = self._pack_frames_concat()
-            return packed, float(pen), True
+        self.s.frame_stack.append(self.s.prev_state)
+        packed = self._pack_frames_concat()
+        return packed, float(pen), True
 
     def _get_playfield_xy_norm_for_shaping(self):
         x_n, y_n = getattr(self.obs, "last_xy_norm", (None, None))
@@ -236,7 +210,6 @@ class GameEnv:
         self._prof_sum_obs = 0.0
         self._prof_sum_mask = 0.0
         self._prof_sum_ctrl = 0.0
-        self._prof_sum_dbg = 0.0
 
         self._prof_last_mean_abs = None
         self._prof_last_max_abs = None
@@ -252,9 +225,6 @@ class GameEnv:
         return ch0[::s, ::s].astype(np.uint8, copy=False)
 
     def _prof_update_frame_dup(self, img: np.ndarray) -> bool:
-        """
-        returns: is_dup (bool)
-        """
         if not self._prof_enable:
             return False
 
@@ -315,22 +285,16 @@ class GameEnv:
         obs_ms = (self._prof_sum_obs / denom) * 1000.0
         mask_ms = (self._prof_sum_mask / denom) * 1000.0
         ctrl_ms = (self._prof_sum_ctrl / denom) * 1000.0
-        dbg_ms = (self._prof_sum_dbg / denom) * 1000.0
 
         print(
             "  [PROF] avg_ms/step | "
-            f"capture={cap_ms:.2f} ui={ui_ms:.2f} obs={obs_ms:.2f} mask={mask_ms:.2f} ctrl={ctrl_ms:.2f} dbg={dbg_ms:.2f}"
+            f"capture={cap_ms:.2f} ui={ui_ms:.2f} obs={obs_ms:.2f} mask={mask_ms:.2f} ctrl={ctrl_ms:.2f}"
         )
 
     # =========================
     # DUP frame handling
     # =========================
     def _capture_with_dup_retry(self):
-        """
-        returns: (img_bgr, is_dup_final)
-        - 첫 캡처가 dup이면 짧게 대기 후 재캡처를 dup_retry 만큼 시도
-        - 최종적으로도 dup이면 is_dup_final=True
-        """
         t0 = time.perf_counter()
         img = self.screen.capture()
         self._prof_sum_capture += (time.perf_counter() - t0)
@@ -390,7 +354,6 @@ class GameEnv:
         state = self.obs.make_state(img)
         self._prof_sum_obs += (time.perf_counter() - t1)
 
-        # ✅ prev_state는 (C,H,W) 형태로 저장
         self.s.prev_state = self._as_chw(state)
 
         t2 = time.perf_counter()
@@ -398,7 +361,6 @@ class GameEnv:
         self.s.prev_ui_lives = self.ui.ui_lives_safe(img, ui_ok)
         self._prof_sum_ui += (time.perf_counter() - t2)
 
-        # frame_stack 초기화
         self.s.frame_stack.clear()
         for _ in range(self.s.frame_stack_size):
             self.s.frame_stack.append(self.s.prev_state)
@@ -415,7 +377,6 @@ class GameEnv:
         set_attack_hold(True)
         set_always_slow(True)
 
-        # ✅ concat 반환 (C_total,H,W)
         return self._pack_frames_concat()
 
     def step(self, action_idx):
@@ -425,12 +386,9 @@ class GameEnv:
             for _ in range(6):
                 release_all()
                 time.sleep(0.02)
-            # ✅ concat 반환
             return self._pack_frames_concat(), 0.0, True
 
-        # ---------
-        # Abort 사전 체크 (pre_img)
-        # ---------
+        # pre capture (abort check)
         pre_img, pre_is_dup = self._capture_with_dup_retry()
 
         if self.skip_dup_frames and pre_is_dup:
@@ -446,7 +404,7 @@ class GameEnv:
                 self._prof_maybe_print()
                 return self._end_episode(self.abort_pen, "ABORT:UI_ABSENT(pre)")
 
-        # 입력 + 초기 마스킹
+        # initial masking
         t2 = time.perf_counter()
         masked_idx, was_masked, _ = self.masker.apply_action_mask(action_idx, pre_img)
         self._prof_sum_mask += (time.perf_counter() - t2)
@@ -464,35 +422,25 @@ class GameEnv:
 
         total_reward = 0.0
 
-        # ---------
-        # action_repeat loop
-        # ---------
         for _ in range(self.s.action_repeat):
             if self.s.frame_sleep > 0:
                 time.sleep(self.s.frame_sleep)
 
             img, is_dup = self._capture_with_dup_retry()
 
-            # -------------------------
-            # DUP FRAME: heavy parts skip
-            # -------------------------
+            # DUP frame skip heavy parts
             if self.skip_dup_frames and is_dup:
                 reward = 0.0 if self.dup_reward_zero else float(self.alive_reward)
-
-                # ✅ prev_state는 이미 (C,H,W), 그대로 쌓기
                 self.s.frame_stack.append(self.s.prev_state)
-
                 total_reward += float(reward)
                 self._ep_add(float(reward))
                 self._step_count += 1
-
                 self._prof_maybe_print()
                 continue
 
-            # fresh frame
             g = self.screen.gray(img)
 
-            # UI 체크
+            # UI check
             t5 = time.perf_counter()
             ui_ok = self.screen.ui_panel_present(img, gray=g)
             self.ui.update_ui_absent(ui_ok)
@@ -507,15 +455,13 @@ class GameEnv:
                 self._prof_maybe_print()
                 return self._pack_frames_concat(), float(total_reward), True
 
-            # 관측 업데이트
+            # obs
             t6 = time.perf_counter()
             state = self.obs.make_state(img)
             self._prof_sum_obs += (time.perf_counter() - t6)
-
-            # ✅ prev_state는 (C,H,W)로 고정
             state_chw = self._as_chw(state)
 
-            # 마스킹 재적용
+            # re-mask
             t7 = time.perf_counter()
             cur_idx, cur_was_masked, _ = self.masker.apply_action_mask(masked_idx, img)
             self._prof_sum_mask += (time.perf_counter() - t7)
@@ -531,7 +477,6 @@ class GameEnv:
                 release_all()
                 press_keys(action.value)
                 self._prof_sum_ctrl += (time.perf_counter() - t8)
-
             elif cur_was_masked:
                 self.s.exec_was_masked = True
                 self._masked_count += 1
@@ -546,7 +491,7 @@ class GameEnv:
                 reward += self._y_zone_penalty(y_n, conf)
                 reward += self._position_shaping_penalty(x_n, y_n)
 
-            # death 판정
+            # death
             _, gameover_fx = self.screen.detect_death(img, gray=g)
             if gameover_fx:
                 for _ in range(3):
@@ -562,7 +507,7 @@ class GameEnv:
                 self._prof_maybe_print()
                 return self._pack_frames_concat(), float(total_reward), True
 
-            # hit 판정
+            # hit
             t_ui_lives = time.perf_counter()
             ui_now = self.ui.ui_lives_safe(img, ui_ok)
             self._prof_sum_ui += (time.perf_counter() - t_ui_lives)
@@ -594,9 +539,6 @@ class GameEnv:
                         print(f"[WARN] obs.on_player_death failed: {e}")
 
             self.s.prev_ui_lives = ui_now
-
-            # (디버그는 그대로 두되, return은 concat 기준)
-            # ---- (중간 디버그 show_reimu_debug 부분은 기존 그대로 둬도 OK) ----
 
             self.s.prev_state = state_chw
             self.s.frame_stack.append(self.s.prev_state)
