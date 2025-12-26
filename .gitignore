@@ -2,8 +2,14 @@
 .venv/
 venv/
 
+*.zip
+*.7z
+*.rar
+
 .checkpoints/
 checkpoints/
+
+.01_touhou_ai.zip
 
 ## png가 대량 저장된 폴더는 제외외
 vision/datasets/raw_playfield
