@@ -24,7 +24,7 @@ CV 기반 레이무 트래커 (touhou_02 reimu_track_test.py 방식 그대로 �
 - get_debug()로 ROI/candidates/lock_cand/locked_bbox 제공
 - LOCK 상태에서는 candidates/lock_cand를 비움(그리지 않게)
 """
-
+#ss
 from __future__ import annotations
 
 from dataclasses import dataclass
