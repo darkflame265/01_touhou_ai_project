@@ -84,7 +84,7 @@ class ObsBuilder:
         # -------------------------
         # ✅ OBS 디버그 창(가운데 화면만 크게)
         # -------------------------
-        self.show_obs_debug = True
+        self.show_obs_debug = False
         self.win_crop = "OBS_CROP"
         self._obs_win_inited = False
         self._obs_win_pos = (1600, 60)
