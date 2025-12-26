@@ -21,11 +21,87 @@ from agents.ppo_agent import PPOAgent
 
 import ctypes
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+
 VK_ESCAPE = 0x1B
+VK_R = 0x52  # 'R'
 
 
 def esc_pressed() -> bool:
     return (user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0
+
+
+def r_pressed_edge(_state={"prev": False}) -> bool:
+    down = (user32.GetAsyncKeyState(VK_R) & 0x8000) != 0
+    edge = down and (not _state["prev"])
+    _state["prev"] = down
+    return edge
+
+
+def _force_reimu_redetect(env: GameEnv) -> bool:
+    """
+    env 내부 어디에 레이무 트래커가 있든 reset()을 찾아 호출한다.
+    성공하면 True.
+    """
+    # 1) env.reimu_tracker (가장 흔함)
+    tr = getattr(env, "reimu_tracker", None)
+    if tr is not None:
+        fn = getattr(tr, "reset", None)
+        if callable(fn):
+            try:
+                fn()
+                return True
+            except Exception:
+                pass
+
+    # 2) env.obs.reimu_tracker / env.obs.tracker / env.obs.reimu
+    obs = getattr(env, "obs", None)
+    if obs is not None:
+        for attr in ("reimu_tracker", "tracker", "reimu"):
+            tr = getattr(obs, attr, None)
+            if tr is None:
+                continue
+            fn = getattr(tr, "reset", None)
+            if callable(fn):
+                try:
+                    fn()
+                    return True
+                except Exception:
+                    pass
+
+        # 3) env.obs 내부에 tracker holder가 있는 경우
+        #    (예: obs.trk.reimu_tracker 같은 구조)
+        for holder_attr in ("trk", "track", "trackers", "detector"):
+            holder = getattr(obs, holder_attr, None)
+            if holder is None:
+                continue
+            for attr in ("reimu_tracker", "tracker", "reimu"):
+                tr = getattr(holder, attr, None)
+                if tr is None:
+                    continue
+                fn = getattr(tr, "reset", None)
+                if callable(fn):
+                    try:
+                        fn()
+                        return True
+                    except Exception:
+                        pass
+
+    # 4) env.debug 쪽에 뭔가 달려있는 경우
+    dbg = getattr(env, "debug", None)
+    if dbg is not None:
+        for attr in ("reimu_tracker", "tracker", "reimu"):
+            tr = getattr(dbg, attr, None)
+            if tr is None:
+                continue
+            fn = getattr(tr, "reset", None)
+            if callable(fn):
+                try:
+                    fn()
+                    return True
+                except Exception:
+                    pass
+
+    return False
 
 
 def parse_args():
@@ -391,7 +467,6 @@ def main():
             safe_release_inputs()
             state = env.reset()
 
-            # reset 직후에도 창이 “바로” 떠야 하면, 여기서도 1번 펌프해줘도 좋다.
             if not args.no_render:
                 _pump_cv_key_and_forward_to_obs(env)
 
@@ -410,6 +485,13 @@ def main():
             aborted = False
 
             while not done:
+                # ✅ R (전역) 누르면 레이무 트래커 강제 reset -> 초록박스(LOCK) 해제 -> 재탐색
+                if r_pressed_edge():
+                    ok = _force_reimu_redetect(env)
+                    if ok:
+                        safe_release_inputs()  # 키 리셋하는 김에 입력도 안전하게
+                    # 성공/실패 여부 상관없이 계속 진행
+
                 if esc_pressed():
                     stop_requested = True
                     aborted = True
@@ -438,7 +520,6 @@ def main():
                 if (not is_eval) and agent.should_update():
                     agent.update(last_state=state, last_done=done)
 
-                # ✅ OpenCV 이벤트 펌프: 여기서만 1번 + obs_builder로 키 전달
                 if not args.no_render:
                     _pump_cv_key_and_forward_to_obs(env)
 

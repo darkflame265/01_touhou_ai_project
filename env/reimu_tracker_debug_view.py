@@ -9,8 +9,9 @@ touhou_02(reimu_track_test.py)와 동일하게:
 - locked: 초록 박스(thickness=2) + 초록 텍스트(scale=0.6, thickness=2)
 
 요청사항 반영:
-- LOCK 확정 텍스트는 "w x h"만 표시
 - ✅ LOCK 상태에서는 candidates/lock_cand를 그리지 않음(touhou_02 느낌 그대로)
+- ✅ lock_cand(주황) 텍스트는 "LOCK"만 표시(수치 제거)
+- locked(초록) 텍스트는 touhou_02처럼 수치 표시
 - R: tracker.reset()
 """
 
@@ -47,7 +48,7 @@ class DebugViewConfig:
     lock_cand_text_thickness: int = 2
 
     # colors (BGR) touhou_02 동일
-    color_roi: Tuple[int, int, int] = (255, 0, 0)         # Blue
+    color_roi: Tuple[int, int, int] = (255, 0, 0)          # Blue
     color_candidates: Tuple[int, int, int] = (0, 255, 255) # Yellow
     color_lock_cand: Tuple[int, int, int] = (0, 128, 255)  # Orange
     color_locked: Tuple[int, int, int] = (0, 255, 0)       # Green
@@ -145,17 +146,16 @@ class ReimuTrackerDebugView:
                 b2 = _clamp_bbox(tuple(b), W, H)
                 _draw_bbox(vis, b2, self.cfg.color_candidates, self.cfg.cand_thickness)
 
-            # lock candidate (orange) + 텍스트
+            # lock candidate (orange) + 텍스트(LOCK만)
             lc = dbg.get("lock_cand", None)
             if lc is not None:
                 b2 = _clamp_bbox(tuple(lc), W, H)
                 _draw_bbox(vis, b2, self.cfg.color_lock_cand, self.cfg.lock_cand_thickness)
 
                 x, y, w, h = b2
-                area = int(w * h)
                 cv2.putText(
                     vis,
-                    f"LOCK CAND size={w}x{h} area={area}",
+                    "LOCK",
                     (x, max(0, y - 6)),
                     self.cfg.font,
                     float(self.cfg.lock_cand_text_scale),
@@ -163,21 +163,22 @@ class ReimuTrackerDebugView:
                     int(self.cfg.lock_cand_text_thickness),
                 )
 
-        # locked (green) + "w x h"만 표시 (요청사항)
+        # locked (green) + touhou_02처럼 수치 표시
         lb = dbg.get("locked_bbox", None)
         if lb is not None:
             b2 = _clamp_bbox(tuple(lb), W, H)
             _draw_bbox(vis, b2, self.cfg.color_locked, self.cfg.locked_thickness)
 
             x, y, w, h = b2
+            area = int(w * h)
             cv2.putText(
                 vis,
-                f"{w}x{h}",
+                f"REIMU (CSRT) size={w}x{h} area={area}",
                 (x, max(0, y - 6)),
                 self.cfg.font,
-                float(self.cfg.locked_text_scale),
-                self.cfg.color_locked,
-                int(self.cfg.locked_text_thickness),
+                float(self.cfg.locked_text_scale),    # 0.6
+                self.cfg.color_locked,                # (0,255,0)
+                int(self.cfg.locked_text_thickness),  # 2
             )
 
         cv2.imshow(self.cfg.window_name, vis)

@@ -2,6 +2,9 @@
 .venv/
 venv/
 
+.checkpoints/
+checkpoints/
+
 ## png가 대량 저장된 폴더는 제외외
 vision/datasets/raw_playfield
 **/pyvenv.cfg

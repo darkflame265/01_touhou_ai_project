@@ -1,6 +1,6 @@
 # env/reimu_tracker_cv.py
 """
-CV 기반 레이무 트래커 (touhou_02 reimu_track_test.py 방식을 그대로 클래스화)
+CV 기반 레이무 트래커 (touhou_02 reimu_track_test.py 방식 그대로 클래스화)
 
 원리(=touhou_02 그대로):
 - ROI: 고정 사각형(LEFT/TOP/RIGHT_MARGIN/BOTTOM_MARGIN)
@@ -13,16 +13,16 @@ CV 기반 레이무 트래커 (touhou_02 reimu_track_test.py 방식을 그대로
   - 일정 시간 동안 크기 안정적인 track만 LOCK 후보 선정
 - LOCK 후:
   - CSRT tracker로만 추적
-  - 추적 실패 시에만 detector+tracker reset 후 재탐색
+  - R 누르기 전까지 절대 unlock 하지 않음 (외부에서 reset() 호출)
 
 출력:
 - step(frame, now=None) -> (bbox_xywh or None, conf)
   - LOCK 성공/유지: (bbox, 1.0)
   - 그 외: (None, 0.0)
 
-디버그:
+디버그(그리기용 데이터만):
 - get_debug()로 ROI/candidates/lock_cand/locked_bbox 제공
-- LOCK 상태에서는 touhou_02 느낌 그대로 candidates/lock_cand를 비움(그리지 않게)
+- LOCK 상태에서는 candidates/lock_cand를 비움(그리지 않게)
 """
 
 from __future__ import annotations
@@ -65,7 +65,6 @@ def _roi_rect(W: int, H: int, left: int, top: int, right_margin: int, bottom_mar
 
 
 def _make_csrt_tracker():
-    # touhou_02와 동일한 의도: CSRT 사용 (OpenCV 버전차 대응)
     try:
         if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerCSRT_create"):
             return cv2.legacy.TrackerCSRT_create()
@@ -79,13 +78,37 @@ def _make_csrt_tracker():
     return None
 
 
+def _tracker_init_ok(ret) -> bool:
+    if ret is None:
+        return True
+    return bool(ret)
+
+
+def _ensure_uint8_bgr(frame: np.ndarray) -> np.ndarray:
+    if frame is None or frame.size == 0:
+        return frame
+
+    if frame.dtype != np.uint8:
+        f = frame.astype(np.float32)
+        if f.size > 0 and float(np.nanmax(f)) <= 1.5:
+            f = f * 255.0
+        frame = np.clip(f, 0, 255).astype(np.uint8)
+
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    elif frame.ndim == 3 and frame.shape[2] == 4:
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+    elif frame.ndim == 3 and frame.shape[2] == 3:
+        pass
+    else:
+        return frame
+
+    if not frame.flags["C_CONTIGUOUS"]:
+        frame = np.ascontiguousarray(frame)
+    return frame
+
+
 def _peaks_count_from_mask(mask_u8: np.ndarray, peak_bin_ratio: float, peak_min_area: int) -> int:
-    """
-    touhou_02 peaks_count_from_mask와 동일:
-    - m.sum() < 50 이면 0
-    - distanceTransform(L2,5) -> thr=mx*ratio
-    - thr 이상 peak 이진화 -> contour area >= peak_min_area count
-    """
     if mask_u8 is None or mask_u8.size == 0:
         return 0
 
@@ -104,32 +127,27 @@ def _peaks_count_from_mask(mask_u8: np.ndarray, peak_bin_ratio: float, peak_min_
     cnts, _ = cv2.findContours(peak, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     keep = 0
     for c in cnts:
-        a = cv2.contourArea(c)
-        if a >= float(peak_min_area):
+        if cv2.contourArea(c) >= float(peak_min_area):
             keep += 1
     return int(keep)
 
 
 @dataclass
 class TrackerConfig:
-    # ROI (touhou_02 동일)
     roi_left: int = 20
     roi_top: int = 210
     roi_right_margin: int = 210
     roi_bottom_margin: int = 20
 
-    # MOG2 (touhou_02 동일)
     mog2_history: int = 120
     mog2_var_threshold: int = 28
     mog2_detect_shadows: bool = False
 
-    # morphology (touhou_02 동일)
     open_k: int = 3
     open_iter: int = 1
     erode_iter: int = 1
     dilate_iter: int = 1
 
-    # size/area (touhou_02 동일)
     w_min: int = 18
     w_max: int = 70
     h_min: int = 28
@@ -137,25 +155,19 @@ class TrackerConfig:
     area_min: int = 400
     area_max: int = 6000
 
-    # aspect (touhou_02 동일)
     aspect_min: float = 0.45
     aspect_max: float = 0.78
 
-    # peak 제거 (touhou_02 동일)
     peak_bin_ratio: float = 0.60
     peak_max_count: int = 1
     peak_min_area: int = 25
 
-    # track 유지/확정 (touhou_02 동일)
     assoc_dist: float = 60.0
     cand_ttl_sec: float = 0.25
     lock_hold_sec: float = 0.25
     size_stable_tol: float = 0.35
 
-    # LOCK 후보 bbox 패딩 (touhou_02 동일)
     lock_pad_px: int = 6
-
-    # 디버그 후보 표시 제한(성능/가독성용, 원리에는 영향 없음)
     debug_max_candidates: int = 80
 
 
@@ -175,23 +187,19 @@ class ReimuTrackerCV:
             detectShadows=bool(self.cfg.mog2_detect_shadows),
         )
 
-        # LOCK 후 CSRT
         self._csrt = None
         self.locked: bool = False
         self.lock_bbox: Optional[BBox] = None  # full-frame coords
 
-        # LOCK 전 tracks
         self._next_id: int = 1
         self._tracks: Dict[int, _Track] = {}
 
-        # debug snapshots
         self._dbg_roi_xyxy: Optional[Tuple[int, int, int, int]] = None
         self._dbg_candidates_full: List[BBox] = []
         self._dbg_lock_cand_full: Optional[BBox] = None
         self._dbg_fg_roi: Optional[np.ndarray] = None
 
     def reset(self):
-        # touhou_02 detector.reset + tracker.reset 동일 효과
         self.bg = cv2.createBackgroundSubtractorMOG2(
             history=int(self.cfg.mog2_history),
             varThreshold=float(self.cfg.mog2_var_threshold),
@@ -223,13 +231,16 @@ class ReimuTrackerCV:
         if frame_bgr is None or frame_bgr.size == 0:
             return None, 0.0
 
+        frame_bgr = _ensure_uint8_bgr(frame_bgr)
+        if frame_bgr is None or frame_bgr.size == 0:
+            return None, 0.0
+
         H, W = frame_bgr.shape[:2]
         if now is None:
             import time
             now = time.time()
         now = float(now)
 
-        # ROI
         x0, y0, x1, y1 = _roi_rect(
             W, H,
             left=self.cfg.roi_left,
@@ -239,46 +250,21 @@ class ReimuTrackerCV:
         )
         self._dbg_roi_xyxy = (x0, y0, x1, y1)
 
-        # =========================================================
-        # LOCK 상태: "절대로 unlock/re-detect 하지 않는다"
-        # - update 실패해도 locked 유지
-        # - 대신 동일 bbox로 CSRT 재초기화(re-init)만 시도
-        # =========================================================
-        if self.locked and (self._csrt is not None) and (self.lock_bbox is not None):
-            ok, b = self._csrt.update(frame_bgr)
-            if ok:
-                self.lock_bbox = _clamp_bbox(tuple(map(int, b)), W, H)
+        # LOCK: CSRT update only (절대 자동 unlock 안 함)
+        if self.locked and self.lock_bbox is not None:
+            if self._csrt is not None:
+                try:
+                    ok, b = self._csrt.update(frame_bgr)
+                except Exception:
+                    ok, b = False, None
+                if ok and b is not None:
+                    self.lock_bbox = _clamp_bbox(tuple(map(int, b)), W, H)
 
-                # LOCK이면 후보/주황 표시 안 함 (touhou_02 느낌)
-                self._dbg_candidates_full = []
-                self._dbg_lock_cand_full = None
-                return self.lock_bbox, 1.0
-
-            # ❗여기부터가 핵심 수정:
-            # update가 실패해도 unlock 하지 말고, 현재 lock_bbox로 CSRT를 다시 init 해본다.
-            # (재탐색/ detector reset 금지)
-            trk = _make_csrt_tracker()
-            if trk is not None:
-                # 혹시 bbox가 화면 밖으로 삐져나가면 clamp
-                bb = _clamp_bbox(self.lock_bbox, W, H)
-                ok2 = trk.init(frame_bgr, tuple(map(float, bb)))
-                if ok2:
-                    self._csrt = trk
-                    self.lock_bbox = bb
-
-                    self._dbg_candidates_full = []
-                    self._dbg_lock_cand_full = None
-                    return self.lock_bbox, 1.0
-
-            # re-init도 실패해도 "LOCK 유지"
-            # -> 마지막 bbox를 계속 반환 (너 요구사항: 절대 풀리지 않음)
             self._dbg_candidates_full = []
             self._dbg_lock_cand_full = None
             return self.lock_bbox, 1.0
 
-        # -------------------------
-        # UNLOCK 상태: candidate 탐색 (기존 그대로)
-        # -------------------------
+        # UNLOCK: detect candidates
         roi = frame_bgr[y0:y1, x0:x1]
         if roi.size == 0:
             self._dbg_candidates_full = []
@@ -309,14 +295,20 @@ class ReimuTrackerCV:
             (cand_full[0] - pad, cand_full[1] - pad, cand_full[2] + pad * 2, cand_full[3] + pad * 2),
             W, H
         )
+
         self._dbg_lock_cand_full = cand_full
 
         trk = _make_csrt_tracker()
         if trk is None:
             return None, 0.0
 
-        ok = trk.init(frame_bgr, tuple(map(float, cand_full)))
-        if not ok:
+        try:
+            ret = trk.init(frame_bgr, tuple(map(float, cand_full)))
+            ok_init = _tracker_init_ok(ret)
+        except Exception:
+            ok_init = False
+
+        if not ok_init:
             self._tracks.clear()
             self._next_id = 1
             self.bg = cv2.createBackgroundSubtractorMOG2(
@@ -324,29 +316,21 @@ class ReimuTrackerCV:
                 varThreshold=float(self.cfg.mog2_var_threshold),
                 detectShadows=bool(self.cfg.mog2_detect_shadows),
             )
-            self._dbg_lock_cand_full = None
             return None, 0.0
 
         self._csrt = trk
         self.locked = True
         self.lock_bbox = cand_full
 
-        # LOCK 직후에도 후보/주황 표시 안 함
         self._dbg_candidates_full = []
         self._dbg_lock_cand_full = None
-
         return self.lock_bbox, 1.0
 
-    # -------------------------
-    # Internal: touhou_02 detector logic
-    # -------------------------
     def _detect_candidates_roi(self, roi_bgr: np.ndarray) -> Tuple[List[BBox], np.ndarray]:
-        # touhou_02: bg.apply(roi_bgr) (GRAY 변환 안 함)
         fg = self.bg.apply(roi_bgr)
         _, fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)
 
-        k = int(self.cfg.open_k)
-        k = max(1, k)
+        k = max(1, int(self.cfg.open_k))
         kernel = np.ones((k, k), np.uint8)
 
         fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel, iterations=int(self.cfg.open_iter))
@@ -381,7 +365,6 @@ class ReimuTrackerCV:
     def _update_tracks(self, cands_roi: List[BBox], now: float):
         used = set()
 
-        # prune + association (touhou_02 동일)
         for tid, tr in list(self._tracks.items()):
             if (now - tr.last) > float(self.cfg.cand_ttl_sec):
                 del self._tracks[tid]
@@ -407,7 +390,6 @@ class ReimuTrackerCV:
                 tr.hist.append((now, float(cx), float(cy), b))
                 tr.last = now
 
-        # new tracks (touhou_02 동일)
         for i, b in enumerate(cands_roi):
             if i in used:
                 continue
@@ -422,7 +404,6 @@ class ReimuTrackerCV:
         best = None
         best_score = -1.0
 
-        # touhou_02 동일
         for tr in self._tracks.values():
             pts = [p for p in tr.hist if (now - p[0]) <= float(self.cfg.lock_hold_sec)]
             if len(pts) < 4:
