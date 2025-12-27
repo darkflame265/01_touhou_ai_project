@@ -20,7 +20,7 @@ class UIGuard:
         if not ui_panel_ok:
             return None
         try:
-            v = count_lives_from_img(img_bgr)
+            v = count_lives_from_img(img_bgr, debug=True)
         except Exception:
             return None
         if v is None:
@@ -29,4 +29,6 @@ class UIGuard:
             return None
         if v < 0 or v > 12:
             return None
+
+        #print(f"현재 남은 목숨은 : {int(v)}")
         return int(v)

@@ -1,12 +1,12 @@
 # === PPO_STATS_BEGIN ===
-total_completed=9
+total_completed=23
 best_reward=43.087201
 best_reward_ts=2025-12-26 22:29:20
 best_reward_run=2025-12-26 22:28:40
 best_reward_ep=(1/1)
-best_survival=29.126
-best_survival_ts=2025-12-26 22:29:20
-best_survival_run=2025-12-26 22:28:40
+best_survival=30.571
+best_survival_ts=2025-12-27 15:47:17
+best_survival_run=2025-12-27 15:46:36
 best_survival_ep=(1/1)
 # === PPO_STATS_END ===
 
@@ -183,3 +183,132 @@ idx	reward	survival_sec	note
 [STATS] total_completed=8 | best_reward=43.087 | best_survival=29.13s
 idx	reward	survival_sec	note
 (1/1)	39.241284	24.840	
+
+========
+[RUN] 2025-12-27 15:17:27  episodes=1 eval=False
+[STATS] total_completed=9 | best_reward=43.087 | best_survival=29.13s
+idx	reward	survival_sec	note
+(1/1)	3.568894	4.900	ABORTED
+
+========
+[RUN] 2025-12-27 15:17:56  episodes=1 eval=False
+[STATS] total_completed=9 | best_reward=43.087 | best_survival=29.13s
+idx	reward	survival_sec	note
+(1/1)	16.671004	17.632	
+
+========
+[RUN] 2025-12-27 15:18:44  episodes=1 eval=False
+[STATS] total_completed=10 | best_reward=43.087 | best_survival=29.13s
+idx	reward	survival_sec	note
+(1/1)	22.517356	24.425	
+
+========
+[RUN] 2025-12-27 15:22:32  episodes=1 eval=False
+[STATS] total_completed=11 | best_reward=43.087 | best_survival=29.13s
+idx	reward	survival_sec	note
+(1/1)	7.500000	4.568	ABORTED
+
+========
+[RUN] 2025-12-27 15:23:15  episodes=1 eval=False
+[STATS] total_completed=11 | best_reward=43.087 | best_survival=29.13s
+idx	reward	survival_sec	note
+(1/1)	25.499086	21.766	
+
+========
+[RUN] 2025-12-27 15:24:46  episodes=1 eval=False
+[STATS] total_completed=12 | best_reward=43.087 | best_survival=29.13s
+idx	reward	survival_sec	note
+(1/1)	28.022366	23.835	
+
+========
+[RUN] 2025-12-27 15:26:34  episodes=1 eval=False
+[STATS] total_completed=13 | best_reward=43.087 | best_survival=29.13s
+idx	reward	survival_sec	note
+(1/1)	23.413305	19.245	
+
+========
+[RUN] 2025-12-27 15:40:43  episodes=1 eval=False
+[STATS] total_completed=14 | best_reward=43.087 | best_survival=29.13s
+idx	reward	survival_sec	note
+(1/1)	27.038859	24.239	
+
+========
+[RUN] 2025-12-27 15:46:36  episodes=1 eval=False
+[STATS] total_completed=15 | best_reward=43.087 | best_survival=29.13s
+idx	reward	survival_sec	note
+(1/1)	29.497578	30.571	
+
+========
+[RUN] 2025-12-27 15:51:34  episodes=1 eval=False
+[STATS] total_completed=16 | best_reward=43.087 | best_survival=30.57s
+idx	reward	survival_sec	note
+(1/1)	11.339179	19.017	
+
+========
+[RUN] 2025-12-27 15:54:27  episodes=1 eval=False
+[STATS] total_completed=17 | best_reward=43.087 | best_survival=30.57s
+idx	reward	survival_sec	note
+(1/1)	22.418163	25.293	
+
+========
+[RUN] 2025-12-27 15:57:11  episodes=1 eval=False
+[STATS] total_completed=18 | best_reward=43.087 | best_survival=30.57s
+idx	reward	survival_sec	note
+(1/1)	16.711969	23.007	
+
+========
+[RUN] 2025-12-27 16:07:56  episodes=1 eval=False
+[STATS] total_completed=19 | best_reward=43.087 | best_survival=30.57s
+idx	reward	survival_sec	note
+(1/1)	21.737996	20.510	
+
+========
+[RUN] 2025-12-27 16:15:48  episodes=1 eval=False
+[STATS] total_completed=20 | best_reward=43.087 | best_survival=30.57s
+idx	reward	survival_sec	note
+(1/1)	15.388058	19.554	
+
+========
+[RUN] 2025-12-27 16:30:03  episodes=1 eval=False
+[STATS] total_completed=21 | best_reward=43.087 | best_survival=30.57s
+idx	reward	survival_sec	note
+
+========
+[RUN] 2025-12-27 16:31:20  episodes=1 eval=False
+[STATS] total_completed=21 | best_reward=43.087 | best_survival=30.57s
+idx	reward	survival_sec	note
+
+========
+[RUN] 2025-12-27 16:31:36  episodes=1 eval=False
+[STATS] total_completed=21 | best_reward=43.087 | best_survival=30.57s
+idx	reward	survival_sec	note
+(1/1)	21.975115	15.311	ABORTED
+
+========
+[RUN] 2025-12-27 16:33:54  episodes=1 eval=False
+[STATS] total_completed=21 | best_reward=43.087 | best_survival=30.57s
+idx	reward	survival_sec	note
+(1/1)	10.600000	7.784	ABORTED
+
+========
+[RUN] 2025-12-27 16:37:03  episodes=1 eval=False
+[STATS] total_completed=21 | best_reward=43.087 | best_survival=30.57s
+idx	reward	survival_sec	note
+(1/1)	6.827168	8.196	ABORTED
+
+========
+[RUN] 2025-12-27 16:40:44  episodes=1 eval=False
+[STATS] total_completed=21 | best_reward=43.087 | best_survival=30.57s
+idx	reward	survival_sec	note
+
+========
+[RUN] 2025-12-27 16:41:32  episodes=1 eval=False
+[STATS] total_completed=21 | best_reward=43.087 | best_survival=30.57s
+idx	reward	survival_sec	note
+(1/1)	-2.200000	10.722	
+
+========
+[RUN] 2025-12-27 16:47:39  episodes=1 eval=False
+[STATS] total_completed=22 | best_reward=43.087 | best_survival=30.57s
+idx	reward	survival_sec	note
+(1/1)	5.331315	18.508	

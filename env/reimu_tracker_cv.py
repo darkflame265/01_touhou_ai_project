@@ -36,6 +36,43 @@ import numpy as np
 
 BBox = Tuple[int, int, int, int]  # (x, y, w, h)
 
+@dataclass
+class TrackerConfig:
+    roi_left: int = 20
+    roi_top: int = 210
+    roi_right_margin: int = 210
+    roi_bottom_margin: int = 10
+
+    mog2_history: int = 120
+    mog2_var_threshold: int = 28
+    mog2_detect_shadows: bool = False
+
+    open_k: int = 3
+    open_iter: int = 1
+    erode_iter: int = 1
+    dilate_iter: int = 1
+
+    w_min: int = 18
+    w_max: int = 70
+    h_min: int = 28
+    h_max: int = 90
+    area_min: int = 400
+    area_max: int = 6000
+
+    aspect_min: float = 0.45
+    aspect_max: float = 0.78
+
+    peak_bin_ratio: float = 0.60
+    peak_max_count: int = 1
+    peak_min_area: int = 25
+
+    assoc_dist: float = 60.0
+    cand_ttl_sec: float = 0.25
+    lock_hold_sec: float = 0.25
+    size_stable_tol: float = 0.35
+
+    lock_pad_px: int = 6
+    debug_max_candidates: int = 80
 
 def _clamp_bbox(b: BBox, W: int, H: int) -> BBox:
     x, y, w, h = b
@@ -130,45 +167,6 @@ def _peaks_count_from_mask(mask_u8: np.ndarray, peak_bin_ratio: float, peak_min_
         if cv2.contourArea(c) >= float(peak_min_area):
             keep += 1
     return int(keep)
-
-
-@dataclass
-class TrackerConfig:
-    roi_left: int = 20
-    roi_top: int = 210
-    roi_right_margin: int = 210
-    roi_bottom_margin: int = 20
-
-    mog2_history: int = 120
-    mog2_var_threshold: int = 28
-    mog2_detect_shadows: bool = False
-
-    open_k: int = 3
-    open_iter: int = 1
-    erode_iter: int = 1
-    dilate_iter: int = 1
-
-    w_min: int = 18
-    w_max: int = 70
-    h_min: int = 28
-    h_max: int = 90
-    area_min: int = 400
-    area_max: int = 6000
-
-    aspect_min: float = 0.45
-    aspect_max: float = 0.78
-
-    peak_bin_ratio: float = 0.60
-    peak_max_count: int = 1
-    peak_min_area: int = 25
-
-    assoc_dist: float = 60.0
-    cand_ttl_sec: float = 0.25
-    lock_hold_sec: float = 0.25
-    size_stable_tol: float = 0.35
-
-    lock_pad_px: int = 6
-    debug_max_candidates: int = 80
 
 
 @dataclass

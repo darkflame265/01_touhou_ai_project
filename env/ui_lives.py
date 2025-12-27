@@ -23,10 +23,20 @@ def count_lives_from_img(img_bgr, debug=False):
 
     roi = img_bgr[y:y+h, x:x+w]
 
-    # ✅ 빨간색을 HSV로 잡기
+    # =========================
+    # ✅ ROI 스샷: 딱 한 번만 저장
+    # =========================
+    # ROI 위치 어긋나면 python -m tools.calibrate_lives_roi 로 드래고하여 위치 재설정.
+    if not hasattr(count_lives_from_img, "_roi_dumped"):
+        os.makedirs("debug", exist_ok=True)
+        cv2.imwrite("debug/lives_roi_once.png", roi)
+        print("[DEBUG] lives ROI snapshot saved: debug/lives_roi_once.png")
+        count_lives_from_img._roi_dumped = True
+
+    # HSV 변환
     hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
 
-    # 빨강은 HSV Hue가 양쪽 끝(0 근처, 180 근처)에 걸쳐 있음
+    # 빨강 HSV 범위
     lower1 = np.array([0, 80, 80])
     upper1 = np.array([10, 255, 255])
     lower2 = np.array([170, 80, 80])
@@ -36,16 +46,15 @@ def count_lives_from_img(img_bgr, debug=False):
     mask2 = cv2.inRange(hsv, lower2, upper2)
     mask = cv2.bitwise_or(mask1, mask2)
 
-    # 노이즈 정리 (조금씩만)
+    # 노이즈 정리
     kernel = np.ones((3, 3), np.uint8)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
 
-    # 연결요소로 별 덩어리 세기
+    # 연결요소 분석
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
 
-    # 최소 면적 (ROI 작으니 너무 크게 잡지 않기)
-    min_area = max(10, int((w * h) * 0.01))  # 54*24=1296이면 ~12 정도
+    min_area = max(10, int((w * h) * 0.01))
     count = 0
     areas = []
 
@@ -62,3 +71,4 @@ def count_lives_from_img(img_bgr, debug=False):
         cv2.waitKey(1)
 
     return count
+

@@ -34,7 +34,7 @@ class GameEnv:
         self.s.action_repeat = 1
         self.s.frame_sleep = 0.012
 
-        # 관측 (debug_viz 제거: 필요없음)
+        # 관측
         self.obs = ObsBuilder(
             self.screen,
             obs_out_size=128,
@@ -53,7 +53,6 @@ class GameEnv:
         self.y_floor = 0.60
         self.y_zone_enter_pen = 1.5
         self.y_zone_stay_pen_k = 0.08
-        self.y_pen_conf_thr = 0.02  # (기본 OFF 로직 유지)
 
         self.top_soft_y = 0.20
         self.right_soft_x = 0.80
@@ -96,23 +95,25 @@ class GameEnv:
 
         # PROFILING
         self._prof_enable = True
-        self._prof_every_steps = 200
         self._prof_t0 = time.perf_counter()
-        self._prof_last_print_t = self._prof_t0
-
-        self._prof_steps = 0
-        self._prof_dup_count = 0
-        self._prof_prev_sample = None
-
         self._prof_sum_capture = 0.0
         self._prof_sum_ui = 0.0
         self._prof_sum_obs = 0.0
         self._prof_sum_mask = 0.0
         self._prof_sum_ctrl = 0.0
+        self._prof_prev_sample = None
 
-        self._prof_last_mean_abs = None
-        self._prof_last_max_abs = None
+        # =========================
+        # ✅ “UI=0 이후 다음 죽음에서 종료”를 위한 상태
+        # =========================
+        self._pending_gameover_after_ui_zero = False   # UI가 0으로 떨어진 뒤, 다음 죽음이 진짜 게임오버
+        self._last_ui_lives = None                     # 마지막으로 성공적으로 읽은 UI 값(별 개수)
+        self._death_fx_reset_cooldown = 0.25
+        self._last_death_fx_reset_t = 0.0
 
+    # -------------------------
+    # small helpers
+    # -------------------------
     def _as_chw(self, obs: np.ndarray) -> np.ndarray:
         if obs is None:
             return None
@@ -174,11 +175,6 @@ class GameEnv:
 
     def _y_zone_penalty(self, y_n: float, conf: float) -> float:
         self._last_y_pen = 0.0
-
-        # (기본 OFF 유지)
-        # if conf < self.y_pen_conf_thr:
-        #     return 0.0
-
         bad = (y_n < self.y_floor)
 
         if bad and (not self._in_y_bad_zone):
@@ -194,26 +190,9 @@ class GameEnv:
 
         return float(self._last_y_pen)
 
-    # =========================
-    # PROFILING helpers
-    # =========================
-    def _prof_reset_episode(self):
-        self._prof_t0 = time.perf_counter()
-        self._prof_last_print_t = self._prof_t0
-
-        self._prof_steps = 0
-        self._prof_dup_count = 0
-        self._prof_prev_sample = None
-
-        self._prof_sum_capture = 0.0
-        self._prof_sum_ui = 0.0
-        self._prof_sum_obs = 0.0
-        self._prof_sum_mask = 0.0
-        self._prof_sum_ctrl = 0.0
-
-        self._prof_last_mean_abs = None
-        self._prof_last_max_abs = None
-
+    # -------------------------
+    # PROF / DUP
+    # -------------------------
     def _prof_sample_frame(self, img: np.ndarray) -> np.ndarray:
         if img is None:
             return None
@@ -234,66 +213,17 @@ class GameEnv:
 
         if self._prof_prev_sample is None:
             self._prof_prev_sample = sample
-            self._prof_last_mean_abs = None
-            self._prof_last_max_abs = None
             return False
 
         diff = np.abs(sample.astype(np.int16) - self._prof_prev_sample.astype(np.int16))
         mean_abs = float(diff.mean())
         max_abs = int(diff.max())
-
-        self._prof_last_mean_abs = mean_abs
-        self._prof_last_max_abs = max_abs
+        self._prof_prev_sample = sample
 
         thr = float(self.dup_thr_mean_abs)
         is_dup = (max_abs == 0) or (mean_abs < thr)
-        if is_dup:
-            self._prof_dup_count += 1
-
-        self._prof_prev_sample = sample
         return bool(is_dup)
 
-    def _prof_maybe_print(self):
-        if not self._prof_enable:
-            return
-
-        self._prof_steps += 1
-        if (self._prof_steps % self._prof_every_steps) != 0:
-            return
-
-        now = time.perf_counter()
-        dt = max(1e-9, now - self._prof_last_print_t)
-        fps = self._prof_every_steps / dt
-        self._prof_last_print_t = now
-
-        if self._prof_last_mean_abs is None:
-            print(f"[FRAMEDBG] step={self._prof_steps} mean_abs_diff=N/A")
-        else:
-            print(
-                f"[FRAMEDBG] step={self._prof_steps} "
-                f"mean_abs_diff={self._prof_last_mean_abs:.3f} max_abs={self._prof_last_max_abs} fps~{fps:.1f}"
-            )
-            if self._prof_last_max_abs == 0 or (self._prof_last_mean_abs < float(self.dup_thr_mean_abs)):
-                print("  [FRAMEDBG][HINT] mean_abs_diff 매우 낮음 -> 같은 프레임 중복 캡처 가능성↑ (frame_sleep 너무 짧을 수 있음)")
-
-        dup_ratio = self._prof_dup_count / max(1, self._prof_steps)
-        print(f"  [FRAMEDBG] dup_frames={self._prof_dup_count}/{self._prof_steps} ({dup_ratio*100:.2f}%)")
-
-        denom = max(1, self._prof_steps)
-        cap_ms = (self._prof_sum_capture / denom) * 1000.0
-        ui_ms = (self._prof_sum_ui / denom) * 1000.0
-        obs_ms = (self._prof_sum_obs / denom) * 1000.0
-        mask_ms = (self._prof_sum_mask / denom) * 1000.0
-        ctrl_ms = (self._prof_sum_ctrl / denom) * 1000.0
-
-        print(
-            "  [PROF] avg_ms/step | "
-            f"capture={cap_ms:.2f} ui={ui_ms:.2f} obs={obs_ms:.2f} mask={mask_ms:.2f} ctrl={ctrl_ms:.2f}"
-        )
-
-    # =========================
-    # DUP frame handling
-    # =========================
     def _capture_with_dup_retry(self):
         t0 = time.perf_counter()
         img = self.screen.capture()
@@ -320,6 +250,65 @@ class GameEnv:
 
         return img, True
 
+    # =========================
+    # ✅ tracker reset helper
+    # =========================
+    def _reset_tracker_on_death(self):
+        try:
+            if hasattr(self.obs, "on_player_death"):
+                self.obs.on_player_death()
+        except Exception as e:
+            print(f"[WARN] obs.on_player_death failed: {e}")
+
+    # =========================
+    # ✅ UI 목숨(별) 처리 핵심
+    # - 별 감소가 감지되면: 트래커 리셋 + hit_pen
+    # - 별이 0이 되는 순간엔 종료하지 말고, "다음 죽음이 진짜 게임오버" 플래그만 켠다
+    # =========================
+    def _handle_ui_lives(self, ui_now: int, now_ts: float):
+        """
+        return: (reward_override_or_none)
+        """
+        hit_cd = float(getattr(self.s, "hit_cooldown", 0.25))
+        last_hit = float(getattr(self.s, "last_hit_time", 0.0))
+        prev = getattr(self.s, "prev_ui_lives", None)
+
+        # 기록(마지막 UI)
+        self._last_ui_lives = int(ui_now)
+
+        # prev 초기화
+        if prev is None:
+            self.s.prev_ui_lives = int(ui_now)
+            # 참고용 동기화(실제 목숨=별+1 가정)
+            self.s.lives = int(ui_now) + 1
+            return None
+
+        # 쿨다운 중이면 변화 감지 안 하고 최신값만 반영
+        if (now_ts - last_hit) <= hit_cd:
+            self.s.prev_ui_lives = int(ui_now)
+            self.s.lives = int(ui_now) + 1
+            return None
+
+        # ✅ 별 감소 감지 = “목숨 깎임”
+        if int(ui_now) < int(prev):
+            self.s.last_hit_time = float(now_ts)
+            self.s.prev_ui_lives = int(ui_now)
+            self.s.lives = int(ui_now) + 1  # 참고용
+
+            # ✅ 여기! “목숨 깎인 순간” 트래커 초기화
+            self._reset_tracker_on_death()
+
+            # ✅ 별이 0이 됐다면: 아직 1 목숨 남아있으니 종료 X
+            if int(ui_now) == 0:
+                self._pending_gameover_after_ui_zero = True
+
+            return float(self.hit_pen)
+
+        # 감소 아니면 정상 갱신
+        self.s.prev_ui_lives = int(ui_now)
+        self.s.lives = int(ui_now) + 1
+        return None
+
     # -------------------------
     # Gym API
     # -------------------------
@@ -327,6 +316,7 @@ class GameEnv:
         release_all()
         time.sleep(0.5)
 
+        # 기본값(혹시 UI 못 읽을 때 대비)
         self.s.lives = 3
         self.s.last_hit_time = 0.0
         self.s.slow_streak = 0
@@ -345,7 +335,11 @@ class GameEnv:
         self._last_y_pen = 0.0
         self._last_pos_pen = 0.0
 
-        self._prof_reset_episode()
+        # ✅ 상태 초기화
+        self._pending_gameover_after_ui_zero = False
+        self._last_ui_lives = None
+        self._last_death_fx_reset_t = 0.0
+        self._prof_prev_sample = None
 
         img, _ = self._capture_with_dup_retry()
         g = self.screen.gray(img)
@@ -353,13 +347,21 @@ class GameEnv:
         t1 = time.perf_counter()
         state = self.obs.make_state(img)
         self._prof_sum_obs += (time.perf_counter() - t1)
-
         self.s.prev_state = self._as_chw(state)
 
         t2 = time.perf_counter()
         ui_ok = self.screen.ui_panel_present(img, gray=g)
-        self.s.prev_ui_lives = self.ui.ui_lives_safe(img, ui_ok)
+        ui_lives = self.ui.ui_lives_safe(img, ui_ok)
         self._prof_sum_ui += (time.perf_counter() - t2)
+
+        self.s.prev_ui_lives = ui_lives
+        if ui_lives is not None:
+            self._last_ui_lives = int(ui_lives)
+            # 참고용: 실제 목숨이 별+1인 케이스 반영
+            self.s.lives = int(ui_lives) + 1
+            # 시작부터 별이 0이면 “다음 죽음이 진짜 게임오버” 모드
+            if int(ui_lives) == 0:
+                self._pending_gameover_after_ui_zero = True
 
         self.s.frame_stack.clear()
         for _ in range(self.s.frame_stack_size):
@@ -401,7 +403,6 @@ class GameEnv:
             self._prof_sum_ui += (time.perf_counter() - t_ui)
 
             if self.s.ui_absent_count >= self.s.ui_absent_needed:
-                self._prof_maybe_print()
                 return self._end_episode(self.abort_pen, "ABORT:UI_ABSENT(pre)")
 
         # initial masking
@@ -435,7 +436,6 @@ class GameEnv:
                 total_reward += float(reward)
                 self._ep_add(float(reward))
                 self._step_count += 1
-                self._prof_maybe_print()
                 continue
 
             g = self.screen.gray(img)
@@ -452,7 +452,6 @@ class GameEnv:
                     time.sleep(0.02)
                 _, pen_reward, _ = self._end_episode(self.abort_pen, "ABORT:UI_ABSENT(loop)")
                 total_reward += pen_reward
-                self._prof_maybe_print()
                 return self._pack_frames_concat(), float(total_reward), True
 
             # obs
@@ -481,7 +480,7 @@ class GameEnv:
                 self.s.exec_was_masked = True
                 self._masked_count += 1
 
-            # reward
+            # base reward
             reward = float(self.alive_reward)
             now = time.time()
 
@@ -491,63 +490,53 @@ class GameEnv:
                 reward += self._y_zone_penalty(y_n, conf)
                 reward += self._position_shaping_penalty(x_n, y_n)
 
-            # death
+            # =========================
+            # ✅ DEATH FX (FLASH)
+            # - 모든 “죽음 순간”에 뜸 (마지막 포함)
+            # - UI가 0으로 떨어진 뒤라면: 다음 죽음(=FLASH)에서 에피소드 종료
+            # =========================
             _, gameover_fx = self.screen.detect_death(img, gray=g)
             if gameover_fx:
-                for _ in range(3):
-                    release_all()
-                    time.sleep(0.02)
+                if (now - self._last_death_fx_reset_t) > self._death_fx_reset_cooldown:
+                    self._last_death_fx_reset_t = now
+                    self._reset_tracker_on_death()
 
-                _, pen_reward, _ = self._end_episode(self.death_pen, "DEATH:FLASH")
-                total_reward += (reward + pen_reward)
+                    # ✅ 여기! "UI 0 이후" 또 죽었으면 = 진짜 게임오버
+                    if self._pending_gameover_after_ui_zero:
+                        # 현재 프레임에서 ui를 못 읽어도, 마지막으로 읽은 값이 0이면 신뢰
+                        if (self._last_ui_lives is not None) and (int(self._last_ui_lives) == 0):
+                            for _ in range(3):
+                                release_all()
+                                time.sleep(0.02)
 
-                self.s.prev_state = state_chw
-                self.s.frame_stack.append(self.s.prev_state)
+                            _, pen_reward, _ = self._end_episode(self.death_pen, "DEATH:AFTER_UI_ZERO")
+                            total_reward += (reward + pen_reward)
 
-                self._prof_maybe_print()
-                return self._pack_frames_concat(), float(total_reward), True
+                            self.s.prev_state = state_chw
+                            self.s.frame_stack.append(self.s.prev_state)
+                            return self._pack_frames_concat(), float(total_reward), True
 
-            # hit
+            # =========================
+            # ✅ UI 별(목숨) 감소 감지 (핵심)
+            # - ui_now < prev: 트래커 리셋 + hit_pen
+            # - ui_now==0이 되더라도 종료하지 않고 "다음 죽음에서 종료" 플래그만 켠다
+            # =========================
             t_ui_lives = time.perf_counter()
             ui_now = self.ui.ui_lives_safe(img, ui_ok)
             self._prof_sum_ui += (time.perf_counter() - t_ui_lives)
 
-            if (ui_now is not None) and (now - self.s.last_hit_time) > self.s.hit_cooldown:
-                if self.s.prev_ui_lives is not None and ui_now < self.s.prev_ui_lives:
-                    self.s.lives -= 1
-                    self.s.last_hit_time = now
-                    reward = float(self.hit_pen)
+            if ui_now is not None:
+                ro = self._handle_ui_lives(int(ui_now), now)
+                if ro is not None:
+                    reward = float(ro)
 
-                    if self.s.lives <= 0:
-                        for _ in range(3):
-                            release_all()
-                            time.sleep(0.02)
-
-                        _, pen_reward, _ = self._end_episode(self.death_pen, "DEATH:LIVES0")
-                        total_reward += (reward + pen_reward)
-
-                        self.s.prev_state = state_chw
-                        self.s.frame_stack.append(self.s.prev_state)
-
-                        self._prof_maybe_print()
-                        return self._pack_frames_concat(), float(total_reward), True
-
-                    try:
-                        if hasattr(self.obs, "on_player_death"):
-                            self.obs.on_player_death()
-                    except Exception as e:
-                        print(f"[WARN] obs.on_player_death failed: {e}")
-
-            self.s.prev_ui_lives = ui_now
-
+            # state update
             self.s.prev_state = state_chw
             self.s.frame_stack.append(self.s.prev_state)
 
             total_reward += float(reward)
             self._ep_add(float(reward))
             self._step_count += 1
-
-            self._prof_maybe_print()
 
         self.s.step_i += 1
         return self._pack_frames_concat(), float(total_reward), False

@@ -87,6 +87,22 @@ class ObsBuilder:
 
         self._prev_crop_gray_u8 = None
 
+    # env/obs_builder.py 내부에 추가 (클래스 ObsBuilder 안)
+
+    def on_player_death(self):
+        # 목숨 깎였을 때 호출됨: 트래킹 상태 리셋
+        if hasattr(self, "tracker") and hasattr(self.tracker, "reset"):
+            self.tracker.reset()
+        if hasattr(self, "reimu_tracker") and hasattr(self.reimu_tracker, "reset"):
+            self.reimu_tracker.reset()
+
+        # 혹시 last_xy_norm / conf 같은 캐시가 있으면 이것도 비우기
+        if hasattr(self, "last_xy_norm"):
+            self.last_xy_norm = (None, None)
+        if hasattr(self, "last_conf"):
+            self.last_conf = 0.0
+
+
     def pump_key(self, key: int):
         """
         main loop에서 cv2.waitKey로 받은 key를 여기로 넣어라.
