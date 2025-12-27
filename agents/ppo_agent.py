@@ -1,49 +1,52 @@
+import os
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical
-import os
 
 from models.shared.cnn_actor_critic import ActorCriticCNN
 
 
 class PPOAgent:
+    """
+    Drop-in replacement for your working PPOAgent, optimized for:
+    - fewer Python list ops (preallocated rollout buffer)
+    - fewer CPU->GPU transfers (batch transfer once per update)
+    - faster training via AMP (fp16) on RTX 3060 Ti
+    """
+
     def __init__(
         self,
         input_channels,
         num_actions,
-
-        # 프레임당 obs 채널 수(= ObsBuilder.obs_channels)
         obs_channels_per_frame=4,
-
-        # ===== 학습률/할인 =====
-        lr=3.0e-4,          # (기존 2.5e-4) 적응 속도 약간↑
+        lr=3e-4,
         gamma=0.99,
         gae_lambda=0.95,
-
-        # ===== PPO 안정성(8방향 적응 빠르게) =====
-        clip_eps=0.15,      # (기존 0.2) 초기에 폭주 방지
+        clip_eps=0.15,
         vf_coef=0.5,
-
-        # ===== 탐색(Entropy): 짧게 강하게 → 빨리 감소 =====
-        ent_coef=0.04,      # (기존 0.03) 초반 탐색↑ (새 액션공간 적응)
-        ent_min=0.005,      # (기존 0.01) 최저 탐색은 더 낮게
-        ent_decay=0.9995,   # (기존 0.9999) 더 빨리 감소
-
-        # ===== 업데이트 템포: 더 자주 업데이트 =====
-        rollout_steps=128,  # (기존 256) 적응 속도↑
-        update_epochs=5,    # (기존 4) 샘플 효율↑
+        ent_coef=0.04,
+        ent_min=0.005,
+        ent_decay=0.9995,
+        rollout_steps=128,
+        update_epochs=5,
         mini_batch_size=64,
-
-        device=None,
         max_grad_norm=0.5,
-
-        # ===== 엔트로피 warmup =====
-        ent_warmup_updates=30,  # (기존 50) 더 빨리 “정착” 모드로
+        ent_warmup_updates=30,
+        device=None,
+        # ---- speed options ----
+        use_amp=True,              # mixed precision (recommended on 3060Ti)
+        cudnn_benchmark=True,      # good when input size is fixed
+        compile_model=False,       # torch.compile (PyTorch 2.x). Try if stable.
+        channels_last=False,       # enable if your CNN benefits
+        pin_memory=True,           # helps H2D copy speed
     ):
-        ...
-
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.use_amp = bool(use_amp and (self.device == "cuda"))
+        self.pin_memory = bool(pin_memory and (self.device == "cuda"))
+
+        if self.device == "cuda":
+            torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
 
         self.model = ActorCriticCNN(
             input_channels=int(input_channels),
@@ -53,147 +56,232 @@ class PPOAgent:
             meta_channel_offset=0,
         ).to(self.device)
 
+        if channels_last and self.device == "cuda":
+            self.model = self.model.to(memory_format=torch.channels_last)
+
+        if compile_model:
+            try:
+                self.model = torch.compile(self.model)  # PyTorch 2.x
+            except Exception as e:
+                print(f"[WARN] torch.compile failed, continue without it: {e}")
+
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
 
-        self.gamma = gamma
-        self.gae_lambda = gae_lambda
-        self.clip_eps = clip_eps
-        self.vf_coef = vf_coef
+        # PPO params
+        self.gamma = float(gamma)
+        self.gae_lambda = float(gae_lambda)
+        self.clip_eps = float(clip_eps)
+        self.vf_coef = float(vf_coef)
 
-        # entropy
+        # Entropy schedule
         self.ent_coef = float(ent_coef)
         self.ent_min = float(ent_min)
         self.ent_decay = float(ent_decay)
+        self.ent_warmup_updates = int(ent_warmup_updates)
 
+        # Rollout / update
         self.rollout_steps = int(rollout_steps)
         self.update_epochs = int(update_epochs)
         self.mini_batch_size = int(mini_batch_size)
         self.max_grad_norm = float(max_grad_norm)
 
         self.global_step = 0
-
-        # ✅ 업데이트 카운터(엔트로피 warmup용)
         self.update_step = 0
-        self.ent_warmup_updates = int(ent_warmup_updates)
 
+        # ---- prealloc buffers ----
+        self._buf_inited = False
+        self._buf_ptr = 0
+        self._state_shape = None
         self.reset_buffer()
 
     def reset_buffer(self):
-        self.states = []
-        self.actions = []
-        self.rewards = []
-        self.dones = []
-        self.log_probs = []
-        self.values = []
+        self._buf_ptr = 0
 
-    def select_action(self, state):
-        s = torch.from_numpy(state[None].astype(np.float32)).to(self.device)
-        with torch.no_grad():
-            logits, value = self.model(s)
+    def _ensure_buffer(self, state: np.ndarray):
+        if self._buf_inited:
+            return
+
+        # state expected shape: (C,H,W) or whatever your model expects
+        self._state_shape = tuple(state.shape)
+        T = self.rollout_steps
+
+        # States: float32
+        self.states = np.zeros((T,) + self._state_shape, dtype=np.float32)
+        # Scalars:
+        self.actions = np.zeros((T,), dtype=np.int64)
+        self.rewards = np.zeros((T,), dtype=np.float32)
+        self.dones = np.zeros((T,), dtype=np.float32)       # 1.0 if done else 0.0
+        self.log_probs = np.zeros((T,), dtype=np.float32)
+        self.values = np.zeros((T,), dtype=np.float32)
+
+        self._buf_inited = True
+
+    @torch.no_grad()
+    def select_action(self, state: np.ndarray):
+        # state -> (1, ...) float32 on device
+        s = torch.from_numpy(state).to(self.device, dtype=torch.float32).unsqueeze(0)
+
+        if s.is_cuda and getattr(self.model, "to", None) and s.dim() == 4:
+            # If you used channels_last, keep input consistent
+            # (safe even if channels_last=False)
+            s = s.contiguous(memory_format=torch.channels_last)
+
+        logits, value = self.model(s)
         dist = Categorical(logits=logits)
         action = dist.sample()
-        log_prob = dist.log_prob(action)
-        return int(action.item()), float(log_prob.item()), float(value.item())
+
+        return (
+            int(action.item()),
+            float(dist.log_prob(action).item()),
+            float(value.squeeze(-1).item()),
+        )
 
     def store(self, state, action, reward, done, log_prob, value):
-        self.states.append(state)
-        self.actions.append(action)
-        self.rewards.append(float(reward))
-        self.dones.append(bool(done))
-        self.log_probs.append(float(log_prob))
-        self.values.append(float(value))
+        self._ensure_buffer(state)
+
+        i = self._buf_ptr
+        if i >= self.rollout_steps:
+            # if user accidentally keeps storing, just ignore extra
+            return
+
+        self.states[i] = state.astype(np.float32, copy=False)
+        self.actions[i] = int(action)
+        self.rewards[i] = float(reward)
+        self.dones[i] = 1.0 if bool(done) else 0.0
+        self.log_probs[i] = float(log_prob)
+        self.values[i] = float(value)
+
+        self._buf_ptr += 1
         self.global_step += 1
 
     def should_update(self):
-        return len(self.rewards) >= self.rollout_steps
+        return self._buf_ptr >= self.rollout_steps
 
-    def _compute_gae(self, last_value: float = 0.0):
-        advantages = []
-        returns = []
+    def _compute_gae_torch(self, rewards_t, dones_t, values_t, last_value_t):
+        """
+        rewards_t: (T,)
+        dones_t: (T,) float32 1.0 done else 0.0
+        values_t: (T,) predicted V(s_t)
+        last_value_t: scalar tensor V(s_{T}) if not done else 0
+        """
+        T = rewards_t.size(0)
+        adv = torch.zeros(T, device=self.device, dtype=torch.float32)
+        gae = torch.zeros((), device=self.device, dtype=torch.float32)
 
-        gae = 0.0
-        next_value = float(last_value)
-
-        for t in reversed(range(len(self.rewards))):
-            mask = 1.0 - float(self.dones[t])
-            delta = self.rewards[t] + self.gamma * next_value * mask - self.values[t]
+        next_value = last_value_t
+        for t in reversed(range(T)):
+            mask = 1.0 - dones_t[t]
+            delta = rewards_t[t] + self.gamma * next_value * mask - values_t[t]
             gae = delta + self.gamma * self.gae_lambda * mask * gae
+            adv[t] = gae
+            next_value = values_t[t]
 
-            advantages.insert(0, gae)
-            returns.insert(0, gae + self.values[t])
+        ret = adv + values_t
+        adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
+        return ret, adv
 
-            next_value = self.values[t]
-
-        returns = np.asarray(returns, dtype=np.float32)
-        advantages = np.asarray(advantages, dtype=np.float32)
-
-        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        return returns, advantages
-
-    def update(self, last_state=None, last_done: bool = False):
-        if len(self.rewards) < 2:
+    def update(self, last_state=None, last_done=False):
+        T = self._buf_ptr
+        if T < 2:
             self.reset_buffer()
             return None
 
+        # ---- bootstrap last value ----
         last_value = 0.0
-        if (last_state is not None) and (not last_done):
+        if last_state is not None and (not last_done):
             with torch.no_grad():
-                s = torch.from_numpy(last_state[None].astype(np.float32)).to(self.device)
+                s = torch.from_numpy(last_state).to(self.device, dtype=torch.float32).unsqueeze(0)
+                if s.is_cuda and s.dim() == 4:
+                    s = s.contiguous(memory_format=torch.channels_last)
                 _, v = self.model(s)
-                last_value = float(v.item())
+                last_value = float(v.squeeze(-1).item())
 
-        returns, advantages = self._compute_gae(last_value=last_value)
+        # ---- batch tensors (one transfer) ----
+        # Slice only used part (T)
+        states_np = self.states[:T]
+        actions_np = self.actions[:T]
+        rewards_np = self.rewards[:T]
+        dones_np = self.dones[:T]
+        old_logp_np = self.log_probs[:T]
+        values_np = self.values[:T]
 
-        states = torch.from_numpy(np.asarray(self.states, dtype=np.float32)).to(self.device)
-        actions = torch.tensor(self.actions, dtype=torch.long, device=self.device)
-        old_log_probs = torch.tensor(self.log_probs, dtype=torch.float32, device=self.device)
-        returns_t = torch.from_numpy(returns).to(self.device)
-        adv_t = torch.from_numpy(advantages).to(self.device)
+        # CPU tensors
+        states_cpu = torch.from_numpy(states_np)  # float32
+        actions_cpu = torch.from_numpy(actions_np)  # int64
+        rewards_cpu = torch.from_numpy(rewards_np)  # float32
+        dones_cpu = torch.from_numpy(dones_np)      # float32
+        old_logp_cpu = torch.from_numpy(old_logp_np)  # float32
+        values_cpu = torch.from_numpy(values_np)    # float32
+
+        if self.pin_memory:
+            states_cpu = states_cpu.pin_memory()
+            actions_cpu = actions_cpu.pin_memory()
+            rewards_cpu = rewards_cpu.pin_memory()
+            dones_cpu = dones_cpu.pin_memory()
+            old_logp_cpu = old_logp_cpu.pin_memory()
+            values_cpu = values_cpu.pin_memory()
+
+        # GPU tensors (non_blocking if pinned)
+        nb = self.pin_memory
+        states = states_cpu.to(self.device, non_blocking=nb)
+        actions = actions_cpu.to(self.device, non_blocking=nb)
+        rewards = rewards_cpu.to(self.device, non_blocking=nb)
+        dones = dones_cpu.to(self.device, non_blocking=nb)
+        old_log_probs = old_logp_cpu.to(self.device, non_blocking=nb)
+        values = values_cpu.to(self.device, non_blocking=nb)
+
+        if states.is_cuda and states.dim() == 4:
+            states = states.contiguous(memory_format=torch.channels_last)
+
+        last_value_t = torch.tensor(last_value, device=self.device, dtype=torch.float32)
+        returns, advantages = self._compute_gae_torch(rewards, dones, values, last_value_t)
 
         n = states.size(0)
-        idxs = np.arange(n)
-
         total_loss = 0.0
-        total_policy_loss = 0.0
-        total_value_loss = 0.0
+        total_policy = 0.0
+        total_value = 0.0
         total_entropy = 0.0
         steps = 0
 
         for _ in range(self.update_epochs):
-            np.random.shuffle(idxs)
+            idxs = torch.randperm(n, device=self.device)
+
             for start in range(0, n, self.mini_batch_size):
-                end = start + self.mini_batch_size
-                mb_idx = idxs[start:end]
+                mb = idxs[start:start + self.mini_batch_size]
 
-                mb_states = states[mb_idx]
-                mb_actions = actions[mb_idx]
-                mb_old_log_probs = old_log_probs[mb_idx]
-                mb_returns = returns_t[mb_idx]
-                mb_adv = adv_t[mb_idx]
+                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                    logits, v = self.model(states[mb])
+                    v = v.squeeze(-1)
 
-                logits, values = self.model(mb_states)
-                dist = Categorical(logits=logits)
+                    dist = Categorical(logits=logits)
+                    new_log_probs = dist.log_prob(actions[mb])
+                    entropy = dist.entropy().mean()
 
-                new_log_probs = dist.log_prob(mb_actions)
-                entropy = dist.entropy().mean()
+                    ratio = torch.exp(new_log_probs - old_log_probs[mb])
+                    surr1 = ratio * advantages[mb]
+                    surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages[mb]
+                    policy_loss = -torch.min(surr1, surr2).mean()
 
-                ratio = torch.exp(new_log_probs - mb_old_log_probs)
-                surr1 = ratio * mb_adv
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * mb_adv
-                policy_loss = -torch.min(surr1, surr2).mean()
-
-                value_loss = F.mse_loss(values.squeeze(-1), mb_returns)
-
-                loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
+                    value_loss = F.mse_loss(v, returns[mb])
+                    loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
 
                 self.optimizer.zero_grad(set_to_none=True)
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-                self.optimizer.step()
+
+                if self.use_amp:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                    self.optimizer.step()
 
                 total_loss += float(loss.item())
-                total_policy_loss += float(policy_loss.item())
-                total_value_loss += float(value_loss.item())
+                total_policy += float(policy_loss.item())
+                total_value += float(value_loss.item())
                 total_entropy += float(entropy.item())
                 steps += 1
 
@@ -208,8 +296,8 @@ class PPOAgent:
 
         return {
             "loss": total_loss / steps,
-            "policy_loss": total_policy_loss / steps,
-            "value_loss": total_value_loss / steps,
+            "policy_loss": total_policy / steps,
+            "value_loss": total_value / steps,
             "entropy": total_entropy / steps,
             "entropy_coef": float(self.ent_coef),
             "rollout_steps": int(n),
@@ -222,6 +310,7 @@ class PPOAgent:
             {
                 "model": self.model.state_dict(),
                 "optimizer": self.optimizer.state_dict(),
+                "scaler": self.scaler.state_dict() if self.use_amp else None,
                 "global_step": self.global_step,
                 "update_step": self.update_step,
                 "ent_coef": float(self.ent_coef),
@@ -232,39 +321,21 @@ class PPOAgent:
     def load(self, path, load_optimizer=True):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
 
-        #print("[LOAD] partial-load loader active")
-
         sd = ckpt.get("model", ckpt)
-        cur = self.model.state_dict()
+        self.model.load_state_dict(sd, strict=False)
 
-        filtered = {}
-        skipped = []
-        for k, v in sd.items():
-            if (k in cur) and (cur[k].shape == v.shape):
-                filtered[k] = v
-            else:
-                skipped.append(k)
-
-        msg = self.model.load_state_dict(filtered, strict=False)
-
-        if load_optimizer:
+        if load_optimizer and "optimizer" in ckpt:
             try:
-                if "optimizer" in ckpt:
-                    self.optimizer.load_state_dict(ckpt["optimizer"])
+                self.optimizer.load_state_dict(ckpt["optimizer"])
             except Exception as e:
-                print(f"[WARN] optimizer state not loaded (model changed): {e}")
+                print(f"[WARN] optimizer state skipped: {e}")
+
+        if self.use_amp and ("scaler" in ckpt) and (ckpt["scaler"] is not None):
+            try:
+                self.scaler.load_state_dict(ckpt["scaler"])
+            except Exception as e:
+                print(f"[WARN] scaler state skipped: {e}")
 
         self.global_step = int(ckpt.get("global_step", self.global_step))
         self.update_step = int(ckpt.get("update_step", self.update_step))
-        if "ent_coef" in ckpt:
-            self.ent_coef = float(ckpt["ent_coef"])
-
-        try:
-            print("[LOAD] loaded keys:", len(filtered))
-            print("[LOAD] missing keys:", msg.missing_keys)
-            print("[LOAD] unexpected keys:", msg.unexpected_keys)
-            if skipped:
-                print("[LOAD] skipped incompatible keys(sample):", skipped[:10], "...")
-            print(f"[LOAD] global_step={self.global_step} update_step={self.update_step} ent_coef={self.ent_coef:.6f}")
-        except Exception:
-            pass
+        self.ent_coef = float(ckpt.get("ent_coef", self.ent_coef))

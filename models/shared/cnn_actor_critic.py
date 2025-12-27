@@ -140,7 +140,7 @@ class ActorCriticCNN(nn.Module):
         # img
         z = self.conv(x01)
         z = self.pool(z)
-        z = z.view(z.size(0), -1)
+        z = z.reshape(z.size(0), -1)
         img_feat = self.fc_img(z)          # (B,512)
 
         feat = torch.cat([img_feat, meta_feat], dim=1)
