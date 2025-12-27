@@ -62,7 +62,6 @@ class CannyEdgeRatioCache:
 
         every = max(1, int(self.cfg.every_n_frames))
 
-        # ROI 사이즈가 크게 바뀌면 바로 갱신(캐시 무의미해짐)
         h, w = gray_roi.shape[:2]
         shape = (h, w)
 
@@ -91,18 +90,90 @@ class CannyEdgeRatioCache:
 
 
 def mean_std(gray_roi: np.ndarray) -> Tuple[float, float]:
-    """
-    gray ROI의 mean/std
-    """
     if gray_roi is None or gray_roi.size == 0:
         return 0.0, 0.0
     return float(gray_roi.mean()), float(gray_roi.std())
 
 
 def bright_ratio(gray_roi: np.ndarray, thr: int) -> float:
-    """
-    gray ROI에서 (pixel > thr) 비율
-    """
     if gray_roi is None or gray_roi.size == 0:
         return 0.0
     return float((gray_roi > int(thr)).mean())
+
+
+# =========================
+# 여기부터 "screen.py에서 빼낼" 계산 로직
+# =========================
+
+@dataclass
+class UiPanelHeuristics:
+    edge_ratio_thr: float = 0.040
+    std_min: float = 15.0
+    std_max: float = 80.0
+    mean_min: float = 20.0
+    mean_max: float = 200.0
+
+
+def ui_panel_present_cached(
+    panel_gray: np.ndarray,
+    *,
+    frame_idx: int,
+    edge_cache: CannyEdgeRatioCache,
+    heur: UiPanelHeuristics,
+) -> bool:
+    """
+    panel ROI만 받아서 UI 패널 존재 여부 판정.
+    - edge_ratio는 캐시 + 다운샘플 ROI 적용
+    """
+    if panel_gray is None or panel_gray.size == 0:
+        return False
+
+    mean, std = mean_std(panel_gray)
+    edge_ratio = edge_cache.edge_ratio(panel_gray, frame_idx)
+
+    ok = (
+        (edge_ratio >= float(heur.edge_ratio_thr)) and
+        (float(heur.std_min) <= std <= float(heur.std_max)) and
+        (float(heur.mean_min) <= mean <= float(heur.mean_max))
+    )
+    return bool(ok)
+
+
+@dataclass
+class DangerWeights:
+    w_edge: float = 4.0
+    w_bright: float = 2.0
+    w_std: float = 1.2
+    bright_thr: int = 160
+
+
+def danger_from_playfield_cached(
+    danger_roi_gray: np.ndarray,
+    *,
+    frame_idx: int,
+    edge_cache: CannyEdgeRatioCache,
+    weights: DangerWeights,
+    return_parts: bool = False,
+):
+    """
+    danger ROI만 받아서 danger 계산.
+    - edge_ratio는 캐시 + 다운샘플 ROI 적용
+    """
+    if danger_roi_gray is None or danger_roi_gray.size == 0:
+        if return_parts:
+            return 0.0, 0.0, 0.0, 0.0
+        return 0.0
+
+    edge_ratio = edge_cache.edge_ratio(danger_roi_gray, frame_idx)
+    b_ratio = bright_ratio(danger_roi_gray, int(weights.bright_thr))
+    std_norm = float(danger_roi_gray.std()) / 255.0
+
+    danger = 0.0
+    danger += float(weights.w_edge) * float(edge_ratio)
+    danger += float(weights.w_bright) * float(b_ratio)
+    danger += float(weights.w_std) * float(std_norm)
+    danger = max(0.0, min(1.0, danger))
+
+    if return_parts:
+        return float(danger), float(edge_ratio), float(b_ratio), float(std_norm)
+    return float(danger)

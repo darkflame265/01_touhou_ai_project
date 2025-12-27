@@ -66,7 +66,7 @@ class PPOAgent:
                 print(f"[WARN] torch.compile failed, continue without it: {e}")
 
         self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
-        self.scaler = torch.cuda.amp.GradScaler(enabled=self.use_amp)
+        self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         # PPO params
         self.gamma = float(gamma)
@@ -250,7 +250,7 @@ class PPOAgent:
             for start in range(0, n, self.mini_batch_size):
                 mb = idxs[start:start + self.mini_batch_size]
 
-                with torch.cuda.amp.autocast(enabled=self.use_amp):
+                with torch.amp.autocast("cuda", enabled=self.use_amp):
                     logits, v = self.model(states[mb])
                     v = v.squeeze(-1)
 
