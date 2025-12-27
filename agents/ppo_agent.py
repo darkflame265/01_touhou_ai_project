@@ -232,7 +232,7 @@ class PPOAgent:
     def load(self, path, load_optimizer=True):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
 
-        print("[LOAD] partial-load loader active")
+        #print("[LOAD] partial-load loader active")
 
         sd = ckpt.get("model", ckpt)
         cur = self.model.state_dict()

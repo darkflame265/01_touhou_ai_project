@@ -85,6 +85,8 @@ SC_UP = 0x48  # extended=True로 보내야 함
 # Templates (LOBBY existence only)
 # =========================
 TEMPLATES: dict[str, np.ndarray] = {}
+TEMPLATES_HALF: dict[str, np.ndarray] = {}
+_TEMPLATES_READY = False
 
 
 def _load_gray(path: str) -> np.ndarray:
@@ -94,22 +96,28 @@ def _load_gray(path: str) -> np.ndarray:
     return g
 
 
-def load_lobby_templates():
+def _ensure_lobby_templates_loaded():
     """
-    assets/ 폴더에서 로비 템플릿만 로드:
-      - lobby_practice.png
-      - lobby_quit.png
+    import 시점에 무조건 로드하지 않고, 최초 사용 시 1회 로드.
+    (프로세스 시작 체감 지연도 조금 줄어듦)
     """
+    global _TEMPLATES_READY
+    if _TEMPLATES_READY:
+        return
+
     base = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", "assets"))
-    TEMPLATES["practice"] = _load_gray(os.path.join(base, "lobby_practice.png"))
-    TEMPLATES["quit"] = _load_gray(os.path.join(base, "lobby_quit.png"))
+    practice = _load_gray(os.path.join(base, "lobby_practice.png"))
+    quit_ = _load_gray(os.path.join(base, "lobby_quit.png"))
+
+    TEMPLATES["practice"] = practice
+    TEMPLATES["quit"] = quit_
+
+    # half-scale 템플릿(매칭 속도용)
+    TEMPLATES_HALF["practice"] = cv2.resize(practice, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+    TEMPLATES_HALF["quit"] = cv2.resize(quit_, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
+
+    _TEMPLATES_READY = True
     print("[MENU] templates loaded:", list(TEMPLATES.keys()))
-
-
-try:
-    load_lobby_templates()
-except Exception as e:
-    print("[MENU][WARN] lobby templates not loaded:", repr(e))
 
 
 def _match_template(gray: np.ndarray, tmpl: np.ndarray) -> float:
@@ -301,14 +309,22 @@ def _menu_highlight_score(img_bgr_roi):
 # =========================
 # Location detection (SCORE / LOBBY / OTHER only)
 # =========================
-def detect_location(screen):
+def detect_location(screen, img=None, need_selected: bool = False):
     """
+    ✅ 최적화 포인트
+    - img를 넘기면 screen.capture()를 여기서 하지 않는다 (중복 캡처 방지)
+    - 템플릿 매칭은 half-scale로 수행
+    - need_selected=False면 selected 판정(하이라이트 스코어) 자체를 생략
+
     return dict:
       state: 'SCORE' | 'LOBBY' | 'OTHER'
       selected_name: 'PRACTICE' | 'QUIT' | None
       scores: debug dict
     """
-    img = screen.capture()
+    _ensure_lobby_templates_loaded()
+
+    if img is None:
+        img = screen.capture()
 
     # 1) SCORE는 확정 판정
     try:
@@ -321,11 +337,14 @@ def detect_location(screen):
     menu_roi = _roi(img, 0.55, 0.28, 0.98, 0.92)
     menu_gray = cv2.cvtColor(menu_roi, cv2.COLOR_BGR2GRAY)
 
-    practice_t = TEMPLATES.get("practice", None)
-    quit_t = TEMPLATES.get("quit", None)
+    # half-scale로 줄여서 matchTemplate 비용 감소
+    menu_gray_half = cv2.resize(menu_gray, (0, 0), fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
 
-    practice_tm = _match_template(menu_gray, practice_t) if practice_t is not None else 0.0
-    quit_tm = _match_template(menu_gray, quit_t) if quit_t is not None else 0.0
+    practice_t = TEMPLATES_HALF.get("practice", None)
+    quit_t = TEMPLATES_HALF.get("quit", None)
+
+    practice_tm = _match_template(menu_gray_half, practice_t) if practice_t is not None else 0.0
+    quit_tm = _match_template(menu_gray_half, quit_t) if quit_t is not None else 0.0
 
     menu_present = (max(practice_tm, quit_tm) >= 0.70)
 
@@ -336,7 +355,15 @@ def detect_location(screen):
             "scores": {"practice_tm": practice_tm, "quit_tm": quit_tm},
         }
 
-    # 3) LOBBY 내부에서만 selected 추정(없어도 OK)
+    # selected가 필요 없으면 여기서 끝
+    if not need_selected:
+        return {
+            "state": "LOBBY",
+            "selected_name": None,
+            "scores": {"practice_tm": practice_tm, "quit_tm": quit_tm},
+        }
+
+    # 3) LOBBY 내부에서만 selected 추정(verify용)
     practice_roi = _roi(img, 0.67, 0.40, 0.97, 0.58)
     quit_roi = _roi(img, 0.67, 0.76, 0.97, 0.92)
 
@@ -410,7 +437,6 @@ def recover_from_score_to_lobby(screen, max_sec=3.0) -> bool:
                 print(f"[MENU][RECOVER_SCORE] done (tries={tries})")
                 return True
         except Exception:
-            # 판정 실패 시에도 계속 탈출 입력은 진행
             pass
 
         tap_scancode(SC_X, label=f"X{tries+1}", press=0.02, gap=0.02)
@@ -437,6 +463,11 @@ def recover_to_lobby(
       - 나머지는 OTHER로 보고 'X 연타'로 무조건 로비로 보낸다.
       - SCORE면 recover_from_score_to_lobby()를 우선 사용.
       - OTHER면 X를 일정 횟수/간격으로 눌러 탈출.
+
+    ✅ 최적화:
+    - 루프당 capture 1회
+    - detect_location(screen, img=..., need_selected=False)로
+      selected(하이라이트 스코어) 계산은 생략
     """
     print("[MENU][RECOVER_LOBBY] start")
     if not focus_touhou_window():
@@ -447,7 +478,8 @@ def recover_to_lobby(
     cycles = 0
 
     while (time.time() - t0) < max_sec:
-        st = detect_location(screen)
+        img = screen.capture()
+        st = detect_location(screen, img=img, need_selected=False)
         state = st.get("state")
 
         if state == "LOBBY":
@@ -460,14 +492,12 @@ def recover_to_lobby(
             cycles += 1
             continue
 
-        # state == OTHER:
-        # 원하는 동작: X 6번, 0.4초 간격 (버스트)
+        # OTHER: X burst
         for i in range(other_x_presses):
             tap_scancode(SC_X, label=f"X(back){cycles}-{i+1}", press=0.02, gap=0.02)
             time.sleep(other_x_interval)
 
-            # 너무 많은 Z 섞기는 위험할 수 있어서 "마지막에 가끔 1번"만
-            # (나가기/확정 버튼이 있는 화면에서 탈출률 보강)
+            # 마지막에 가끔 1번만 Z
             if i == other_x_presses - 1 and (cycles % 3) == 2:
                 tap_scancode(SC_Z, label=f"Z(confirm){cycles}", press=0.02, gap=0.02)
                 time.sleep(0.15)
@@ -478,20 +508,24 @@ def recover_to_lobby(
     return False
 
 
-
 def ensure_practice_cursor_from_lobby(screen, verify=True, max_try=3) -> bool:
     """
     로비에서 Practice 커서 정렬:
       - Quit로 기준점(X 1회)
       - UP 5회로 Practice로
       - verify면 detect_location().selected_name == PRACTICE 확인
+
+    ✅ 최적화:
+    - verify=True인 경우에만 selected 판정(need_selected=True)을 수행.
+    - verify 전 상태 확인은 need_selected=False로 가볍게.
     """
     if not focus_touhou_window():
         print("[MENU][ALIGN] focus failed -> cannot send keys")
         return False
 
     for attempt in range(max_try):
-        st = detect_location(screen)
+        img0 = screen.capture()
+        st = detect_location(screen, img=img0, need_selected=False)
         if st.get("state") != "LOBBY":
             print(f"[MENU][ALIGN] not in LOBBY (state={st.get('state')})")
             return False
@@ -508,7 +542,8 @@ def ensure_practice_cursor_from_lobby(screen, verify=True, max_try=3) -> bool:
         if not verify:
             return True
 
-        st2 = detect_location(screen)
+        img1 = screen.capture()
+        st2 = detect_location(screen, img=img1, need_selected=True)
         ok = (st2.get("state") == "LOBBY" and st2.get("selected_name") == "PRACTICE")
         print(f"[MENU][ALIGN] verify attempt {attempt+1}/{max_try} -> {st2.get('selected_name')} ok={ok}")
         if ok:
@@ -537,7 +572,6 @@ def boot_into_practice(screen, max_sec_lobby: float = 10.0) -> bool:
     ok = ensure_practice_cursor_from_lobby(screen, verify=True, max_try=3)
     if not ok:
         print("[MENU][BOOT2] failed: cannot align practice cursor (continue anyway)")
-        # 그래도 시도는 해봄
 
     enter_practice_from_cursor()
     return True

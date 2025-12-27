@@ -9,8 +9,12 @@ from env.actions import ACTIONS
 from env.playfield_utils import get_playfield_rect_safe
 
 
+
 @dataclass
 class MaskingConfig:
+    """
+    레이무가 화면 끝/상단 제한선 근처에 있을 때, 바깥으로 나가는 방향의 액션을 금지하거나 안전한 쪽으로 바꿔주는 장치
+    """
     margin_px: int = 200
     use_flip: bool = True
 
