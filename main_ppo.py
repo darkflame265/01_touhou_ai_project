@@ -1,4 +1,4 @@
-# main_ppo.py (optimized / in-game no-lag version)
+# main_ppo.py
 import argparse
 import os
 from datetime import datetime
@@ -8,20 +8,19 @@ import re
 import tempfile
 
 import cv2
+import ctypes
 
 from env.game_env import GameEnv
-from env.controller import release_all, set_attack_hold
-from env.controller import cleanup_inputs_on_exit
-from env.menu import (
-    detect_location,
-    boot_into_practice,
-)
+from env.controller import release_all, set_attack_hold, cleanup_inputs_on_exit
+from env.menu import detect_location, boot_into_practice
 from env.actions import ACTIONS
 from agents.ppo_agent import PPOAgent
 
-import ctypes
-user32 = ctypes.WinDLL("user32", use_last_error=True)
 
+# -------------------------
+# Windows global hotkey (ESC)
+# -------------------------
+user32 = ctypes.WinDLL("user32", use_last_error=True)
 VK_ESCAPE = 0x1B
 
 
@@ -29,6 +28,9 @@ def esc_pressed() -> bool:
     return (user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0
 
 
+# -------------------------
+# Args
+# -------------------------
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--episodes", type=int, default=1)
@@ -37,7 +39,11 @@ def parse_args():
     return p.parse_args()
 
 
+# -------------------------
+# Safety helpers
+# -------------------------
 def safe_release_inputs():
+    # 공격홀드/키 stuck 방지
     try:
         set_attack_hold(False)
     except Exception:
@@ -48,50 +54,20 @@ def safe_release_inputs():
         pass
 
 
-def boot_print_state(env):
-    print("\n[BOOT] 현재 화면 위치 감지 중...")
-    st = detect_location(env.screen)
-    print(f"[BOOT] state={st.get('state')} selected={st.get('selected_name')}")
-
-    if st.get("state") == "SCORE":
-        print("[BOOT] SCORE 감지됨: boot_into_practice()가 알아서 복구할 것")
-    elif st.get("state") == "LOBBY":
-        print("[BOOT] LOBBY 감지됨: 바로 practice 진입 가능")
-    else:
-        print("[BOOT] OTHER 감지됨: X 연타 복귀로 LOBBY 만들 예정")
-
-
-def ensure_practice_ready_for_episode(env: GameEnv, ep: int) -> bool:
-    print(f"[EP_PREP] boot_into_practice (ep={ep})")
-    ok = boot_into_practice(env.screen, max_sec_lobby=12.0)
-    if not ok:
-        print("[EP_PREP][WARN] boot_into_practice failed (will continue and let env/reset try)")
-    return ok
-
-
-def _try_clear_agent_rollout(agent):
-    for name in ("clear", "reset_buffer", "reset_storage", "clear_buffer", "clear_rollout"):
-        fn = getattr(agent, name, None)
-        if callable(fn):
-            try:
-                fn()
-                print(f"[PPO] agent.{name}() called (abort cleanup)")
-            except Exception:
-                pass
-            break
-
-
-def _safe_save_checkpoint(agent, ckpt_path: str) -> bool:
+def _pump_cv_events_once():
+    """
+    OpenCV 창을 띄운 경우에만 이벤트 펌프용으로 호출.
+    (키 입력을 여기서 처리하지 않음)
+    """
     try:
-        ret = agent.save(ckpt_path)
-        if isinstance(ret, bool):
-            return ret
-        return True
-    except Exception as e:
-        print(f"[WARN] checkpoint save failed (ignored): {e}")
-        return False
+        cv2.waitKey(1)
+    except Exception:
+        pass
 
 
+# -------------------------
+# Stats logging
+# -------------------------
 STATS_BEGIN = "# === PPO_STATS_BEGIN ==="
 STATS_END = "# === PPO_STATS_END ==="
 
@@ -121,8 +97,6 @@ def _read_text(path: str) -> str:
     try:
         with open(path, "r", encoding="utf-8") as f:
             return f.read()
-    except FileNotFoundError:
-        return ""
     except Exception:
         return ""
 
@@ -158,9 +132,7 @@ def _extract_stats_block(text: str):
 
     for line in block.splitlines():
         line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        if "=" not in line:
+        if not line or line.startswith("#") or ("=" not in line):
             continue
         k, v = line.split("=", 1)
         k = k.strip()
@@ -253,13 +225,19 @@ def _stats_one_line(stats: dict) -> str:
     return f"[STATS] total_completed={stats['total_completed']} | best_reward={br_s} | best_survival={bs_s}"
 
 
-def _apply_no_render(env: GameEnv):
-    # env / obs 쪽 debug 창들 끄기
-    try:
-        env.show_reimu_debug = False
-    except Exception:
-        pass
+def _append_run_header(log_path: str, run_ts: str, episodes: int, is_eval: bool, stats: dict):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write("\n========\n")
+        f.write(f"[RUN] {run_ts}  episodes={episodes} eval={str(bool(is_eval))}\n")
+        f.write(_stats_one_line(stats) + "\n")
+        f.write("idx\treward\tsurvival_sec\tnote\n")
 
+
+# -------------------------
+# Render disable helper
+# -------------------------
+def _apply_no_render(env: GameEnv):
+    # env/obs_builder.py 쪽 플래그들을 최대한 끈다
     try:
         if hasattr(env, "obs") and hasattr(env.obs, "show_reimu_debug"):
             env.obs.show_reimu_debug = False
@@ -272,6 +250,7 @@ def _apply_no_render(env: GameEnv):
     except Exception:
         pass
 
+    # env.debug 같은 별도 디버그 객체가 있을 수도 있어서 방어적으로 off
     dbg = getattr(env, "debug", None)
     if dbg is not None:
         for name, val in (
@@ -287,45 +266,28 @@ def _apply_no_render(env: GameEnv):
                 pass
 
 
-def _append_run_header(log_path: str, run_ts: str, episodes: int, is_eval: bool, stats: dict):
-    with open(log_path, "a", encoding="utf-8") as f:
-        f.write("\n========\n")
-        f.write(f"[RUN] {run_ts}  episodes={episodes} eval={str(bool(is_eval))}\n")
-        f.write(_stats_one_line(stats) + "\n")
-        f.write("idx\treward\tsurvival_sec\tnote\n")
+# -------------------------
+# Agent helpers
+# -------------------------
+def _try_clear_agent_rollout(agent):
+    for name in ("clear", "reset_buffer", "reset_storage", "clear_buffer", "clear_rollout"):
+        fn = getattr(agent, name, None)
+        if callable(fn):
+            try:
+                fn()
+                print(f"[PPO] agent.{name}() called (abort cleanup)")
+            except Exception:
+                pass
+            break
 
 
-class CvEventPump:
-    """
-    OpenCV 창이 있을 때 waitKey를 매 step 호출하면 비용이 생길 수 있어서,
-    시간 기반(예: 60Hz)으로만 펌프.
-    """
-    def __init__(self, env: GameEnv, enabled: bool, hz: float = 60.0):
-        self.env = env
-        self.enabled = bool(enabled)
-        self.period = 1.0 / max(1e-6, float(hz))
-        self._t_last = 0.0
-
-    def tick(self):
-        if not self.enabled:
-            return
-        now = time.perf_counter()
-        if (now - self._t_last) < self.period:
-            return
-        self._t_last = now
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == 255:
-            return
-
-        obs = getattr(self.env, "obs", None)
-        if obs is not None:
-            pump = getattr(obs, "pump_key", None)
-            if callable(pump):
-                try:
-                    pump(int(key))
-                except Exception:
-                    pass
+def _safe_save_checkpoint(agent, ckpt_path: str) -> bool:
+    try:
+        ret = agent.save(ckpt_path)
+        return bool(ret) if isinstance(ret, bool) else True
+    except Exception as e:
+        print(f"[WARN] checkpoint save failed (ignored): {e}")
+        return False
 
 
 def main():
@@ -339,7 +301,6 @@ def main():
     log_path = os.path.join(os.path.dirname(CKPT_PATH), f"{pth_name}_episode_log.txt")
 
     stats = _ensure_stats_header(log_path)
-
     run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     _append_run_header(log_path, run_ts, int(args.episodes), is_eval, stats)
 
@@ -349,10 +310,11 @@ def main():
     if args.no_render:
         _apply_no_render(env)
 
-    # OpenCV 이벤트 펌프 (인게임 루프에서 부담 최소화)
-    pump = CvEventPump(env, enabled=(not args.no_render), hz=60.0)
-
-    boot_print_state(env)
+    # 부팅 시 1회만 상태 찍기 (인게임 중엔 절대 안 함)
+    print("\n[BOOT] 현재 화면 위치 감지 중...")
+    st = detect_location(env.screen)
+    print(f"[BOOT] state={st.get('state')} selected={st.get('selected_name')}")
+    print("[BOOT] practice 진입 준비...")
 
     obs_channels = int(getattr(env.obs, "obs_channels", 1))
     stack_size = int(getattr(env.s, "frame_stack_size", 4))
@@ -369,9 +331,10 @@ def main():
         agent.load(CKPT_PATH, load_optimizer=False)
         print(f"[PPO] checkpoint loaded: {CKPT_PATH}")
     else:
-        print("[PPO] no checkpoint found, training from scratch" if not is_eval else "[PPO][EVAL] no checkpoint found (evaluating random policy)")
+        print("[PPO] no checkpoint found, training from scratch" if not is_eval
+              else "[PPO][EVAL] no checkpoint found (evaluating random policy)")
 
-    # hyperparams
+    # (유지) 하이퍼파라미터 override
     agent.ent_coef = 0.04
     agent.ent_min = 0.005
     agent.ent_decay = 0.9995
@@ -391,12 +354,12 @@ def main():
 
     print("\n[INFO] ESC 중단: Windows 전역 감지(GetAsyncKeyState)")
     print(" - 게임 창이 포커스여도 ESC를 잡고 즉시 종료합니다.\n")
-    time.sleep(0.7)
+    time.sleep(0.5)
 
     stop_requested = False
 
     try:
-        for ep in range(1, args.episodes + 1):
+        for ep in range(1, int(args.episodes) + 1):
             if esc_pressed():
                 stop_requested = True
                 print("[STOP] ESC pressed before episode start -> stopping.")
@@ -404,17 +367,18 @@ def main():
 
             print(f"\n========== EPISODE {ep}/{args.episodes} ==========")
 
-            # 에피소드 시작 전 메뉴/상태 확인(인게임 중엔 호출 안 함)
-            st = detect_location(env.screen)
-            print(f"[BOOT->EP] state={st.get('state')} selected={st.get('selected_name')}")
-
+            # 에피소드 시작 전(로비/스코어 등)에서만 메뉴 제어 수행
             print("[MENU] [practice 준비/진입 중...]")
-            ensure_practice_ready_for_episode(env, ep)
+            ok = boot_into_practice(env.screen, max_sec_lobby=12.0)
+            if not ok:
+                print("[EP_PREP][WARN] boot_into_practice failed (will continue and let env/reset try)")
             print("[MENU] [practice 준비/진입 완료]")
 
             safe_release_inputs()
             state = env.reset()
-            pump.tick()
+
+            if not args.no_render:
+                _pump_cv_events_once()
 
             ep_t0 = time.time()
 
@@ -425,10 +389,10 @@ def main():
             action_counter = Counter()
             aborted = False
 
-            # =========================
-            # ✅ 인게임 루프
-            # - 여기서는 절대 agent.update() 하지 않는다 (렉 방지)
-            # =========================
+            # -------------------------
+            # ✅ 인게임 루프: "절대 update 하지 않는다"
+            # (렉 방지 핵심)
+            # -------------------------
             while not done:
                 if esc_pressed():
                     stop_requested = True
@@ -452,15 +416,16 @@ def main():
                     agent.store(state, exec_idx, reward, done, log_prob, value)
 
                 state = next_state
-                total_reward += reward
+                total_reward += float(reward)
                 steps += 1
 
-                pump.tick()
+                if not args.no_render:
+                    _pump_cv_events_once()
 
-            # =========================
-            # 에피소드 종료 후 처리
-            # (여기서 렉 걸려도 괜찮다고 했으니 update/save/파일 IO 몰아서 수행)
-            # =========================
+            # -------------------------
+            # 에피소드 종료 후(로비/스코어로 빠진 뒤)
+            # 무거운 작업(update/save/log) 수행
+            # -------------------------
             survival_sec = time.time() - ep_t0
             slow_ratio = slow_count / max(1, steps)
             top_actions = action_counter.most_common(5)
@@ -489,21 +454,21 @@ def main():
                 break
 
             if not is_eval:
-                # 기록 업데이트 / stats 저장
-                _maybe_update_records(stats, total_reward, survival_sec, run_ts, ep_tag)
-                _update_stats_in_file(log_path, stats)
-                print(_stats_one_line(stats))
-
-                # ✅ 학습(update)은 여기서만 수행 (인게임 렉 제거의 핵심)
-                # rollout이 여러 번 쌓였을 수도 있으니 가능한 만큼 반복
+                # ✅ 업데이트는 여기서만(인게임 중엔 절대 X)
+                # rollout_steps가 차면 여러 번 update 해야 할 수도 있으니 while로 안전하게 처리
+                # (PPOAgent 구현에 따라 should_update가 내부 카운터 기반일 수 있음)
                 updates = 0
                 while agent.should_update():
                     agent.update(last_state=state, last_done=True)
                     updates += 1
                 if updates > 0:
-                    print(f"[PPO] updates after episode: {updates}")
+                    print(f"[PPO] updates_after_episode={updates}")
 
-                # ✅ 체크포인트는 매 에피소드마다 저장 (요구 유지)
+                _maybe_update_records(stats, total_reward, survival_sec, run_ts, ep_tag)
+                _update_stats_in_file(log_path, stats)
+                print(_stats_one_line(stats))
+
+                # ✅ 에피소드마다 저장(요구사항 유지)
                 ok = _safe_save_checkpoint(agent, CKPT_PATH)
                 if ok:
                     print("[PPO] checkpoint saved")
@@ -517,7 +482,7 @@ def main():
                 break
 
             if ep < args.episodes:
-                time.sleep(0.3)
+                time.sleep(0.2)
 
     finally:
         cleanup_inputs_on_exit()
