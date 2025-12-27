@@ -1,4 +1,4 @@
-# main_ppo.py
+# main_ppo.py (optimized / in-game no-lag version)
 import argparse
 import os
 from datetime import datetime
@@ -23,85 +23,10 @@ import ctypes
 user32 = ctypes.WinDLL("user32", use_last_error=True)
 
 VK_ESCAPE = 0x1B
-VK_R = 0x52  # 'R'
 
 
 def esc_pressed() -> bool:
     return (user32.GetAsyncKeyState(VK_ESCAPE) & 0x8000) != 0
-
-
-def r_pressed_edge(_state={"prev": False}) -> bool:
-    down = (user32.GetAsyncKeyState(VK_R) & 0x8000) != 0
-    edge = down and (not _state["prev"])
-    _state["prev"] = down
-    return edge
-
-
-def _force_reimu_redetect(env: GameEnv) -> bool:
-    """
-    env 내부 어디에 레이무 트래커가 있든 reset()을 찾아 호출한다.
-    성공하면 True.
-    """
-    # 1) env.reimu_tracker (가장 흔함)
-    tr = getattr(env, "reimu_tracker", None)
-    if tr is not None:
-        fn = getattr(tr, "reset", None)
-        if callable(fn):
-            try:
-                fn()
-                return True
-            except Exception:
-                pass
-
-    # 2) env.obs.reimu_tracker / env.obs.tracker / env.obs.reimu
-    obs = getattr(env, "obs", None)
-    if obs is not None:
-        for attr in ("reimu_tracker", "tracker", "reimu"):
-            tr = getattr(obs, attr, None)
-            if tr is None:
-                continue
-            fn = getattr(tr, "reset", None)
-            if callable(fn):
-                try:
-                    fn()
-                    return True
-                except Exception:
-                    pass
-
-        # 3) env.obs 내부에 tracker holder가 있는 경우
-        #    (예: obs.trk.reimu_tracker 같은 구조)
-        for holder_attr in ("trk", "track", "trackers", "detector"):
-            holder = getattr(obs, holder_attr, None)
-            if holder is None:
-                continue
-            for attr in ("reimu_tracker", "tracker", "reimu"):
-                tr = getattr(holder, attr, None)
-                if tr is None:
-                    continue
-                fn = getattr(tr, "reset", None)
-                if callable(fn):
-                    try:
-                        fn()
-                        return True
-                    except Exception:
-                        pass
-
-    # 4) env.debug 쪽에 뭔가 달려있는 경우
-    dbg = getattr(env, "debug", None)
-    if dbg is not None:
-        for attr in ("reimu_tracker", "tracker", "reimu"):
-            tr = getattr(dbg, attr, None)
-            if tr is None:
-                continue
-            fn = getattr(tr, "reset", None)
-            if callable(fn):
-                try:
-                    fn()
-                    return True
-                except Exception:
-                    pass
-
-    return False
 
 
 def parse_args():
@@ -329,8 +254,15 @@ def _stats_one_line(stats: dict) -> str:
 
 
 def _apply_no_render(env: GameEnv):
+    # env / obs 쪽 debug 창들 끄기
     try:
         env.show_reimu_debug = False
+    except Exception:
+        pass
+
+    try:
+        if hasattr(env, "obs") and hasattr(env.obs, "show_reimu_debug"):
+            env.obs.show_reimu_debug = False
     except Exception:
         pass
 
@@ -363,26 +295,37 @@ def _append_run_header(log_path: str, run_ts: str, episodes: int, is_eval: bool,
         f.write("idx\treward\tsurvival_sec\tnote\n")
 
 
-def _pump_cv_key_and_forward_to_obs(env: GameEnv) -> int:
+class CvEventPump:
     """
-    ✅ OpenCV 이벤트 펌프는 main loop에서 1번만.
-    - 여기서 waitKey로 키를 읽고
-    - obs_builder(=env.obs) 쪽에 pump_key가 있으면 전달한다.
+    OpenCV 창이 있을 때 waitKey를 매 step 호출하면 비용이 생길 수 있어서,
+    시간 기반(예: 60Hz)으로만 펌프.
     """
-    key = cv2.waitKey(1) & 0xFF
-    if key == 255:
-        return -1
+    def __init__(self, env: GameEnv, enabled: bool, hz: float = 60.0):
+        self.env = env
+        self.enabled = bool(enabled)
+        self.period = 1.0 / max(1e-6, float(hz))
+        self._t_last = 0.0
 
-    obs = getattr(env, "obs", None)
-    if obs is not None:
-        pump = getattr(obs, "pump_key", None)
-        if callable(pump):
-            try:
-                pump(key)
-            except Exception:
-                pass
+    def tick(self):
+        if not self.enabled:
+            return
+        now = time.perf_counter()
+        if (now - self._t_last) < self.period:
+            return
+        self._t_last = now
 
-    return int(key)
+        key = cv2.waitKey(1) & 0xFF
+        if key == 255:
+            return
+
+        obs = getattr(self.env, "obs", None)
+        if obs is not None:
+            pump = getattr(obs, "pump_key", None)
+            if callable(pump):
+                try:
+                    pump(int(key))
+                except Exception:
+                    pass
 
 
 def main():
@@ -406,6 +349,9 @@ def main():
     if args.no_render:
         _apply_no_render(env)
 
+    # OpenCV 이벤트 펌프 (인게임 루프에서 부담 최소화)
+    pump = CvEventPump(env, enabled=(not args.no_render), hz=60.0)
+
     boot_print_state(env)
 
     obs_channels = int(getattr(env.obs, "obs_channels", 1))
@@ -425,6 +371,7 @@ def main():
     else:
         print("[PPO] no checkpoint found, training from scratch" if not is_eval else "[PPO][EVAL] no checkpoint found (evaluating random policy)")
 
+    # hyperparams
     agent.ent_coef = 0.04
     agent.ent_min = 0.005
     agent.ent_decay = 0.9995
@@ -457,6 +404,7 @@ def main():
 
             print(f"\n========== EPISODE {ep}/{args.episodes} ==========")
 
+            # 에피소드 시작 전 메뉴/상태 확인(인게임 중엔 호출 안 함)
             st = detect_location(env.screen)
             print(f"[BOOT->EP] state={st.get('state')} selected={st.get('selected_name')}")
 
@@ -466,14 +414,7 @@ def main():
 
             safe_release_inputs()
             state = env.reset()
-
-            if not args.no_render:
-                _pump_cv_key_and_forward_to_obs(env)
-
-            try:
-                print("[DBG] state.shape =", state.shape, "dtype=", state.dtype, "min/max=", float(state.min()), float(state.max()))
-            except Exception:
-                pass
+            pump.tick()
 
             ep_t0 = time.time()
 
@@ -484,14 +425,11 @@ def main():
             action_counter = Counter()
             aborted = False
 
+            # =========================
+            # ✅ 인게임 루프
+            # - 여기서는 절대 agent.update() 하지 않는다 (렉 방지)
+            # =========================
             while not done:
-                # ✅ R (전역) 누르면 레이무 트래커 강제 reset -> 초록박스(LOCK) 해제 -> 재탐색
-                if r_pressed_edge():
-                    ok = _force_reimu_redetect(env)
-                    if ok:
-                        safe_release_inputs()  # 키 리셋하는 김에 입력도 안전하게
-                    # 성공/실패 여부 상관없이 계속 진행
-
                 if esc_pressed():
                     stop_requested = True
                     aborted = True
@@ -517,12 +455,12 @@ def main():
                 total_reward += reward
                 steps += 1
 
-                if (not is_eval) and agent.should_update():
-                    agent.update(last_state=state, last_done=done)
+                pump.tick()
 
-                if not args.no_render:
-                    _pump_cv_key_and_forward_to_obs(env)
-
+            # =========================
+            # 에피소드 종료 후 처리
+            # (여기서 렉 걸려도 괜찮다고 했으니 update/save/파일 IO 몰아서 수행)
+            # =========================
             survival_sec = time.time() - ep_t0
             slow_ratio = slow_count / max(1, steps)
             top_actions = action_counter.most_common(5)
@@ -551,12 +489,21 @@ def main():
                 break
 
             if not is_eval:
+                # 기록 업데이트 / stats 저장
                 _maybe_update_records(stats, total_reward, survival_sec, run_ts, ep_tag)
                 _update_stats_in_file(log_path, stats)
                 print(_stats_one_line(stats))
 
-                agent.update(last_state=state, last_done=True)
+                # ✅ 학습(update)은 여기서만 수행 (인게임 렉 제거의 핵심)
+                # rollout이 여러 번 쌓였을 수도 있으니 가능한 만큼 반복
+                updates = 0
+                while agent.should_update():
+                    agent.update(last_state=state, last_done=True)
+                    updates += 1
+                if updates > 0:
+                    print(f"[PPO] updates after episode: {updates}")
 
+                # ✅ 체크포인트는 매 에피소드마다 저장 (요구 유지)
                 ok = _safe_save_checkpoint(agent, CKPT_PATH)
                 if ok:
                     print("[PPO] checkpoint saved")

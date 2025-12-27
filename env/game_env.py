@@ -295,6 +295,9 @@ class GameEnv:
             self.s.prev_ui_lives = int(ui_now)
             self.s.lives = int(ui_now) + 1  # 참고용
 
+            print(f"ui목숨 감소 감지. 현재 남은 목숨은 : {int(ui_now)}")
+
+
             # ✅ 여기! “목숨 깎인 순간” 트래커 초기화
             self._reset_tracker_on_death()
 

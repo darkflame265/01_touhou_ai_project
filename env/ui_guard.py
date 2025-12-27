@@ -20,7 +20,7 @@ class UIGuard:
         if not ui_panel_ok:
             return None
         try:
-            v = count_lives_from_img(img_bgr, debug=True)
+            v = count_lives_from_img(img_bgr, debug=False)
         except Exception:
             return None
         if v is None:

@@ -1,12 +1,12 @@
 # === PPO_STATS_BEGIN ===
-total_completed=23
+total_completed=29
 best_reward=43.087201
 best_reward_ts=2025-12-26 22:29:20
 best_reward_run=2025-12-26 22:28:40
 best_reward_ep=(1/1)
-best_survival=30.571
-best_survival_ts=2025-12-27 15:47:17
-best_survival_run=2025-12-27 15:46:36
+best_survival=31.212
+best_survival_ts=2025-12-27 16:51:11
+best_survival_run=2025-12-27 16:50:28
 best_survival_ep=(1/1)
 # === PPO_STATS_END ===
 
@@ -312,3 +312,39 @@ idx	reward	survival_sec	note
 [STATS] total_completed=22 | best_reward=43.087 | best_survival=30.57s
 idx	reward	survival_sec	note
 (1/1)	5.331315	18.508	
+
+========
+[RUN] 2025-12-27 16:50:28  episodes=1 eval=False
+[STATS] total_completed=23 | best_reward=43.087 | best_survival=30.57s
+idx	reward	survival_sec	note
+(1/1)	29.899832	31.212	
+
+========
+[RUN] 2025-12-27 16:58:32  episodes=1 eval=False
+[STATS] total_completed=24 | best_reward=43.087 | best_survival=31.21s
+idx	reward	survival_sec	note
+(1/1)	21.095713	22.787	
+
+========
+[RUN] 2025-12-27 17:05:26  episodes=1 eval=False
+[STATS] total_completed=25 | best_reward=43.087 | best_survival=31.21s
+idx	reward	survival_sec	note
+(1/1)	18.500000	20.561	
+
+========
+[RUN] 2025-12-27 17:06:24  episodes=1 eval=False
+[STATS] total_completed=26 | best_reward=43.087 | best_survival=31.21s
+idx	reward	survival_sec	note
+(1/1)	16.696437	24.848	
+
+========
+[RUN] 2025-12-27 17:10:31  episodes=1 eval=False
+[STATS] total_completed=27 | best_reward=43.087 | best_survival=31.21s
+idx	reward	survival_sec	note
+(1/1)	16.507942	23.697	
+
+========
+[RUN] 2025-12-27 17:22:14  episodes=1 eval=False
+[STATS] total_completed=28 | best_reward=43.087 | best_survival=31.21s
+idx	reward	survival_sec	note
+(1/1)	7.939221	16.261	
