@@ -22,9 +22,9 @@ CV 기반 레이무 트래커
 - ✅ 배경(천천히/부드럽게/일정하게) 움직이는 트랙을 LOCK에서 감점/제외하는 규칙 추가
 - ✅ 레이무가 주로 있는 "아래쪽" 위치 prior를 score에 추가(가벼운 편향)
 
-추가 변경(이번 요청):
-- ✅ area_min/area_max의 'area' 기준을 contourArea -> bbox area(w*h) 로 통일
-  (디버그뷰가 출력하는 area(w*h)와 동일 기준)
+추가 변경점(이번 요청):
+- ✅ area 기준을 cv2.contourArea가 아니라 bbox 면적(w*h)로 통일
+  -> 디버그 뷰의 area(=w*h)와 필터의 area가 같은 의미가 됨
 """
 
 from __future__ import annotations
@@ -72,8 +72,10 @@ class TrackerConfig:
     w_max: int = 70
     h_min: int = 28
     h_max: int = 115
-    area_min: int = 400
-    area_max: int = 4500
+
+    # ✅ area는 bbox 면적(w*h) 기준으로 통일
+    area_min: int = 500
+    area_max: int = 5000
 
     # aspect = w/h
     aspect_min: float = 0.40
@@ -85,12 +87,12 @@ class TrackerConfig:
     peak_min_area: int = 25
 
     # 작은 후보는 peak 검사 스킵
-    peak_check_min_area: int = 900
-    peak_check_min_wh: int = 26 * 38  # ~988
+    peak_check_min_area: int = 900      # ✅ bbox_area 기준으로 사용
+    peak_check_min_wh: int = 26 * 38    # ~988
 
     # Association / lock
     assoc_dist: float = 60.0
-    cand_ttl_sec: float = 0.25
+    cand_ttl_sec: float = 0.15
 
     # hold 시간 내에 "지속적으로 관측된 트랙"만 락 후보
     lock_hold_sec: float = 0.19
@@ -113,12 +115,9 @@ class TrackerConfig:
     # =========================
     # ✅ 배경 트랙 억제(LOCK 후보 선정용)
     # =========================
-
-    # (1) "아래쪽" prior: 레이무는 보통 화면 아래쪽에 많음.
     lock_y_prior_weight: float = 0.35  # 0이면 사용 안함
-
-    # (2) "부드러운 배경 스크롤" 억제
     reject_smooth_bg: bool = True
+
     smooth_total_disp_px: float = 3.0
     smooth_max_step_px: float = 2.0
     smooth_dir_std_deg: float = 12.0
@@ -369,7 +368,7 @@ class ReimuTrackerCV:
         now = float(now)
 
         # =========================
-        # LOCK: CSRT update only (+정지 감지로 재탐색)
+        # LOCK
         # =========================
         if self.locked and self.lock_bbox is not None:
             ok = True
@@ -530,19 +529,21 @@ class ReimuTrackerCV:
             if len(cands) >= max_keep:
                 break
 
-            # ✅ (단위 통일) area 필터를 contourArea가 아니라 bbox area(w*h)로 적용
+            # ✅ area는 bbox 면적(w*h)로 통일하기 위해, 먼저 boundingRect를 구한다.
             x, y, w, h = cv2.boundingRect(c)
-            bbox_area = float(int(w) * int(h))
-            if bbox_area < float(self.cfg.area_min) or bbox_area > float(self.cfg.area_max):
-                continue
 
             if not (self.cfg.w_min <= w <= self.cfg.w_max and self.cfg.h_min <= h <= self.cfg.h_max):
+                continue
+
+            bbox_area = float(w * h)
+            if bbox_area < float(self.cfg.area_min) or bbox_area > float(self.cfg.area_max):
                 continue
 
             ar = (w / float(h)) if h > 0 else 999.0
             if ar < float(self.cfg.aspect_min) or ar > float(self.cfg.aspect_max):
                 continue
 
+            # 큰 후보만 peak 검사 (✅ bbox_area 기준)
             do_peak = (bbox_area >= float(self.cfg.peak_check_min_area)) and ((w * h) >= int(self.cfg.peak_check_min_wh))
             if do_peak:
                 sub = fg[y:y + h, x:x + w]
@@ -615,12 +616,12 @@ class ReimuTrackerCV:
         for tr in self._tracks.values():
             pts = [p for p in tr.hist if (now - p[0]) <= hold]
             n = len(pts)
-            if n < 4:
+            if n < 3:
                 continue
 
             t0 = pts[0][0]
             t1 = pts[-1][0]
-            if (t1 - t0) < hold * 0.8:
+            if (t1 - t0) < hold * 0.5:
                 continue
 
             if use_smooth_reject:
