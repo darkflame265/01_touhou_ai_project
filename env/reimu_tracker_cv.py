@@ -1,30 +1,21 @@
 # env/reimu_tracker_cv.py
 """
-CV 기반 레이무 트래커 (touhou_02 reimu_track_test.py 방식 그대로 클래스화)
+CV 기반 레이무 트래커
 
-원리(=touhou_02 그대로):
-- ROI: 고정 사각형(LEFT/TOP/RIGHT_MARGIN/BOTTOM_MARGIN)
-- MOG2(roi_bgr에 apply) -> threshold(200) -> morph(open) -> erode -> dilate
-- contour 후보들에 대해:
-  - area/size/aspect(w/h) 필터
-  - distanceTransform peak count로 탄알 군집 제거
+원리:
+- ROI 고정
+- MOG2 -> threshold -> morph(open) -> erode -> dilate
+- contour 후보:
+  - area/size/aspect 필터
+  - (큰 후보에 한해) distanceTransform peak count로 탄알 군집 제거
 - LOCK 전:
-  - 후보들을 track으로 유지(association + TTL)
-  - 일정 시간 동안 크기 안정적인 track만 LOCK 후보 선정
+  - 후보들을 track 유지(association + TTL)
+  - 일정 시간 동안 크기 안정 + (최소 이동) 트랙만 LOCK 후보 선정
 - LOCK 후:
   - CSRT tracker로만 추적
   - R 누르기 전까지 절대 unlock 하지 않음 (외부에서 reset() 호출)
-
-출력:
-- step(frame, now=None) -> (bbox_xywh or None, conf)
-  - LOCK 성공/유지: (bbox, 1.0)
-  - 그 외: (None, 0.0)
-
-디버그(그리기용 데이터만):
-- get_debug()로 ROI/candidates/lock_cand/locked_bbox 제공
-- LOCK 상태에서는 candidates/lock_cand를 비움(그리지 않게)
 """
-#ss
+
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -36,22 +27,27 @@ import numpy as np
 
 BBox = Tuple[int, int, int, int]  # (x, y, w, h)
 
+
 @dataclass
 class TrackerConfig:
+    # ROI
     roi_left: int = 20
     roi_top: int = 210
     roi_right_margin: int = 210
     roi_bottom_margin: int = 10
 
+    # MOG2
     mog2_history: int = 120
     mog2_var_threshold: int = 28
     mog2_detect_shadows: bool = False
 
+    # Morphology
     open_k: int = 3
     open_iter: int = 1
     erode_iter: int = 1
     dilate_iter: int = 1
 
+    # Candidate filters
     w_min: int = 18
     w_max: int = 70
     h_min: int = 28
@@ -62,17 +58,36 @@ class TrackerConfig:
     aspect_min: float = 0.45
     aspect_max: float = 0.78
 
+    # Peak check (탄알 군집 제거)
     peak_bin_ratio: float = 0.60
     peak_max_count: int = 1
     peak_min_area: int = 25
 
+    # 작은 후보는 peak 검사 스킵 (비싼 distanceTransform 절감)
+    peak_check_min_area: int = 900
+    peak_check_min_wh: int = 26 * 38  # ~988
+
+    # Association / lock
     assoc_dist: float = 60.0
     cand_ttl_sec: float = 0.25
-    lock_hold_sec: float = 0.25
+
+    # 0.25 -> 0.18~0.20
+    lock_hold_sec: float = 0.19
+
     size_stable_tol: float = 0.35
 
+    # ✅ 추가(오탐 감소, 부작용 적게): 락 후보는 "최소 이동" 필요
+    # (너무 작은 값이면 효과 없음, 너무 크면 락이 늦어짐)
+    lock_min_disp_px: float = 2.0
+
     lock_pad_px: int = 6
+
+    # 후보 수 줄이기
+    max_candidates_per_frame: int = 45
+
+    # debug
     debug_max_candidates: int = 80
+
 
 def _clamp_bbox(b: BBox, W: int, H: int) -> BBox:
     x, y, w, h = b
@@ -166,6 +181,9 @@ def _peaks_count_from_mask(mask_u8: np.ndarray, peak_bin_ratio: float, peak_min_
     for c in cnts:
         if cv2.contourArea(c) >= float(peak_min_area):
             keep += 1
+            # peak_max_count=1이면 여기서 더 볼 필요 없음 (미세 최적화)
+            if keep >= 2:
+                break
     return int(keep)
 
 
@@ -184,6 +202,10 @@ class ReimuTrackerCV:
             varThreshold=float(self.cfg.mog2_var_threshold),
             detectShadows=bool(self.cfg.mog2_detect_shadows),
         )
+
+        # morphology kernel 캐시 (프레임마다 만들지 않음)
+        k = max(1, int(self.cfg.open_k))
+        self._open_kernel = np.ones((k, k), np.uint8)
 
         self._csrt = None
         self.locked: bool = False
@@ -248,7 +270,7 @@ class ReimuTrackerCV:
         )
         self._dbg_roi_xyxy = (x0, y0, x1, y1)
 
-        # LOCK: CSRT update only (절대 자동 unlock 안 함)
+        # LOCK: CSRT update only
         if self.locked and self.lock_bbox is not None:
             if self._csrt is not None:
                 try:
@@ -272,6 +294,7 @@ class ReimuTrackerCV:
         cands_roi, fg = self._detect_candidates_roi(roi)
         self._dbg_fg_roi = fg
 
+        # debug candidates (full coords)
         self._dbg_candidates_full = []
         for (bx, by, bw, bh) in cands_roi:
             self._dbg_candidates_full.append(_clamp_bbox((x0 + bx, y0 + by, bw, bh), W, H))
@@ -307,6 +330,7 @@ class ReimuTrackerCV:
             ok_init = False
 
         if not ok_init:
+            # 실패 시 과감히 초기화(다음 기회)
             self._tracks.clear()
             self._next_id = 1
             self.bg = cv2.createBackgroundSubtractorMOG2(
@@ -328,18 +352,25 @@ class ReimuTrackerCV:
         fg = self.bg.apply(roi_bgr)
         _, fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)
 
-        k = max(1, int(self.cfg.open_k))
-        kernel = np.ones((k, k), np.uint8)
-
-        fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel, iterations=int(self.cfg.open_iter))
+        fg = cv2.morphologyEx(
+            fg, cv2.MORPH_OPEN, self._open_kernel, iterations=int(self.cfg.open_iter)
+        )
         fg = cv2.erode(fg, None, iterations=int(self.cfg.erode_iter))
         fg = cv2.dilate(fg, None, iterations=int(self.cfg.dilate_iter))
 
         cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
+        # 후보가 많으면 큰 contour 위주로 (정렬 비용 vs 이득 트레이드)
+        max_keep = int(self.cfg.max_candidates_per_frame)
+        if len(cnts) > max_keep:
+            cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+
         cands: List[BBox] = []
         for c in cnts:
-            area = cv2.contourArea(c)
+            if len(cands) >= max_keep:
+                break
+
+            area = float(cv2.contourArea(c))
             if area < float(self.cfg.area_min) or area > float(self.cfg.area_max):
                 continue
 
@@ -351,10 +382,17 @@ class ReimuTrackerCV:
             if ar < float(self.cfg.aspect_min) or ar > float(self.cfg.aspect_max):
                 continue
 
-            sub = fg[y:y + h, x:x + w]
-            pk = _peaks_count_from_mask(sub, peak_bin_ratio=self.cfg.peak_bin_ratio, peak_min_area=self.cfg.peak_min_area)
-            if pk > int(self.cfg.peak_max_count):
-                continue
+            # 큰 후보만 peak 검사
+            do_peak = (area >= float(self.cfg.peak_check_min_area)) and ((w * h) >= int(self.cfg.peak_check_min_wh))
+            if do_peak:
+                sub = fg[y:y + h, x:x + w]
+                pk = _peaks_count_from_mask(
+                    sub,
+                    peak_bin_ratio=self.cfg.peak_bin_ratio,
+                    peak_min_area=self.cfg.peak_min_area,
+                )
+                if pk > int(self.cfg.peak_max_count):
+                    continue
 
             cands.append((int(x), int(y), int(w), int(h)))
 
@@ -362,32 +400,39 @@ class ReimuTrackerCV:
 
     def _update_tracks(self, cands_roi: List[BBox], now: float):
         used = set()
+        ttl = float(self.cfg.cand_ttl_sec)
+        assoc = float(self.cfg.assoc_dist)
+        assoc2 = assoc * assoc
 
+        # update existing tracks
         for tid, tr in list(self._tracks.items()):
-            if (now - tr.last) > float(self.cfg.cand_ttl_sec):
+            if (now - tr.last) > ttl:
                 del self._tracks[tid]
                 continue
 
             lx, ly = float(tr.hist[-1][1]), float(tr.hist[-1][2])
 
             best_i = None
-            best_d = 1e18
+            best_d2 = 1e18
             for i, b in enumerate(cands_roi):
                 if i in used:
                     continue
                 cx, cy = _bbox_center(b)
-                d = (cx - lx) ** 2 + (cy - ly) ** 2
-                if d < best_d:
-                    best_d = d
+                dx = cx - lx
+                dy = cy - ly
+                d2 = dx * dx + dy * dy
+                if d2 < best_d2:
+                    best_d2 = d2
                     best_i = i
 
-            if best_i is not None and (best_d ** 0.5) <= float(self.cfg.assoc_dist):
+            if best_i is not None and best_d2 <= assoc2:
                 used.add(best_i)
                 b = cands_roi[best_i]
                 cx, cy = _bbox_center(b)
                 tr.hist.append((now, float(cx), float(cy), b))
                 tr.last = now
 
+        # new tracks
         for i, b in enumerate(cands_roi):
             if i in used:
                 continue
@@ -399,29 +444,58 @@ class ReimuTrackerCV:
             self._next_id += 1
 
     def _pick_lock_candidate(self, now: float) -> Optional[BBox]:
-        best = None
+        best: Optional[BBox] = None
         best_score = -1.0
 
+        hold = float(self.cfg.lock_hold_sec)
+        stable_tol = float(self.cfg.size_stable_tol)
+        min_disp = float(self.cfg.lock_min_disp_px)
+
         for tr in self._tracks.values():
-            pts = [p for p in tr.hist if (now - p[0]) <= float(self.cfg.lock_hold_sec)]
-            if len(pts) < 4:
+            # hold 내 포인트들만
+            pts = [p for p in tr.hist if (now - p[0]) <= hold]
+            n = len(pts)
+            if n < 4:
                 continue
 
             t0 = pts[0][0]
             t1 = pts[-1][0]
-            if (t1 - t0) < float(self.cfg.lock_hold_sec) * 0.8:
+            if (t1 - t0) < hold * 0.8:
                 continue
 
-            ws = np.array([p[3][2] for p in pts], dtype=np.float32)
-            hs = np.array([p[3][3] for p in pts], dtype=np.float32)
-            w0, h0 = float(ws[0]), float(hs[0])
+            # ✅ 최소 이동 조건(오탐 감소, 부작용 적게)
+            dx = float(pts[-1][1] - pts[0][1])
+            dy = float(pts[-1][2] - pts[0][2])
+            if (dx * dx + dy * dy) < (min_disp * min_disp):
+                continue
 
-            wv = float((ws.max() - ws.min()) / max(1.0, w0))
-            hv = float((hs.max() - hs.min()) / max(1.0, h0))
-            if wv > float(self.cfg.size_stable_tol) or hv > float(self.cfg.size_stable_tol):
+            # ✅ size stability (np.array 만들지 않고 min/max만)
+            w0 = float(pts[0][3][2])
+            h0 = float(pts[0][3][3])
+            w_min = 1e18
+            w_max = -1e18
+            h_min = 1e18
+            h_max = -1e18
+            for p in pts:
+                w = float(p[3][2])
+                h = float(p[3][3])
+                if w < w_min:
+                    w_min = w
+                if w > w_max:
+                    w_max = w
+                if h < h_min:
+                    h_min = h
+                if h > h_max:
+                    h_max = h
+
+            wv = float((w_max - w_min) / max(1.0, w0))
+            hv = float((h_max - h_min) / max(1.0, h0))
+            if wv > stable_tol or hv > stable_tol:
                 continue
 
             b_last = pts[-1][3]
+
+            # 점수: 오래 유지 + 조금 큰 후보 선호 (기존 유지)
             score = (t1 - t0) * 10.0 + (b_last[2] * b_last[3]) * 0.001
             if score > best_score:
                 best_score = score

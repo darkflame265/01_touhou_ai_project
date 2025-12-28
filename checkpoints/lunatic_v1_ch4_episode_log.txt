@@ -1,5 +1,5 @@
 # === PPO_STATS_BEGIN ===
-total_completed=123
+total_completed=125
 best_reward=67.370951
 best_reward_ts=2025-12-28 10:59:02
 best_reward_run=2025-12-28 10:47:26
@@ -301,3 +301,15 @@ idx	reward	survival_sec	note
 [STATS] total_completed=122 | best_reward=67.371 | best_survival=41.95s
 idx	reward	survival_sec	note
 (1/1)	36.404468	31.517	
+
+========
+[RUN] 2025-12-28 14:10:17  episodes=1 eval=False
+[STATS] total_completed=123 | best_reward=67.371 | best_survival=41.95s
+idx	reward	survival_sec	note
+(1/1)	21.671023	22.731	
+
+========
+[RUN] 2025-12-28 14:33:36  episodes=1 eval=False
+[STATS] total_completed=124 | best_reward=67.371 | best_survival=41.95s
+idx	reward	survival_sec	note
+(1/1)	36.896409	30.142	
