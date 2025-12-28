@@ -117,7 +117,7 @@ class GameEnv:
         # ✅ 시작 타이밍 / 폭탄 금지 타이머
         now = time.time()
         self.s.episode_start_time = float(now)
-        self.s.bomb_forbid_until = float(now + 3.0)   # 게임 시작 후 3초 폭탄 금지
+        self.s.bomb_forbid_until = float(now + 5.0)   # 게임 시작 후 3초 폭탄 금지
         self.s.bomb_lock_until = 0.0
         self.s.last_bomb_time = 0.0
 

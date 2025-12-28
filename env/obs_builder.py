@@ -96,7 +96,7 @@ class ObsBuilder:
     # =========================
     # ✅ Bomb hook
     # =========================
-    def on_bomb_used(self, pause_sec: float = 3.0):
+    def on_bomb_used(self, pause_sec: float = 2.0):
         """
         폭탄 연출(레이무 일러스트/이펙트)로 tracker가 오염되는 걸 방지:
         - pause_sec 동안 tracker.step()을 아예 호출하지 않음
