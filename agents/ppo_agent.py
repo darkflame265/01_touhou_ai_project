@@ -119,7 +119,6 @@ class PPOAgent:
 
     @torch.no_grad()
     def select_action(self, state: np.ndarray):
-        # state -> (1, ...) float32 on device
         s = torch.from_numpy(state).to(self.device, dtype=torch.float32).unsqueeze(0)
 
         if s.is_cuda and getattr(self.model, "to", None) and s.dim() == 4:

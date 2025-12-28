@@ -47,7 +47,6 @@ def main(n=50):
     for k in keys:
         i = idx_map[k]
 
-        # stack 만들기: [t, t-1, ...]
         st = []
         base_gray = None
         H = W = None

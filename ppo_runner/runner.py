@@ -132,7 +132,7 @@ def run(
             print(f"\n========== EPISODE {ep}/{episodes} ==========")
 
             # 에피소드 시작 전(로비/스코어 등)에서만 메뉴 제어
-            print("[MENU] [practice 준비/진입 중...]")
+            print("[MENU] [practice 준비/진입 중.]")
             ok = boot_into_practice(env.screen, max_sec_lobby=12.0)
             if not ok:
                 print("[EP_PREP][WARN] boot_into_practice failed (continue)")

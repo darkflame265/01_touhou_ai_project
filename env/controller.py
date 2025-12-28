@@ -94,9 +94,11 @@ def _send_scancode(scan: int, is_down: bool, extended: bool = False) -> bool:
 # =========================
 # Key mapping (Scan codes)
 # =========================
+# NOTE: 네 프로젝트에서 공격키는 z 고정, 폭탄키는 x 로 가정
 SCAN = {
-    "z": (0x2C, False),
-    "shift": (0x2A, False),
+    "z": (0x2C, False),     # Z
+    "x": (0x2D, False),     # X (bomb)
+    "shift": (0x2A, False), # LSHIFT
     "left": (0x4B, True),
     "right": (0x4D, True),
     "up": (0x48, True),
@@ -104,6 +106,7 @@ SCAN = {
 }
 
 ATTACK_KEY = "z"
+BOMB_KEY = "x"
 
 MOVE_KEYS = {
     "LEFT": "left",
@@ -162,20 +165,41 @@ def _key_up(key: str):
     _HELD.discard(key)
 
 
+def tap_key(key: str, hold_sec: float = 0.03):
+    """
+    '짧게 눌렀다 떼기' (폭탄처럼 순간 입력에 사용)
+    """
+    sc, ext = SCAN[key]
+    _send_scancode(sc, is_down=True, extended=ext)
+    time.sleep(max(0.0, float(hold_sec)))
+    _send_scancode(sc, is_down=False, extended=ext)
+
+
+def press_bomb(hold_sec: float = 0.03):
+    tap_key(BOMB_KEY, hold_sec=hold_sec)
+
+
 # =========================
 # Main input API
 # =========================
 def press_keys(action_keys):
     """
     action_keys: ["LEFT"], ["SLOW","UP"], ["UP","RIGHT"] 등
+    + ["BOMB"] 를 포함해도 됨(이 경우 x 를 '딸깍' 누름)
     """
-    # 공격키 유지
+    # 0) 폭탄은 '짧게 탭' (동시 입력 필요 없다고 했으니 여기서만 처리)
+    if "BOMB" in action_keys:
+        press_bomb()
+        # bomb는 순간 입력이라 이후 로직에서 방향/슬로우에 영향 주지 않게 제거
+        action_keys = [k for k in action_keys if k != "BOMB"]
+
+    # 1) 공격키 유지
     if _ATTACK_HOLD:
         _key_down(ATTACK_KEY)
     else:
         _key_up(ATTACK_KEY)
 
-    # --- SLOW 처리 ---
+    # 2) SLOW 처리
     slow_name = "SLOW"
     slow_key = MOVE_KEYS[slow_name]
 
@@ -187,7 +211,7 @@ def press_keys(action_keys):
         else:
             _key_up(slow_key)
 
-    # --- 방향키 ---
+    # 3) 방향키 처리
     for name, key in MOVE_KEYS.items():
         if name == slow_name:
             continue
@@ -210,9 +234,15 @@ def release_all(force: bool = False):
     if force:
         _ALWAYS_SLOW = False
 
-    for name, key in MOVE_KEYS.items():
+    # 방향/슬로우 해제
+    for _, key in MOVE_KEYS.items():
         _key_up(key)
+
+    # 공격 해제
     _key_up(ATTACK_KEY)
+
+    # 폭탄은 원래 홀드 안 하지만, 혹시 꼬였을까봐 한 번 Up 보장
+    _key_up(BOMB_KEY)
 
 
 # =========================

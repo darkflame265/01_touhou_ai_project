@@ -466,7 +466,7 @@ def recover_to_lobby(
 
     ✅ 최적화:
     - 루프당 capture 1회
-    - detect_location(screen, img=..., need_selected=False)로
+    - detect_location(screen, img=, need_selected=False)로
       selected(하이라이트 스코어) 계산은 생략
     """
     print("[MENU][RECOVER_LOBBY] start")

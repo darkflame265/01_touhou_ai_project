@@ -70,10 +70,10 @@ def run_main():
         apply_no_render(env)
 
     # 부팅 시 1회만(인게임 중에는 절대 안 돌림)
-    print("\n[BOOT] 현재 화면 위치 감지 중...")
+    print("\n[BOOT] 현재 화면 위치 감지 중.")
     st = detect_location(env.screen)
     print(f"[BOOT] state={st.get('state')} selected={st.get('selected_name')}")
-    print("[BOOT] practice 진입 준비...")
+    print("[BOOT] practice 진입 준비.")
 
     obs_channels = int(getattr(env.obs, "obs_channels", 1))
     stack_size = int(getattr(env.s, "frame_stack_size", 4))
@@ -118,7 +118,7 @@ def run_main():
             print(f"\n========== EPISODE {ep}/{args.episodes} ==========")
 
             # 에피소드 시작 전(로비/스코어)에서만 메뉴 제어
-            print("[MENU] [practice 준비/진입 중...]")
+            print("[MENU] [practice 준비/진입 중.]")
             ok = boot_into_practice(env.screen, max_sec_lobby=12.0)
             if not ok:
                 print("[EP_PREP][WARN] boot_into_practice failed (will continue and let env/reset try)")

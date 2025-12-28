@@ -114,6 +114,13 @@ class GameEnv:
         self.s.episode_end_pen = 0.0
         self.s.ep_total_reward = 0.0
 
+        # ✅ 시작 타이밍 / 폭탄 금지 타이머
+        now = time.time()
+        self.s.episode_start_time = float(now)
+        self.s.bomb_forbid_until = float(now + 3.0)   # 게임 시작 후 3초 폭탄 금지
+        self.s.bomb_lock_until = 0.0
+        self.s.last_bomb_time = 0.0
+
         self.fs.reset()
         self.act.reset()
 
@@ -161,7 +168,7 @@ class GameEnv:
             if self.s.ui_absent_count >= self.s.ui_absent_needed:
                 return self._end_episode(self.reward_engine.abort_pen, "ABORT:UI_ABSENT(pre)")
 
-        # initial mask + key press
+        # initial mask + key press (여기서 bomb 락/트래킹 pause 트리거됨)
         r0 = self.act.begin(action_idx, pre_img)
         masked_idx = int(r0.masked_idx)
 
@@ -193,11 +200,11 @@ class GameEnv:
                 total_reward += pen_r
                 return self.packer.pack_frames_concat(), float(total_reward), True
 
-            # obs
+            # obs (ObsBuilder가 bomb pause 처리)
             state = self.obs.make_state(img)
             state_chw = self.packer.as_chw(state)
 
-            # remask / key update
+            # remask / key update (bomb 락 중이면 executor가 입력정지 유지)
             r1 = self.act.remask_if_needed(masked_idx, img)
             masked_idx = int(r1.masked_idx)
 

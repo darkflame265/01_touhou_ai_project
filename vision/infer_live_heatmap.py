@@ -94,7 +94,7 @@ def main():
         disp = cv2.cvtColor(play_gray, cv2.COLOR_GRAY2BGR)
 
         if len(buf) < stack:
-            cv2.putText(disp, f"warming up stack... ({len(buf)}/{stack})",
+            cv2.putText(disp, f"warming up stack. ({len(buf)}/{stack})",
                         (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
                         (255, 255, 255), 2, cv2.LINE_AA)
             cv2.imshow(WIN, disp)

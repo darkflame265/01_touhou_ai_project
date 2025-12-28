@@ -1,4 +1,5 @@
 # env/obs_builder.py
+import time
 import cv2
 import numpy as np
 
@@ -56,16 +57,20 @@ class ObsBuilder:
         self.risk_tau_px = 8.0
         self.risk_clip_max = 1.0
 
-        # 디버그 창 (원하면 True)
+        # ✅ 폭탄 연출 중 트래킹 정지
+        self._track_pause_until = 0.0
+        self._track_pause_active = False
+        self._track_pause_resume_reset_pending = False  # pause 끝나면 reset해서 재탐색
+
+        # 디버그 창
         self.show_reimu_debug = True
         dbg_cfg = DebugViewConfig(
             window_name="debug_hell",
-            enable_keys=False,  # waitKey는 main loop에서만!
+            enable_keys=False,
             wait_ms=1,
         )
         self.reimu_dbg_view = ReimuTrackerDebugView(self.tracker, cfg=dbg_cfg)
 
-        # OBS crop 디버그는 기본 OFF (렉 원인 될 수 있음)
         self.show_obs_debug = True
         self.win_crop = "OBS_CROP"
         self._obs_win_inited = False
@@ -77,15 +82,30 @@ class ObsBuilder:
         self.last_conf = 0.0
         self._prev_gray_small_u8 = None
 
+        self._track_pause_until = 0.0
+        self._track_pause_active = False
+        self._track_pause_resume_reset_pending = False
+
     def on_player_death(self):
         # 목숨 깎였을 때 tracker 상태 리셋
         try:
             self.tracker.reset()
         except Exception:
             pass
-        # 좌표 캐시는 유지해도 되지만, 원하면 초기화 가능
-        # self.last_xy_norm = (0.5, 0.78)
-        # self.last_conf = 0.0
+
+    # =========================
+    # ✅ Bomb hook
+    # =========================
+    def on_bomb_used(self, pause_sec: float = 3.0):
+        """
+        폭탄 연출(레이무 일러스트/이펙트)로 tracker가 오염되는 걸 방지:
+        - pause_sec 동안 tracker.step()을 아예 호출하지 않음
+        - pause 종료 시 tracker.reset()으로 재탐색
+        """
+        now = time.time()
+        self._track_pause_until = float(now + float(pause_sec))
+        self._track_pause_active = True
+        self._track_pause_resume_reset_pending = True
 
     def pump_key(self, key: int):
         if key is None or key < 0:
@@ -117,7 +137,6 @@ class ObsBuilder:
         return img_bgr[y1:y2, x1:x2], (cx, cy)
 
     def _inject_meta_pixels_ch0_only(self, ch0_01: np.ndarray) -> np.ndarray:
-        # ch0_01: (obs_out_size, obs_out_size) float32
         try:
             x_n, y_n = self.last_xy_norm
             c = float(self.last_conf)
@@ -157,7 +176,6 @@ class ObsBuilder:
         return mask_u8
 
     def _compute_risk_heat_small(self, bullet_mask_u8_small: np.ndarray) -> np.ndarray:
-        # bullet=255, bg=0 가정이면 invert 필요
         inv = cv2.bitwise_not(bullet_mask_u8_small)  # 탄=0, 배경=255
         dist = cv2.distanceTransform(inv, distanceType=cv2.DIST_L2, maskSize=3)
 
@@ -174,21 +192,43 @@ class ObsBuilder:
         return risk.astype(np.float32, copy=False)
 
     def make_state(self, img_bgr: np.ndarray):
-        # 1) tracker step (전체 화면 기준)
-        bbox, conf = self.tracker.step(img_bgr)
-        if bbox is not None:
-            x, y, w, h = map(int, bbox)
-            cx = int(round(x + 0.5 * w))
-            cy = int(round(y + 0.5 * h))
-            self.player_center = (cx, cy)
-            self.last_conf = float(np.clip(conf, 0.0, 1.0))
-            self.last_xy_norm = self._full_xy_to_playfield_norm(cx, cy)
+        now = time.time()
+
+        # =========================
+        # ✅ tracker pause window
+        # =========================
+        if self._track_pause_active:
+            if now < float(self._track_pause_until):
+                # 폭탄 연출 중: tracker.step() 자체를 호출하지 않는다 (LOCK 오염 방지)
+                pass
+            else:
+                # pause 종료: 재탐색을 위해 reset
+                self._track_pause_active = False
+                if self._track_pause_resume_reset_pending:
+                    self._track_pause_resume_reset_pending = False
+                    try:
+                        self.tracker.reset()
+                    except Exception:
+                        pass
+                    # conf는 0으로 떨어뜨려 meta에 반영
+                    self.last_conf = 0.0
+
+        # 1) tracker step (전체 화면 기준) - pause 중이 아닐 때만
+        if not self._track_pause_active:
+            bbox, conf = self.tracker.step(img_bgr)
+            if bbox is not None:
+                x, y, w, h = map(int, bbox)
+                cx = int(round(x + 0.5 * w))
+                cy = int(round(y + 0.5 * h))
+                self.player_center = (cx, cy)
+                self.last_conf = float(np.clip(conf, 0.0, 1.0))
+                self.last_xy_norm = self._full_xy_to_playfield_norm(cx, cy)
 
         # 2) crop (det None이어도 마지막 center 유지)
         cx, cy = self.player_center
         crop_bgr, _ = self._crop_square_bgr(img_bgr, cx, cy, self.crop_size)
 
-        # 3) ✅ 먼저 obs_out_size로 줄인 뒤, 나머지 연산은 전부 작은 이미지에서!
+        # 3) obs_out_size로 resize
         interp = cv2.INTER_AREA if self.crop_size >= self.obs_out_size else cv2.INTER_LINEAR
         bgr_small = cv2.resize(crop_bgr, (self.obs_out_size, self.obs_out_size), interpolation=interp)
 
@@ -200,7 +240,7 @@ class ObsBuilder:
             diff_small_u8 = cv2.absdiff(gray_small_u8, self._prev_gray_small_u8)
         self._prev_gray_small_u8 = gray_small_u8
 
-        # 4) bullet + risk (작은 이미지에서)
+        # 4) bullet + risk
         if self.enable_bullet_channels:
             bullet_mask_u8 = self._compute_bullet_mask_u8_small(bgr_small)
             risk_01 = self._compute_risk_heat_small(bullet_mask_u8)
@@ -208,7 +248,7 @@ class ObsBuilder:
             bullet_mask_u8 = np.zeros_like(gray_small_u8, dtype=np.uint8)
             risk_01 = np.zeros((self.obs_out_size, self.obs_out_size), dtype=np.float32)
 
-        # 5) float32 채널 구성 (0..1)
+        # 5) float32 채널 구성
         ch0 = (gray_small_u8.astype(np.float32) / 255.0)
         ch1 = (diff_small_u8.astype(np.float32) / 255.0)
         ch2 = (bullet_mask_u8.astype(np.float32) / 255.0)

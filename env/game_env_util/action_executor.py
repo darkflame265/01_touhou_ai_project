@@ -3,12 +3,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Optional, Tuple
 
 from env.actions import ACTIONS
 from env.controller import press_keys, release_all
 
-# ActionMasker 타입 힌트용(순환 import 방지)
 try:
     from env.game_env_util.action_masking import ActionMasker
 except Exception:  # pragma: no cover
@@ -23,16 +21,16 @@ class ActionExecResult:
 
 class ActionExecutor:
     """
-    GameEnv에서 '액션 실행' 관련 책임을 분리:
-      - apply_action_mask (초기/루프 중)
-      - release_all + press_keys 실행
-      - state 기록(exec_action_idx / exec_was_masked)
-      - 마스킹 카운트 누적
-
-    NOTE:
-      - 타이밍/프로파일링(perf_counter)은 GameEnv 쪽에서 감싸도 되고,
-        여기서 time.perf_counter()로 추가해도 되는데, 우선 기능만 분리.
+    - action mask 적용
+    - 키 입력 갱신
+    - ✅ 폭탄 사용 시:
+        1) 입력을 N초 동안 완전 정지 (레이무 이동 정지)
+        2) ObsBuilder 트래커를 N초 동안 정지시키고, 종료 시 reset으로 재탐색
     """
+
+    # ✅ 네 요구사항 값
+    START_BOMB_FORBID_SEC = 3.0   # 게임 시작 후 3초 폭탄 금지
+    BOMB_LOCK_SEC = 3.0          # 폭탄 사용 후 3초 입력/트래킹 정지
 
     def __init__(self, state, masker: ActionMasker):
         self.s = state
@@ -43,6 +41,12 @@ class ActionExecutor:
         self.masked_count = 0
         self.s.exec_action_idx = 0
         self.s.exec_was_masked = False
+        # reset 때마다 락은 풀어둔다 (env.reset에서 다시 세팅)
+        try:
+            self.s.bomb_lock_until = 0.0
+            self.s.last_bomb_time = 0.0
+        except Exception:
+            pass
 
     def _clamp_action_idx(self, action_idx: int) -> int:
         try:
@@ -53,20 +57,64 @@ class ActionExecutor:
             return 0
         return i
 
-    def _press_action_idx(self, action_idx: int):
-        idx = self._clamp_action_idx(action_idx)
-        action = ACTIONS[idx]
-        release_all()
-        press_keys(action.value)
+    def _find_fallback_idx(self) -> int:
+        # "SLOW_DOWN" 있으면 그걸 우선, 없으면 0
+        for i, a in enumerate(ACTIONS):
+            if getattr(a, "name", "") == "SLOW_DOWN":
+                return int(i)
+        return 0
+
+    def _is_bomb_action(self, action_enum) -> bool:
+        """
+        폭탄 액션 판별:
+        - name에 BOMB 포함
+        - value에 'X' 또는 'BOMB' 문자열 포함
+        (네 코드가 어떤 형태로 정의됐든 최대한 안전하게 잡는다)
+        """
+        try:
+            name = str(getattr(action_enum, "name", "")).upper()
+            if "BOMB" in name:
+                return True
+        except Exception:
+            pass
+
+        try:
+            keys = set(action_enum.value)
+            keys_u = {str(k).upper() for k in keys}
+            if "X" in keys_u or "BOMB" in keys_u:
+                return True
+        except Exception:
+            pass
+
+        return False
+
+    def _apply_inputs_frozen(self) -> None:
+        """
+        폭탄 락 동안: 이동 입력을 완전 정지.
+        - release_all() 후 press_keys([])로 (공격홀드/always_slow 정책은 controller 내부에서 유지)
+        """
+        try:
+            release_all()
+        except Exception:
+            pass
+        try:
+            press_keys([])  # 방향키 없음
+        except Exception:
+            pass
 
     def begin(self, action_idx: int, img_bgr) -> ActionExecResult:
-        """
-        step() 시작 시 1회:
-          - pre_img 기준으로 action mask 적용
-          - 해당 액션을 즉시 실행
-        """
         action_idx = self._clamp_action_idx(action_idx)
 
+        now = time.time()
+
+        # ✅ 폭탄 락 동안은 어떤 액션이 와도 입력 정지
+        if float(getattr(self.s, "bomb_lock_until", 0.0)) > now:
+            self._apply_inputs_frozen()
+            self.s.exec_action_idx = int(action_idx)
+            self.s.exec_was_masked = False
+            return ActionExecResult(masked_idx=int(action_idx), was_masked=False)
+
+        # 마스킹 적용
         masked_idx, was_masked, _ = self.masker.apply_action_mask(action_idx, img_bgr)
 
         self.s.exec_action_idx = int(masked_idx)
@@ -74,29 +122,67 @@ class ActionExecutor:
         if was_masked:
             self.masked_count += 1
 
-        self._press_action_idx(masked_idx)
+        action_enum = ACTIONS[int(masked_idx)]
+
+        # ✅ 폭탄: 시작 3초 금지 + 사용 시 락/트래커 정지
+        if self._is_bomb_action(action_enum):
+            # 시작 3초 폭탄 금지
+            forbid_until = float(getattr(self.s, "bomb_forbid_until", 0.0))
+            if now < forbid_until:
+                fb = self._find_fallback_idx()
+                self.s.exec_action_idx = int(fb)
+                self.s.exec_was_masked = True
+                self.masked_count += 1
+                press_keys(ACTIONS[int(fb)].value)
+                return ActionExecResult(masked_idx=int(fb), was_masked=True)
+
+            # 폭탄 실행
+            press_keys(action_enum.value)
+
+            # 즉시 락 걸기 (입력/트래킹 정지)
+            self.s.last_bomb_time = float(now)
+            self.s.bomb_lock_until = float(now + float(self.BOMB_LOCK_SEC))
+
+            # ObsBuilder에 "폭탄 사용" 알림 → 트래킹 pause + 종료 후 reset
+            obs = getattr(self.masker, "obs", None)
+            if obs is not None and hasattr(obs, "on_bomb_used"):
+                try:
+                    obs.on_bomb_used(pause_sec=float(self.BOMB_LOCK_SEC))
+                except Exception:
+                    pass
+
+            # 폭탄 직후부터 이동 정지
+            self._apply_inputs_frozen()
+            return ActionExecResult(masked_idx=int(masked_idx), was_masked=bool(was_masked))
+
+        # 일반 액션
+        release_all()
+        press_keys(action_enum.value)
         return ActionExecResult(masked_idx=int(masked_idx), was_masked=bool(was_masked))
 
     def remask_if_needed(self, cur_masked_idx: int, img_bgr) -> ActionExecResult:
-        """
-        step() 루프 내부에서:
-          - 현재 action_idx 기준으로 다시 마스킹 적용
-          - 바뀌면 즉시 키 입력 갱신
-        """
         cur_masked_idx = self._clamp_action_idx(cur_masked_idx)
+        now = time.time()
+
+        # ✅ 폭탄 락 동안은 계속 입력 정지 유지
+        if float(getattr(self.s, "bomb_lock_until", 0.0)) > now:
+            self._apply_inputs_frozen()
+            self.s.exec_action_idx = int(cur_masked_idx)
+            self.s.exec_was_masked = False
+            return ActionExecResult(masked_idx=int(cur_masked_idx), was_masked=False)
 
         new_idx, was_masked, _ = self.masker.apply_action_mask(cur_masked_idx, img_bgr)
 
         changed = (int(new_idx) != int(cur_masked_idx))
         if changed:
-            # 새 액션 실행
-            self._press_action_idx(int(new_idx))
+            action_enum = ACTIONS[int(new_idx)]
+            release_all()
+            press_keys(action_enum.value)
             self.s.exec_action_idx = int(new_idx)
             self.s.exec_was_masked = True
             self.masked_count += 1
             return ActionExecResult(masked_idx=int(new_idx), was_masked=True)
 
-        # 액션은 그대로인데 "마스킹이 필요했다"는 신호가 오면 기록만 반영
         if was_masked:
             self.s.exec_was_masked = True
             self.masked_count += 1
