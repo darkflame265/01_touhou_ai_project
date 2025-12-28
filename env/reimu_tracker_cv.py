@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections import deque
 from typing import Deque, Dict, List, Optional, Tuple
+import heapq
 
 import cv2
 import numpy as np
@@ -76,8 +77,7 @@ class TrackerConfig:
 
     size_stable_tol: float = 0.35
 
-    # ✅ 추가(오탐 감소, 부작용 적게): 락 후보는 "최소 이동" 필요
-    # (너무 작은 값이면 효과 없음, 너무 크면 락이 늦어짐)
+    # 락 후보는 "최소 이동" 필요
     lock_min_disp_px: float = 2.0
 
     lock_pad_px: int = 6
@@ -360,10 +360,10 @@ class ReimuTrackerCV:
 
         cnts, _ = cv2.findContours(fg, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-        # 후보가 많으면 큰 contour 위주로 (정렬 비용 vs 이득 트레이드)
+        # ✅ 최적화 1) 후보가 많으면 "전체정렬" 대신 상위 K개만 뽑기 (부분정렬)
         max_keep = int(self.cfg.max_candidates_per_frame)
         if len(cnts) > max_keep:
-            cnts = sorted(cnts, key=cv2.contourArea, reverse=True)
+            cnts = heapq.nlargest(max_keep, cnts, key=cv2.contourArea)
 
         cands: List[BBox] = []
         for c in cnts:
@@ -404,6 +404,11 @@ class ReimuTrackerCV:
         assoc = float(self.cfg.assoc_dist)
         assoc2 = assoc * assoc
 
+        # ✅ 최적화 2) 후보 중심점 프레임당 1회 계산
+        cand_centers: List[Tuple[float, float]] = []
+        for b in cands_roi:
+            cand_centers.append(_bbox_center(b))
+
         # update existing tracks
         for tid, tr in list(self._tracks.items()):
             if (now - tr.last) > ttl:
@@ -414,10 +419,9 @@ class ReimuTrackerCV:
 
             best_i = None
             best_d2 = 1e18
-            for i, b in enumerate(cands_roi):
+            for i, (cx, cy) in enumerate(cand_centers):
                 if i in used:
                     continue
-                cx, cy = _bbox_center(b)
                 dx = cx - lx
                 dy = cy - ly
                 d2 = dx * dx + dy * dy
@@ -428,7 +432,7 @@ class ReimuTrackerCV:
             if best_i is not None and best_d2 <= assoc2:
                 used.add(best_i)
                 b = cands_roi[best_i]
-                cx, cy = _bbox_center(b)
+                cx, cy = cand_centers[best_i]
                 tr.hist.append((now, float(cx), float(cy), b))
                 tr.last = now
 
@@ -436,7 +440,7 @@ class ReimuTrackerCV:
         for i, b in enumerate(cands_roi):
             if i in used:
                 continue
-            cx, cy = _bbox_center(b)
+            cx, cy = cand_centers[i]
             self._tracks[self._next_id] = _Track(
                 hist=deque([(now, float(cx), float(cy), b)], maxlen=60),
                 last=now,
@@ -463,13 +467,13 @@ class ReimuTrackerCV:
             if (t1 - t0) < hold * 0.8:
                 continue
 
-            # ✅ 최소 이동 조건(오탐 감소, 부작용 적게)
+            # 최소 이동 조건
             dx = float(pts[-1][1] - pts[0][1])
             dy = float(pts[-1][2] - pts[0][2])
             if (dx * dx + dy * dy) < (min_disp * min_disp):
                 continue
 
-            # ✅ size stability (np.array 만들지 않고 min/max만)
+            # size stability (min/max만)
             w0 = float(pts[0][3][2])
             h0 = float(pts[0][3][3])
             w_min = 1e18
@@ -494,8 +498,6 @@ class ReimuTrackerCV:
                 continue
 
             b_last = pts[-1][3]
-
-            # 점수: 오래 유지 + 조금 큰 후보 선호 (기존 유지)
             score = (t1 - t0) * 10.0 + (b_last[2] * b_last[3]) * 0.001
             if score > best_score:
                 best_score = score
