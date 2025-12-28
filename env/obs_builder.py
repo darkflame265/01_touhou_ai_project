@@ -1,5 +1,8 @@
 # env/obs_builder.py
+from __future__ import annotations
+
 import time
+from typing import Optional, Tuple
 
 import cv2
 import numpy as np
@@ -17,7 +20,13 @@ class ObsBuilder:
       ch3: risk_heatmap (distanceTransform 기반, 0..1)
     """
 
-    def __init__(self, screen, obs_out_size=128, crop_size=256, use_fallback_full_preprocess=True):
+    def __init__(
+        self,
+        screen,
+        obs_out_size: int = 128,
+        crop_size: int = 256,
+        use_fallback_full_preprocess: bool = True,  # (호환용) 현재 미사용
+    ):
         self.screen = screen
 
         self.obs_out_size = int(obs_out_size)
@@ -26,7 +35,7 @@ class ObsBuilder:
 
         img0 = self.screen.capture()
         h0, w0 = img0.shape[:2]
-        self.H, self.W = h0, w0
+        self.H, self.W = int(h0), int(w0)
 
         # playfield width 캐시
         self._playfield_ratio = float(getattr(self.screen, "PLAYFIELD_RIGHT_RATIO", 0.70))
@@ -36,68 +45,74 @@ class ObsBuilder:
         self.tracker = ReimuTrackerCV()
 
         # 정책/리워드용 좌표/신뢰도 (playfield 기준 정규화)
-        self.last_xy_norm = (0.5, 0.78)
-        self.last_conf = 0.0
+        self.last_xy_norm: Tuple[float, float] = (0.5, 0.78)
+        self.last_conf: float = 0.0
 
         # det None일 때 유지
-        self.player_center = (w0 // 2, int(h0 * 0.78))
+        self.player_center: Tuple[int, int] = (w0 // 2, int(h0 * 0.78))
 
         # meta pixels
-        self.meta_patch = 4
+        self.meta_patch: int = 4
 
         # prev gray (obs_out_size 기준으로 저장)
-        self._prev_gray_small_u8 = None
+        self._prev_gray_small_u8: Optional[np.ndarray] = None
 
         # ----- auto inversion / illumination robustness -----
-        # 배경이 점점 밝아져서(gray가 상향) 이진/마스크 로직이 뒤집히는 현상을 완화.
-        # crop의 평균 명도가 일정 이상이면 gray를 자동으로 invert 해서
-        # "배경=어둡게, 탄막/레이무=밝게" 상태를 유지한다.
-        self.auto_invert_gray = True
-        self.invert_mean_thr = 0.58  # 0..1, 이 이상이면 invert
-        self._last_inverted = False
+        self.auto_invert_gray: bool = True
+        self.invert_mean_thr: float = 0.58  # 0..1, 이 이상이면 invert
+        self._last_inverted: bool = False
 
         # ----- bullet/background separation -----
-        # HSV 기반 + "움직임(diff)" 기반을 결합해서
-        # 배경이 밝아졌을 때 전체가 흰색으로 새는 문제를 막는다.
-        self.use_motion_for_bullets = True
-        self.diff_bullet_min = 10  # u8
-        self.diff_bullet_k_mad = 3.0  # adaptive threshold = median + k*MAD
-        self.max_bullet_fill_ratio = 0.35  # 이 이상이면 HSV가 새는 것으로 보고 motion만 사용
+        self.use_motion_for_bullets: bool = True
+        self.diff_bullet_min: int = 10
+        self.diff_bullet_k_mad: float = 3.0
+        self.max_bullet_fill_ratio: float = 0.35
 
-        # ----- keep Reimu bright -----
-        # 트래커 bbox가 있으면 그 영역을 ch0에서 항상 밝게(255) 만들어
-        # 배경/탄막 처리 변화에도 레이무 실루엣이 유지되게 한다.
-        self.keep_reimu_bright = True
-        self._last_bbox_full = None  # (x,y,w,h)
+        # ----- Reimu brighten 제거 -----
+        # keep_reimu_bright / brighten_reimu_in_gray 기능을 사용하지 않는다.
+        # 트래커 bbox는 crop 중심 추정/메타(xy/conf)에만 사용됨.
+        self._last_bbox_full: Optional[Tuple[int, int, int, int]] = None  # (x,y,w,h)
 
-        # bullet/risk (작은 해상도에서 처리)
-        self.enable_bullet_channels = True
-        self.bullet_hsv_s_min = 40
-        self.bullet_hsv_v_min = 140
-        self.bullet_hsv_v_max = 255
-        self.bullet_close_morph = 0
+        # bullet/risk
+        self.enable_bullet_channels: bool = True
+        self.bullet_hsv_s_min: int = 40
+        self.bullet_hsv_v_min: int = 140
+        self.bullet_hsv_v_max: int = 255
+        self.bullet_close_morph: int = 0  # 0이면 morph 스킵
 
-        self.risk_tau_px = 8.0
-        self.risk_clip_max = 1.0
+        self.risk_tau_px: float = 8.0
+        self.risk_clip_max: float = 1.0
 
-        # 디버그 창 (원하면 True)
-        self.show_reimu_debug = True
+        # 디버그 창
+        self.show_reimu_debug: bool = True
         dbg_cfg = DebugViewConfig(
             window_name="debug_hell",
-            enable_keys=False,  # waitKey는 main loop에서만!
+            enable_keys=False,
             wait_ms=1,
         )
         self.reimu_dbg_view = ReimuTrackerDebugView(self.tracker, cfg=dbg_cfg)
 
-        # OBS crop 디버그는 기본 OFF (렉 원인 될 수 있음)
-        self.show_obs_debug = True
-        self.win_crop = "OBS_CROP"
-        self._obs_win_inited = False
+        # OBS 디버그 - 기본: ch3만 표시
+        self.show_obs_debug: bool = True
+        self.win_crop: str = "OBS_CROP"
+        self._obs_win_inited: bool = False
 
-        # ----- tracker pause (bomb etc.) -----
-        self._track_pause_until = 0.0
-        self._track_pause_active = False
-        self._track_pause_resume_reset_pending = False
+        # tracker pause (bomb etc.)
+        self._track_pause_until: float = 0.0
+        self._track_pause_active: bool = False
+        self._track_pause_resume_reset_pending: bool = False
+
+        # =========================
+        # ✅ 최적화용 캐시/버퍼
+        # =========================
+        s = self.obs_out_size
+        self._zeros_small_u8 = np.zeros((s, s), dtype=np.uint8)
+        self._zeros_small_f32 = np.zeros((s, s), dtype=np.float32)
+        self._obs_buf = np.empty((4, s, s), dtype=np.float32)  # 재사용
+
+        # bullet morph kernel cache
+        self._bullet_kernel = None
+        self._bullet_kernel_k = -1
 
     def reset(self):
         self.tracker.reset()
@@ -112,18 +127,12 @@ class ObsBuilder:
         self._track_pause_resume_reset_pending = False
 
     def on_player_death(self):
-        # 목숨 깎였을 때 tracker 상태 리셋
         try:
             self.tracker.reset()
         except Exception:
             pass
 
     def on_bomb_used(self, pause_sec: float = 2.0):
-        """
-        폭탄 연출(레이무 일러스트/이펙트)로 tracker가 오염되는 걸 방지:
-        - pause_sec 동안 tracker.step()을 아예 호출하지 않음
-        - pause 종료 시 tracker.reset()으로 재탐색
-        """
         now = time.time()
         self._track_pause_until = float(now + float(pause_sec))
         self._track_pause_active = True
@@ -144,7 +153,8 @@ class ObsBuilder:
             pass
         self._obs_win_inited = True
 
-    def _crop_square_bgr(self, img_bgr, cx, cy, size):
+    @staticmethod
+    def _crop_square_bgr(img_bgr: np.ndarray, cx: int, cy: int, size: int):
         h, w = img_bgr.shape[:2]
         size = int(size)
         half = size // 2
@@ -159,7 +169,6 @@ class ObsBuilder:
         return img_bgr[y1:y2, x1:x2], (cx, cy), (x1, y1)
 
     def _inject_meta_pixels_ch0_only(self, ch0_01: np.ndarray) -> np.ndarray:
-        # ch0_01: (obs_out_size, obs_out_size) float32
         try:
             x_n, y_n = self.last_xy_norm
             c = float(self.last_conf)
@@ -177,10 +186,21 @@ class ObsBuilder:
             pass
         return ch0_01
 
-    def _full_xy_to_playfield_norm(self, cx: int, cy: int) -> tuple[float, float]:
+    def _full_xy_to_playfield_norm(self, cx: int, cy: int) -> Tuple[float, float]:
         x_n = float(np.clip(cx / max(1, self._playfield_w - 1), 0.0, 1.0))
         y_n = float(np.clip(cy / max(1, self.H - 1), 0.0, 1.0))
         return x_n, y_n
+
+    def _get_bullet_kernel(self):
+        k = int(self.bullet_close_morph)
+        if k <= 0:
+            return None
+        if self._bullet_kernel is not None and self._bullet_kernel_k == k:
+            return self._bullet_kernel
+        ksz = 2 * k + 1
+        self._bullet_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
+        self._bullet_kernel_k = k
+        return self._bullet_kernel
 
     def _compute_bullet_mask_u8_small(self, bgr_small: np.ndarray) -> np.ndarray:
         hsv = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2HSV)
@@ -189,10 +209,8 @@ class ObsBuilder:
         mask = (s >= int(self.bullet_hsv_s_min)) & (v >= int(self.bullet_hsv_v_min)) & (v <= int(self.bullet_hsv_v_max))
         mask_u8 = (mask.astype(np.uint8) * 255)
 
-        k = int(self.bullet_close_morph)
-        if k > 0:
-            ksz = 2 * k + 1
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
+        kernel = self._get_bullet_kernel()
+        if kernel is not None:
             mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel, iterations=1)
             mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
 
@@ -200,14 +218,15 @@ class ObsBuilder:
 
     @staticmethod
     def _mad_u8(x: np.ndarray):
-        # Median Absolute Deviation (robust scale)
         med = float(np.median(x))
         mad = float(np.median(np.abs(x.astype(np.float32) - med)))
         return med, mad
 
     def _compute_bullet_mask_u8_small_robust(self, bgr_small: np.ndarray, diff_small_u8: np.ndarray) -> np.ndarray:
-        """HSV + motion 결합. 배경 누출 시 자동 방어."""
-        hsv_mask = self._compute_bullet_mask_u8_small(bgr_small) if self.enable_bullet_channels else np.zeros_like(diff_small_u8)
+        if not self.enable_bullet_channels:
+            return self._zeros_small_u8
+
+        hsv_mask = self._compute_bullet_mask_u8_small(bgr_small)
 
         if not self.use_motion_for_bullets:
             return hsv_mask
@@ -216,16 +235,13 @@ class ObsBuilder:
         thr = max(float(self.diff_bullet_min), med + float(self.diff_bullet_k_mad) * mad)
         motion = (diff_small_u8.astype(np.float32) >= float(thr)).astype(np.uint8) * 255
 
-        # 둘을 OR로 합치되, HSV가 화면을 과도하게 채우면 motion만 사용
         comb = cv2.bitwise_or(hsv_mask, motion)
         fill = float(np.mean(comb > 0))
         if fill >= float(self.max_bullet_fill_ratio):
             comb = motion
 
-        k = int(self.bullet_close_morph)
-        if k > 0:
-            ksz = 2 * k + 1
-            kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
+        kernel = self._get_bullet_kernel()
+        if kernel is not None:
             comb = cv2.morphologyEx(comb, cv2.MORPH_OPEN, kernel, iterations=1)
             comb = cv2.morphologyEx(comb, cv2.MORPH_CLOSE, kernel, iterations=1)
 
@@ -236,49 +252,19 @@ class ObsBuilder:
             self._last_inverted = False
             return gray_small_u8
 
-        m = float(np.mean(gray_small_u8.astype(np.float32) / 255.0))
+        m = float(np.mean(gray_small_u8, dtype=np.float32) / 255.0)
         inv = bool(m >= float(self.invert_mean_thr))
         self._last_inverted = inv
         if inv:
             return (255 - gray_small_u8)
         return gray_small_u8
 
-    def _brighten_reimu_in_gray(self, gray_small_u8: np.ndarray, bbox_full, crop_origin_xy, scale: float) -> np.ndarray:
-        if (not self.keep_reimu_bright) or (bbox_full is None):
-            return gray_small_u8
-
-        try:
-            x, y, w, h = map(int, bbox_full)
-            ox, oy = map(int, crop_origin_xy)
-
-            # bbox -> crop local
-            x1 = x - ox
-            y1 = y - oy
-            x2 = x1 + w
-            y2 = y1 + h
-
-            # clamp to crop
-            x1 = int(np.clip(x1, 0, self.crop_size - 1))
-            y1 = int(np.clip(y1, 0, self.crop_size - 1))
-            x2 = int(np.clip(x2, 0, self.crop_size))
-            y2 = int(np.clip(y2, 0, self.crop_size))
-            if x2 <= x1 or y2 <= y1:
-                return gray_small_u8
-
-            # scale to small
-            sx1 = int(np.clip(round(x1 * scale), 0, self.obs_out_size - 1))
-            sy1 = int(np.clip(round(y1 * scale), 0, self.obs_out_size - 1))
-            sx2 = int(np.clip(round(x2 * scale), sx1 + 1, self.obs_out_size))
-            sy2 = int(np.clip(round(y2 * scale), sy1 + 1, self.obs_out_size))
-
-            out = gray_small_u8
-            out[sy1:sy2, sx1:sx2] = 255
-            return out
-        except Exception:
-            return gray_small_u8
-
     def _compute_risk_heat_small(self, bullet_mask_u8_small: np.ndarray) -> np.ndarray:
-        # bullet=255, bg=0 가정이면 invert 필요
+        if bullet_mask_u8_small is None or bullet_mask_u8_small.size == 0:
+            return self._zeros_small_f32
+        if int(np.count_nonzero(bullet_mask_u8_small)) == 0:
+            return self._zeros_small_f32
+
         inv = cv2.bitwise_not(bullet_mask_u8_small)  # 탄=0, 배경=255
         dist = cv2.distanceTransform(inv, distanceType=cv2.DIST_L2, maskSize=3)
 
@@ -287,21 +273,19 @@ class ObsBuilder:
 
         m = float(risk.max())
         if m > 1e-6:
-            risk /= m
+            risk *= (1.0 / m)
 
         if self.risk_clip_max is not None:
-            risk = np.clip(risk, 0.0, float(self.risk_clip_max))
+            risk = np.clip(risk, 0.0, float(self.risk_clip_max), out=risk)
 
-        return risk.astype(np.float32, copy=False)
+        return risk
 
-    def make_state(self, img_bgr: np.ndarray):
+    def make_state(self, img_bgr: np.ndarray) -> np.ndarray:
         # 1) tracker step (전체 화면 기준)
         now = time.time()
         if self._track_pause_active and now < float(self._track_pause_until):
-            # pause 중: tracker.step() 호출 금지
             bbox, conf = None, 0.0
         else:
-            # pause 종료 시 한 번 reset으로 재탐색
             if self._track_pause_active and self._track_pause_resume_reset_pending:
                 try:
                     self.tracker.reset()
@@ -321,53 +305,64 @@ class ObsBuilder:
             self.last_conf = float(np.clip(conf, 0.0, 1.0))
             self.last_xy_norm = self._full_xy_to_playfield_norm(cx, cy)
 
-        # 2) crop (det None이어도 마지막 center 유지)
+        # 2) crop
         cx, cy = self.player_center
-        crop_bgr, _, crop_origin = self._crop_square_bgr(img_bgr, cx, cy, self.crop_size)
+        crop_bgr, _, _ = self._crop_square_bgr(img_bgr, cx, cy, self.crop_size)
 
-        # 3) ✅ 먼저 obs_out_size로 줄인 뒤, 나머지 연산은 전부 작은 이미지에서!
+        # 3) small resize
         interp = cv2.INTER_AREA if self.crop_size >= self.obs_out_size else cv2.INTER_LINEAR
         bgr_small = cv2.resize(crop_bgr, (self.obs_out_size, self.obs_out_size), interpolation=interp)
 
         gray_small_u8 = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2GRAY)
 
-        # 3.5) 밝기 변화로 관측이 뒤집히는 문제 대응 (auto invert)
+        # 3.5) auto invert
         gray_small_u8 = self._maybe_invert_gray_small(gray_small_u8)
 
-        # 3.6) 레이무 실루엣 항상 밝게 유지 (bbox 기반)
-        scale = float(self.obs_out_size) / float(self.crop_size)
-        gray_small_u8 = self._brighten_reimu_in_gray(gray_small_u8, self._last_bbox_full, crop_origin, scale)
+        # ✅ (제거) 레이무 bbox를 강제로 밝게 칠하는 단계 없음
 
         if self._prev_gray_small_u8 is None or self._prev_gray_small_u8.shape != gray_small_u8.shape:
-            diff_small_u8 = np.zeros_like(gray_small_u8)
+            diff_small_u8 = self._zeros_small_u8
         else:
             diff_small_u8 = cv2.absdiff(gray_small_u8, self._prev_gray_small_u8)
-        self._prev_gray_small_u8 = gray_small_u8
 
-        # 4) bullet + risk (작은 이미지에서)
+        self._prev_gray_small_u8 = gray_small_u8.copy()
+
+        # 4) bullet + risk
         if self.enable_bullet_channels:
             bullet_mask_u8 = self._compute_bullet_mask_u8_small_robust(bgr_small, diff_small_u8)
             risk_01 = self._compute_risk_heat_small(bullet_mask_u8)
         else:
-            bullet_mask_u8 = np.zeros_like(gray_small_u8, dtype=np.uint8)
-            risk_01 = np.zeros((self.obs_out_size, self.obs_out_size), dtype=np.float32)
+            bullet_mask_u8 = self._zeros_small_u8
+            risk_01 = self._zeros_small_f32
 
-        # 5) float32 채널 구성 (0..1)
-        ch0 = (gray_small_u8.astype(np.float32) / 255.0)
-        ch1 = (diff_small_u8.astype(np.float32) / 255.0)
-        ch2 = (bullet_mask_u8.astype(np.float32) / 255.0)
-        ch3 = risk_01.astype(np.float32, copy=False)
+        # 5) float32 채널 구성 (0..1) - obs buffer 재사용
+        self._obs_buf[0, :, :] = gray_small_u8.astype(np.float32) * (1.0 / 255.0)
+
+        if diff_small_u8 is self._zeros_small_u8:
+            self._obs_buf[1, :, :] = 0.0
+        else:
+            self._obs_buf[1, :, :] = diff_small_u8.astype(np.float32) * (1.0 / 255.0)
+
+        if bullet_mask_u8 is self._zeros_small_u8:
+            self._obs_buf[2, :, :] = 0.0
+        else:
+            self._obs_buf[2, :, :] = bullet_mask_u8.astype(np.float32) * (1.0 / 255.0)
+
+        if risk_01 is self._zeros_small_f32:
+            self._obs_buf[3, :, :] = 0.0
+        else:
+            self._obs_buf[3, :, :] = risk_01
 
         # 6) meta pixels (ch0만)
-        ch0 = self._inject_meta_pixels_ch0_only(ch0)
+        self._inject_meta_pixels_ch0_only(self._obs_buf[0])
 
-        obs4 = np.stack([ch0, ch1, ch2, ch3], axis=0).astype(np.float32, copy=False)
+        obs4 = self._obs_buf
 
         # ---- debug windows ----
         if self.show_obs_debug:
             try:
                 self._ensure_obs_window()
-                vis = (np.clip(ch3, 0.0, 1.0) * 255.0).astype(np.uint8)
+                vis = (np.clip(obs4[3], 0.0, 1.0) * 255.0).astype(np.uint8)
                 vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
                 cv2.imshow(self.win_crop, vis)
             except Exception:
@@ -379,4 +374,4 @@ class ObsBuilder:
             except Exception as e:
                 print("[reimu_dbg_view.render ERROR]", repr(e))
 
-        return obs4
+        return obs4.copy()
