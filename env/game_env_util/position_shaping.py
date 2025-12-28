@@ -2,7 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 
-from env.playfield_utils import get_target_point, get_playfield_rect_safe
+from env.game_env_util.playfield_utils import get_target_point, get_playfield_rect_safe
 
 
 @dataclass

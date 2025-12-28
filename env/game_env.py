@@ -6,13 +6,15 @@ from env.screen import Screen
 from env.controller import press_keys, set_attack_hold, release_all, set_always_slow
 from env.actions import ACTIONS
 
-from env.env_state import EnvState
 from env.episode_guard import EpisodeGuard
 from env.ui_guard import UIGuard
-from env.reward_engine import RewardEngine
 from env.obs_builder import ObsBuilder
 
-from env.action_masking import ActionMasker, MaskingConfig
+
+from env.game_env_util.env_state import EnvState
+from env.game_env_util.reward_engine import RewardEngine
+from env.game_env_util.action_masking import ActionMasker, MaskingConfig
+
 
 
 class GameEnv:

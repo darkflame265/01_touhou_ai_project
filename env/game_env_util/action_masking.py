@@ -6,8 +6,7 @@ from typing import Optional, Tuple
 import numpy as np
 
 from env.actions import ACTIONS
-from env.playfield_utils import get_playfield_rect_safe
-
+from env.game_env_util.playfield_utils import get_playfield_rect_safe
 
 
 @dataclass
