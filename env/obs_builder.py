@@ -66,7 +66,7 @@ class ObsBuilder:
         self.reimu_dbg_view = ReimuTrackerDebugView(self.tracker, cfg=dbg_cfg)
 
         # OBS crop 디버그는 기본 OFF (렉 원인 될 수 있음)
-        self.show_obs_debug = False
+        self.show_obs_debug = True
         self.win_crop = "OBS_CROP"
         self._obs_win_inited = False
 

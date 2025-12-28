@@ -1,5 +1,5 @@
 # === PPO_STATS_BEGIN ===
-total_completed=115
+total_completed=123
 best_reward=67.370951
 best_reward_ts=2025-12-28 10:59:02
 best_reward_run=2025-12-28 10:47:26
@@ -248,3 +248,56 @@ idx	reward	survival_sec	note
 [STATS] total_completed=115 | best_reward=67.371 | best_survival=41.95s
 idx	reward	survival_sec	note
 (1/1)	68.780259	13.009	ABORTED
+
+========
+[RUN] 2025-12-28 12:58:18  episodes=1 eval=False
+[STATS] total_completed=115 | best_reward=67.371 | best_survival=41.95s
+idx	reward	survival_sec	note
+(1/1)	12.126360	17.680	
+
+========
+[RUN] 2025-12-28 13:11:14  episodes=1 eval=False
+[STATS] total_completed=116 | best_reward=67.371 | best_survival=41.95s
+idx	reward	survival_sec	note
+(1/1)	16.853820	23.200	
+
+========
+[RUN] 2025-12-28 13:17:39  episodes=1 eval=False
+[STATS] total_completed=117 | best_reward=67.371 | best_survival=41.95s
+idx	reward	survival_sec	note
+
+========
+[RUN] 2025-12-28 13:18:14  episodes=1 eval=False
+[STATS] total_completed=117 | best_reward=67.371 | best_survival=41.95s
+idx	reward	survival_sec	note
+(1/1)	17.087919	20.628	
+
+========
+[RUN] 2025-12-28 13:22:17  episodes=1 eval=False
+[STATS] total_completed=118 | best_reward=67.371 | best_survival=41.95s
+idx	reward	survival_sec	note
+(1/1)	12.233779	20.753	
+
+========
+[RUN] 2025-12-28 13:30:44  episodes=1 eval=False
+[STATS] total_completed=119 | best_reward=67.371 | best_survival=41.95s
+idx	reward	survival_sec	note
+(1/1)	17.119847	21.011	
+
+========
+[RUN] 2025-12-28 13:44:10  episodes=1 eval=False
+[STATS] total_completed=120 | best_reward=67.371 | best_survival=41.95s
+idx	reward	survival_sec	note
+(1/1)	13.940167	17.891	
+
+========
+[RUN] 2025-12-28 13:51:47  episodes=1 eval=False
+[STATS] total_completed=121 | best_reward=67.371 | best_survival=41.95s
+idx	reward	survival_sec	note
+(1/1)	16.550313	22.166	
+
+========
+[RUN] 2025-12-28 13:52:49  episodes=1 eval=False
+[STATS] total_completed=122 | best_reward=67.371 | best_survival=41.95s
+idx	reward	survival_sec	note
+(1/1)	36.404468	31.517	
