@@ -29,10 +29,10 @@ class ActionExecutor:
     """
 
     # ✅ 튜닝 값들
-    START_BOMB_FORBID_SEC = 5.0    # 게임 시작 후 폭탄 금지 시간
+    START_BOMB_FORBID_SEC = 15.0    # 게임 시작 후 폭탄 금지 시간
     BOMB_LOCK_SEC = 2.0           # 폭탄 사용 직후 "이동 입력 정지" 시간
     TRACK_PAUSE_SEC = 1.0         # 트래커 pause+재탐색 시간
-    BOMB_COOLDOWN_SEC = 25.0       # ✅ 폭탄 연타 방지(락과 분리!)
+    BOMB_COOLDOWN_SEC = 5.0       # ✅ 폭탄 연타 방지(락과 분리!)
 
     def __init__(self, state, masker: ActionMasker):
         self.s = state

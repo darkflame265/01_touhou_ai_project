@@ -77,6 +77,23 @@ class GameEnv:
         # dup reward policy
         self.dup_reward_zero = True
 
+        # =========================
+        # ✅ 죽음 구간 스킵 설정
+        # =========================
+        self.skip_death_segment = True
+
+        # 최소로는 이만큼은 기다려준다(너무 빨리 끊으면 화면 전환 중간 프레임이 나올 수 있음)
+        self.death_skip_min_sec = 0.30
+
+        # 최대 대기(이 이상이면 그냥 끊고 진행)
+        self.death_skip_max_sec = 1.20
+
+        # "죽음 FX가 꺼짐"을 연속으로 몇 번 확인해야 안정화로 볼지
+        self.death_skip_clear_consecutive = 3
+
+        # 스킵 루프 sleep (frame_sleep와 비슷하게)
+        self.death_skip_sleep = 0.012
+
     def close(self):
         try:
             release_all()
@@ -142,6 +159,80 @@ class GameEnv:
         set_always_slow(True)
         return self.packer.pack_frames_concat()
 
+    # =========================
+    # ✅ 죽음 구간 스킵: 내부 프레임 소비
+    # =========================
+    def _consume_death_segment(self):
+        """
+        죽음/부활 연출 중인 프레임들을 '학습 transition'으로 쌓지 않기 위해,
+        내부에서 조용히 캡처를 반복해서 안정화될 때까지 기다린다.
+        return: (last_img, last_gray, ui_ok_last)
+        """
+        t0 = time.time()
+        clear_streak = 0
+
+        last_img = None
+        last_g = None
+        last_ui_ok = True
+
+        # 죽음 연출 동안 입력은 끊는게 안전
+        try:
+            release_all()
+            set_attack_hold(False)
+        except Exception:
+            pass
+
+        while True:
+            if self.death_skip_sleep and self.death_skip_sleep > 0:
+                time.sleep(float(self.death_skip_sleep))
+
+            img, is_dup = self.fs.capture()
+            if img is None:
+                # 캡처 실패면 탈출
+                break
+            if is_dup and self.fs.cfg.skip_dup_frames:
+                # dup는 굳이 평가 안 하고 계속
+                pass
+
+            g = self.screen.gray(img)
+
+            ui_ok = self.screen.ui_panel_present(img, gray=g)
+            self.ui.update_ui_absent(ui_ok)
+            if self.s.ui_absent_count >= self.s.ui_absent_needed:
+                # UI가 계속 없으면 abort 쪽이 더 맞다. 여기선 그냥 즉시 반환.
+                last_img, last_g, last_ui_ok = img, g, ui_ok
+                break
+
+            # 죽음 FX 상태 확인
+            _, gameover_fx = self.screen.detect_death(img, gray=g)
+
+            elapsed = float(time.time() - t0)
+
+            # 최소 시간은 기다린 뒤,
+            # gameover_fx가 꺼진 상태가 연속으로 몇 프레임 유지되면 "안정화"로 본다.
+            if elapsed >= float(self.death_skip_min_sec) and (not gameover_fx):
+                clear_streak += 1
+                if clear_streak >= int(self.death_skip_clear_consecutive):
+                    last_img, last_g, last_ui_ok = img, g, ui_ok
+                    break
+            else:
+                clear_streak = 0
+
+            # 최대 시간 넘으면 강제 종료
+            if elapsed >= float(self.death_skip_max_sec):
+                last_img, last_g, last_ui_ok = img, g, ui_ok
+                break
+
+            last_img, last_g, last_ui_ok = img, g, ui_ok
+
+        # 다음 step에서 다시 액션이 들어오므로 여기선 입력 유지 X
+        try:
+            release_all()
+        except Exception:
+            pass
+
+        return last_img, last_g, last_ui_ok
+
     def step(self, action_idx: int):
         # already terminated
         if self.s.episode_terminated:
@@ -204,7 +295,7 @@ class GameEnv:
             state = self.obs.make_state(img)
             state_chw = self.packer.as_chw(state)
 
-            # remask / key update (bomb 락 중이면 executor가 입력정지 유지)
+            # remask / key update
             r1 = self.act.remask_if_needed(masked_idx, img)
             masked_idx = int(r1.masked_idx)
 
@@ -218,9 +309,13 @@ class GameEnv:
                 conf = float(getattr(self.obs, "last_conf", 0.0))
                 reward += float(self.reward_engine.position_penalties(float(x_n), float(y_n), conf))
 
-            # death FX (RewardEngine)
+            # -------------------------
+            # ✅ death FX
+            # -------------------------
             _, gameover_fx = self.screen.detect_death(img, gray=g)
             term, reason, pen = self.reward_engine.on_death_fx(gameover_fx, now, reset_tracker_cb=reset_tracker)
+
+            # (A) 에피소드 종료(게임오버 등)
             if term:
                 for _ in range(3):
                     release_all()
@@ -230,13 +325,53 @@ class GameEnv:
                 self.packer.push_prev_state(state_chw)
                 return self.packer.pack_frames_concat(), float(total_reward), True
 
+            # (B) ✅ 죽음 연출(피격/부활) 구간 스킵
+            # - gameover_fx가 뜨면 그 프레임에 페널티만 적용하고,
+            # - 연출 구간 프레임들은 내부에서 소비해서 transition으로 쌓지 않음
+            if self.skip_death_segment and bool(gameover_fx):
+                # 보통 pen에 death_pen/hit_pen 계열이 들어있을 가능성이 높으니 반영
+                try:
+                    reward += float(pen)
+                except Exception:
+                    pass
+
+                # tracker는 여기서 바로 리셋해두는 게 안전(부활 후 재락 유도)
+                reset_tracker()
+
+                # 내부에서 연출 프레임 소비
+                last_img, last_g, last_ui_ok = self._consume_death_segment()
+                if last_img is None:
+                    # 캡처 실패면 그냥 현재 프레임으로 진행
+                    last_img, last_g, last_ui_ok = img, g, ui_ok
+
+                # 스킵 후 "안정화된 1프레임"만 관측으로 기록
+                state2 = self.obs.make_state(last_img)
+                state2_chw = self.packer.as_chw(state2)
+
+                # UI lives도 한 번 갱신(RewardEngine 내부 상태 일치)
+                try:
+                    ui_now = self.ui.ui_lives_safe(last_img, last_ui_ok)
+                    ro = self.reward_engine.on_ui_lives(ui_now, time.time(), reset_tracker_cb=reset_tracker)
+                    if ro is not None:
+                        reward = float(ro)
+                except Exception:
+                    pass
+
+                self.packer.push_prev_state(state2_chw)
+                total_reward += reward
+                self.packer.ep_add(reward)
+
+                # action_repeat 남았더라도 여기서 끊어 반환(= 죽음 연출을 1 transition으로 압축)
+                self.s.step_i += 1
+                return self.packer.pack_frames_concat(), float(total_reward), False
+
             # UI lives (RewardEngine)
             ui_now = self.ui.ui_lives_safe(img, ui_ok)
             ro = self.reward_engine.on_ui_lives(ui_now, now, reset_tracker_cb=reset_tracker)
             if ro is not None:
                 reward = float(ro)
 
-            # push state
+            # push state (정상 프레임)
             self.packer.push_prev_state(state_chw)
             total_reward += reward
             self.packer.ep_add(reward)
