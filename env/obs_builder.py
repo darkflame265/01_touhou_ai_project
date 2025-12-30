@@ -14,7 +14,7 @@ from env.reimu_tracker_debug_view import ReimuTrackerDebugView, DebugViewConfig
 class ObsBuilder:
     """
     4채널 관측 (float32):
-      ch0: crop_gray (0..1) + meta pixels(xy/conf)
+      ch0: crop_gray (0..1) + player marker + meta pixels(xy/conf)
       ch1: absdiff(current_gray, prev_gray) (0..1)
       ch2: bullet_candidate_mask (0..1)
       ch3: risk_heatmap (distanceTransform 기반, 0..1)
@@ -69,7 +69,6 @@ class ObsBuilder:
         self.max_bullet_fill_ratio: float = 0.35
 
         # ----- Reimu brighten 제거 -----
-        # keep_reimu_bright / brighten_reimu_in_gray 기능을 사용하지 않는다.
         # 트래커 bbox는 crop 중심 추정/메타(xy/conf)에만 사용됨.
         self._last_bbox_full: Optional[Tuple[int, int, int, int]] = None  # (x,y,w,h)
 
@@ -83,7 +82,18 @@ class ObsBuilder:
         self.risk_tau_px: float = 8.0
         self.risk_clip_max: float = 1.0
 
-        # 디버그 창
+        # ===== player marker on ch0 (학습용) =====
+        # ✅ ch0에만 마커를 찍어서 다른 채널(diff/bullet/risk)을 오염시키지 않는다.
+        # ✅ 마커 위치는 "항상 중앙"이 아니라, 트래커가 잡은 player_center가
+        #    crop 내부에서 어디에 위치하는지(u,v)로 변환해 찍는다.
+        self.mark_player_on_ch0: bool = True
+        self.marker_half: int = 2            # 2면 5x5 십자 정도
+        self.marker_value: float = 1.0       # ch0(0..1)에 찍을 값
+        self.marker_use_conf: bool = True    # conf로 밝기 스케일
+        self.marker_min_scale: float = 0.35  # conf가 낮아도 이 정도는 찍음
+        self._last_player_uv_small: Tuple[int, int] = (self.obs_out_size // 2, self.obs_out_size // 2)
+
+        # 레이무 디버그 창
         self.show_reimu_debug: bool = True
         dbg_cfg = DebugViewConfig(
             window_name="debug_hell",
@@ -92,10 +102,13 @@ class ObsBuilder:
         )
         self.reimu_dbg_view = ReimuTrackerDebugView(self.tracker, cfg=dbg_cfg)
 
-        # OBS 디버그 - 기본: ch3만 표시
+        # OBS 디버그
         self.show_obs_debug: bool = True
         self.win_crop: str = "OBS_CROP"
         self._obs_win_inited: bool = False
+
+        # OBS 디버그에 무엇을 보여줄지 (0/1/2/3)
+        self.obs_debug_channel: int = 0
 
         # tracker pause (bomb etc.)
         self._track_pause_until: float = 0.0
@@ -125,6 +138,7 @@ class ObsBuilder:
         self._track_pause_until = 0.0
         self._track_pause_active = False
         self._track_pause_resume_reset_pending = False
+        self._last_player_uv_small = (self.obs_out_size // 2, self.obs_out_size // 2)
 
     def on_player_death(self):
         try:
@@ -185,6 +199,61 @@ class ObsBuilder:
         except Exception:
             pass
         return ch0_01
+
+    def _update_player_uv_small(self, crop_xy: Tuple[int, int]) -> None:
+        """
+        전체화면 좌표 player_center(px,py)를
+        crop 좌상단(x1,y1) 기준으로 crop 내부 좌표로 바꾸고,
+        obs_out_size 해상도(u,v)로 스케일해서 저장.
+        """
+        try:
+            x1, y1 = map(int, crop_xy)
+            px, py = map(int, self.player_center)
+
+            scale = float(self.obs_out_size) / float(max(1, self.crop_size))
+            u = int(round((px - x1) * scale))
+            v = int(round((py - y1) * scale))
+
+            u = int(np.clip(u, 0, self.obs_out_size - 1))
+            v = int(np.clip(v, 0, self.obs_out_size - 1))
+            self._last_player_uv_small = (u, v)
+        except Exception:
+            self._last_player_uv_small = (self.obs_out_size // 2, self.obs_out_size // 2)
+
+    def _stamp_player_marker_ch0(self, ch0_01: np.ndarray) -> None:
+        """
+        ch0(0..1)에만 플레이어 마커(십자)를 찍는다.
+        위치는 self._last_player_uv_small(u,v)를 사용한다.
+        """
+        if not self.mark_player_on_ch0:
+            return
+        if ch0_01 is None or ch0_01.size == 0:
+            return
+
+        s = int(ch0_01.shape[0])
+        if s <= 0:
+            return
+
+        cx, cy = self._last_player_uv_small
+        cx = int(np.clip(cx, 0, s - 1))
+        cy = int(np.clip(cy, 0, s - 1))
+
+        r = int(self.marker_half)
+        if r <= 0:
+            return
+
+        v = float(self.marker_value)
+        if self.marker_use_conf:
+            c = float(np.clip(self.last_conf, 0.0, 1.0))
+            v *= max(float(self.marker_min_scale), c)
+
+        y1 = max(0, cy - r)
+        y2 = min(s, cy + r + 1)
+        x1 = max(0, cx - r)
+        x2 = min(s, cx + r + 1)
+
+        ch0_01[cy, x1:x2] = v
+        ch0_01[y1:y2, cx] = v
 
     def _full_xy_to_playfield_norm(self, cx: int, cy: int) -> Tuple[float, float]:
         x_n = float(np.clip(cx / max(1, self._playfield_w - 1), 0.0, 1.0))
@@ -305,9 +374,12 @@ class ObsBuilder:
             self.last_conf = float(np.clip(conf, 0.0, 1.0))
             self.last_xy_norm = self._full_xy_to_playfield_norm(cx, cy)
 
-        # 2) crop
+        # 2) crop (crop 좌상단(x1,y1) 필요)
         cx, cy = self.player_center
-        crop_bgr, _, _ = self._crop_square_bgr(img_bgr, cx, cy, self.crop_size)
+        crop_bgr, _, (x1, y1) = self._crop_square_bgr(img_bgr, cx, cy, self.crop_size)
+
+        # ✅ 현재 crop 내부에서 player_center가 어디인지 uv로 갱신
+        self._update_player_uv_small((x1, y1))
 
         # 3) small resize
         interp = cv2.INTER_AREA if self.crop_size >= self.obs_out_size else cv2.INTER_LINEAR
@@ -317,8 +389,6 @@ class ObsBuilder:
 
         # 3.5) auto invert
         gray_small_u8 = self._maybe_invert_gray_small(gray_small_u8)
-
-        # ✅ (제거) 레이무 bbox를 강제로 밝게 칠하는 단계 없음
 
         if self._prev_gray_small_u8 is None or self._prev_gray_small_u8.shape != gray_small_u8.shape:
             diff_small_u8 = self._zeros_small_u8
@@ -337,6 +407,9 @@ class ObsBuilder:
 
         # 5) float32 채널 구성 (0..1) - obs buffer 재사용
         self._obs_buf[0, :, :] = gray_small_u8.astype(np.float32) * (1.0 / 255.0)
+
+        # ✅ 플레이어 마커는 ch0에만 (uv 기반)
+        self._stamp_player_marker_ch0(self._obs_buf[0])
 
         if diff_small_u8 is self._zeros_small_u8:
             self._obs_buf[1, :, :] = 0.0
@@ -362,8 +435,23 @@ class ObsBuilder:
         if self.show_obs_debug:
             try:
                 self._ensure_obs_window()
-                vis = (np.clip(obs4[3], 0.0, 1.0) * 255.0).astype(np.uint8)
+                ch = int(np.clip(self.obs_debug_channel, 0, 3))
+                vis = (np.clip(obs4[ch], 0.0, 1.0) * 255.0).astype(np.uint8)
                 vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+
+                # 디버그 텍스트(옵션): conf와 uv 표시
+                u, v = self._last_player_uv_small
+                cv2.putText(
+                    vis,
+                    f"ch{ch} conf={self.last_conf:.2f} uv=({u},{v}) inv={int(self._last_inverted)}",
+                    (5, 14),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
                 cv2.imshow(self.win_crop, vis)
             except Exception:
                 pass
