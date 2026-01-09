@@ -94,7 +94,7 @@ class ObsBuilder:
         self._last_player_uv_small: Tuple[int, int] = (self.obs_out_size // 2, self.obs_out_size // 2)
 
         # 레이무 디버그 창
-        self.show_reimu_debug: bool = False
+        self.show_reimu_debug: bool = True
         dbg_cfg = DebugViewConfig(
             window_name="debug_hell",
             enable_keys=False,

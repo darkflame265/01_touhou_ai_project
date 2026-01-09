@@ -259,7 +259,16 @@ class GameEnv:
             if self.s.ui_absent_count >= self.s.ui_absent_needed:
                 return self._end_episode(self.reward_engine.abort_pen, "ABORT:UI_ABSENT(pre)")
 
-        set_attack_hold(True)
+            # ✅ 인게임 확인: lives가 정상(0~8 같은 범위)으로 읽힐 때만 공격 홀드 ON
+            ui_lives = self.ui.ui_lives_safe(pre_img, ui_ok)
+            if ui_lives is not None and 0 <= int(ui_lives) <= 8:
+                set_attack_hold(True)
+            else:
+                set_attack_hold(False)
+        else:
+            # dup 프레임이면 일단 안전하게 OFF
+            set_attack_hold(False)
+
 
         # initial mask + key press (여기서 bomb 락/트래킹 pause 트리거됨)
         r0 = self.act.begin(action_idx, pre_img)

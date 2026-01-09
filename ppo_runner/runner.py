@@ -131,6 +131,10 @@ def run(
 
             print(f"\n========== EPISODE {ep}/{episodes} ==========")
 
+            # ✅ 메뉴 들어가기 전에 무조건 입력/공격홀드 해제
+            safe_release_inputs()
+            time.sleep(0.05)
+
             # 에피소드 시작 전(로비/스코어 등)에서만 메뉴 제어
             print("[MENU] [practice 준비/진입 중.]")
             ok = boot_into_practice(env.screen, max_sec_lobby=12.0)
@@ -138,7 +142,10 @@ def run(
                 print("[EP_PREP][WARN] boot_into_practice failed (continue)")
             print("[MENU] [practice 준비/진입 완료]")
 
+            # 메뉴 끝난 직후에도 한 번 더(잔류 방지)
             safe_release_inputs()
+            time.sleep(0.05)
+
             state = env.reset()
 
             if not no_render:
