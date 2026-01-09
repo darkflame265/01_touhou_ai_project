@@ -418,10 +418,6 @@ def enter_practice_from_cursor():
 
 
 def recover_from_score_to_lobby(screen, max_sec=3.0) -> bool:
-    """
-    SCORE 결과창에서 빠져나오기는 게임마다 다르지만
-    보통 X(취소/다음)로 충분 + 가끔 Z 섞으면 안정.
-    """
     print("[MENU][RECOVER_SCORE] start")
     if not focus_touhou_window():
         print("[MENU][ERR] focus failed -> skip key inputs")
@@ -429,26 +425,30 @@ def recover_from_score_to_lobby(screen, max_sec=3.0) -> bool:
     time.sleep(0.05)
 
     t0 = time.time()
-    tries = 0
+    z_sent = False
+
     while (time.time() - t0) < max_sec:
         img = screen.capture()
         try:
             if not screen.is_score_screen(img):
-                print(f"[MENU][RECOVER_SCORE] done (tries={tries})")
+                print("[MENU][RECOVER_SCORE] done")
                 return True
         except Exception:
             pass
 
-        tap_scancode(SC_X, label=f"X{tries+1}", press=0.02, gap=0.02)
-        time.sleep(0.08)
-        if (tries % 3) == 2:
-            tap_scancode(SC_Z, label=f"Z{tries+1}", press=0.02, gap=0.02)
+        # SCORE면 X 연타
+        tap_scancode(SC_X, label="X(score)", press=0.02, gap=0.02)
+        time.sleep(0.06)
+
+        # ✅ 한 번만 Z (예: 0.6초 지나면 1회)
+        if (not z_sent) and (time.time() - t0) >= 0.6:
+            tap_scancode(SC_Z, label="Z(score_once)", press=0.02, gap=0.02)
             time.sleep(0.12)
+            z_sent = True
 
-        tries += 1
-
-    print(f"[MENU][RECOVER_SCORE] timeout (tries={tries})")
+    print("[MENU][RECOVER_SCORE] timeout")
     return False
+
 
 
 def recover_to_lobby(
@@ -498,9 +498,9 @@ def recover_to_lobby(
             time.sleep(other_x_interval)
 
             # 마지막에 가끔 1번만 Z
-            if i == other_x_presses - 1 and (cycles % 3) == 2:
-                tap_scancode(SC_Z, label=f"Z(confirm){cycles}", press=0.02, gap=0.02)
-                time.sleep(0.15)
+            # if i == other_x_presses - 1 and (cycles % 3) == 2:
+            #     tap_scancode(SC_Z, label=f"Z(confirm){cycles}", press=0.02, gap=0.02)
+            #     time.sleep(0.15)
 
         cycles += 1
 

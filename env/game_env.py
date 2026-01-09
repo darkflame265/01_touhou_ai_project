@@ -155,7 +155,7 @@ class GameEnv:
             self.obs.reset()
 
         release_all()
-        set_attack_hold(True)
+        set_attack_hold(False)
         set_always_slow(True)
         return self.packer.pack_frames_concat()
 
@@ -258,6 +258,8 @@ class GameEnv:
             self.ui.update_ui_absent(ui_ok)
             if self.s.ui_absent_count >= self.s.ui_absent_needed:
                 return self._end_episode(self.reward_engine.abort_pen, "ABORT:UI_ABSENT(pre)")
+
+        set_attack_hold(True)
 
         # initial mask + key press (여기서 bomb 락/트래킹 pause 트리거됨)
         r0 = self.act.begin(action_idx, pre_img)
