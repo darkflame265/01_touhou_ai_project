@@ -1,3 +1,4 @@
+# agents/ppo_agent.py
 import os
 import numpy as np
 import torch
@@ -9,10 +10,12 @@ from models.shared.cnn_actor_critic import ActorCriticCNN
 
 class PPOAgent:
     """
-    Drop-in replacement for your working PPOAgent, optimized for:
-    - fewer Python list ops (preallocated rollout buffer)
-    - fewer CPU->GPU transfers (batch transfer once per update)
-    - faster training via AMP (fp16) on RTX 3060 Ti
+    PPOAgent with action masking support.
+
+    Key additions vs your current version:
+    - select_action(state, action_mask): apply mask to logits so forbidden actions are never sampled.
+    - store(..., action_mask): store per-step mask in rollout buffer.
+    - update(...): apply the stored masks to logits during PPO loss computation (consistent training).
     """
 
     def __init__(
@@ -35,11 +38,11 @@ class PPOAgent:
         ent_warmup_updates=30,
         device=None,
         # ---- speed options ----
-        use_amp=True,              # mixed precision (recommended on 3060Ti)
-        cudnn_benchmark=True,      # good when input size is fixed
-        compile_model=False,       # torch.compile (PyTorch 2.x). Try if stable.
-        channels_last=False,       # enable if your CNN benefits
-        pin_memory=True,           # helps H2D copy speed
+        use_amp=True,
+        cudnn_benchmark=True,
+        compile_model=False,
+        channels_last=False,
+        pin_memory=True,
     ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
         self.use_amp = bool(use_amp and (self.device == "cuda"))
@@ -47,6 +50,8 @@ class PPOAgent:
 
         if self.device == "cuda":
             torch.backends.cudnn.benchmark = bool(cudnn_benchmark)
+
+        self.num_actions = int(num_actions)
 
         self.model = ActorCriticCNN(
             input_channels=int(input_channels),
@@ -56,12 +61,13 @@ class PPOAgent:
             meta_channel_offset=0,
         ).to(self.device)
 
-        if channels_last and self.device == "cuda":
+        self.channels_last = bool(channels_last and self.device == "cuda")
+        if self.channels_last:
             self.model = self.model.to(memory_format=torch.channels_last)
 
         if compile_model:
             try:
-                self.model = torch.compile(self.model)  # PyTorch 2.x
+                self.model = torch.compile(self.model)
             except Exception as e:
                 print(f"[WARN] torch.compile failed, continue without it: {e}")
 
@@ -102,31 +108,65 @@ class PPOAgent:
         if self._buf_inited:
             return
 
-        # state expected shape: (C,H,W) or whatever your model expects
         self._state_shape = tuple(state.shape)
         T = self.rollout_steps
+        A = self.num_actions
 
         # States: float32
         self.states = np.zeros((T,) + self._state_shape, dtype=np.float32)
-        # Scalars:
+
+        # Scalars
         self.actions = np.zeros((T,), dtype=np.int64)
         self.rewards = np.zeros((T,), dtype=np.float32)
         self.dones = np.zeros((T,), dtype=np.float32)       # 1.0 if done else 0.0
         self.log_probs = np.zeros((T,), dtype=np.float32)
         self.values = np.zeros((T,), dtype=np.float32)
 
+        # Action masks: bool (T, A)  True=allowed, False=forbidden
+        self.action_masks = np.ones((T, A), dtype=np.bool_)
+
         self._buf_inited = True
 
+    @staticmethod
+    def _apply_action_mask_to_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """
+        logits: (B, A)
+        mask:  (B, A) bool, True=allowed
+        Forbidden actions get very negative logits so prob ~ 0.
+        Safety: if a row is all False, we leave logits unchanged for that row.
+        """
+        if mask is None:
+            return logits
+
+        mask = mask.to(dtype=torch.bool)
+
+        # row safety: if any row has no allowed actions, skip masking for those rows
+        row_any = mask.any(dim=-1, keepdim=True)  # (B,1)
+        safe_mask = torch.where(row_any, mask, torch.ones_like(mask, dtype=torch.bool))
+
+        # ✅ dtype-safe very negative value
+        if logits.dtype in (torch.float16, torch.bfloat16):
+            neg = torch.tensor(-1e4, device=logits.device, dtype=logits.dtype)  # fp16-safe
+        else:
+            neg = torch.tensor(-1e9, device=logits.device, dtype=logits.dtype)
+
+        return logits.masked_fill(~safe_mask, neg)
+
+
     @torch.no_grad()
-    def select_action(self, state: np.ndarray):
+    def select_action(self, state: np.ndarray, action_mask: np.ndarray | None = None):
         s = torch.from_numpy(state).to(self.device, dtype=torch.float32).unsqueeze(0)
 
-        if s.is_cuda and getattr(self.model, "to", None) and s.dim() == 4:
-            # If you used channels_last, keep input consistent
-            # (safe even if channels_last=False)
+        if s.is_cuda and s.dim() == 4 and self.channels_last:
             s = s.contiguous(memory_format=torch.channels_last)
 
-        logits, value = self.model(s)
+        logits, value = self.model(s)  # logits: (1, A)
+
+        if action_mask is not None:
+            m = torch.as_tensor(action_mask, device=self.device, dtype=torch.bool).view(1, -1)
+            if m.numel() == logits.size(-1):
+                logits = self._apply_action_mask_to_logits(logits, m)
+
         dist = Categorical(logits=logits)
         action = dist.sample()
 
@@ -136,12 +176,15 @@ class PPOAgent:
             float(value.squeeze(-1).item()),
         )
 
-    def store(self, state, action, reward, done, log_prob, value):
+    def store(self, state, action, reward, done, log_prob, value, action_mask=None):
+        """
+        action_mask: (A,) bool array where True=allowed.
+        If None, defaults to all-True (no masking).
+        """
         self._ensure_buffer(state)
 
         i = self._buf_ptr
         if i >= self.rollout_steps:
-            # if user accidentally keeps storing, just ignore extra
             return
 
         self.states[i] = state.astype(np.float32, copy=False)
@@ -151,6 +194,16 @@ class PPOAgent:
         self.log_probs[i] = float(log_prob)
         self.values[i] = float(value)
 
+        if action_mask is None:
+            self.action_masks[i] = True
+        else:
+            am = np.asarray(action_mask, dtype=np.bool_)
+            if am.shape[0] == self.num_actions:
+                self.action_masks[i] = am
+            else:
+                # shape mismatch -> fallback to no masking for this step
+                self.action_masks[i] = True
+
         self._buf_ptr += 1
         self.global_step += 1
 
@@ -158,12 +211,6 @@ class PPOAgent:
         return self._buf_ptr >= self.rollout_steps
 
     def _compute_gae_torch(self, rewards_t, dones_t, values_t, last_value_t):
-        """
-        rewards_t: (T,)
-        dones_t: (T,) float32 1.0 done else 0.0
-        values_t: (T,) predicted V(s_t)
-        last_value_t: scalar tensor V(s_{T}) if not done else 0
-        """
         T = rewards_t.size(0)
         adv = torch.zeros(T, device=self.device, dtype=torch.float32)
         gae = torch.zeros((), device=self.device, dtype=torch.float32)
@@ -191,27 +238,28 @@ class PPOAgent:
         if last_state is not None and (not last_done):
             with torch.no_grad():
                 s = torch.from_numpy(last_state).to(self.device, dtype=torch.float32).unsqueeze(0)
-                if s.is_cuda and s.dim() == 4:
+                if s.is_cuda and s.dim() == 4 and self.channels_last:
                     s = s.contiguous(memory_format=torch.channels_last)
                 _, v = self.model(s)
                 last_value = float(v.squeeze(-1).item())
 
-        # ---- batch tensors (one transfer) ----
-        # Slice only used part (T)
+        # ---- slice only used part (T) ----
         states_np = self.states[:T]
         actions_np = self.actions[:T]
         rewards_np = self.rewards[:T]
         dones_np = self.dones[:T]
         old_logp_np = self.log_probs[:T]
         values_np = self.values[:T]
+        masks_np = self.action_masks[:T]
 
-        # CPU tensors
-        states_cpu = torch.from_numpy(states_np)  # float32
-        actions_cpu = torch.from_numpy(actions_np)  # int64
-        rewards_cpu = torch.from_numpy(rewards_np)  # float32
-        dones_cpu = torch.from_numpy(dones_np)      # float32
-        old_logp_cpu = torch.from_numpy(old_logp_np)  # float32
-        values_cpu = torch.from_numpy(values_np)    # float32
+        # ---- CPU tensors ----
+        states_cpu = torch.from_numpy(states_np)         # float32
+        actions_cpu = torch.from_numpy(actions_np)       # int64
+        rewards_cpu = torch.from_numpy(rewards_np)       # float32
+        dones_cpu = torch.from_numpy(dones_np)           # float32
+        old_logp_cpu = torch.from_numpy(old_logp_np)     # float32
+        values_cpu = torch.from_numpy(values_np)         # float32
+        masks_cpu = torch.from_numpy(masks_np.astype(np.bool_, copy=False))  # bool
 
         if self.pin_memory:
             states_cpu = states_cpu.pin_memory()
@@ -220,17 +268,20 @@ class PPOAgent:
             dones_cpu = dones_cpu.pin_memory()
             old_logp_cpu = old_logp_cpu.pin_memory()
             values_cpu = values_cpu.pin_memory()
+            masks_cpu = masks_cpu.pin_memory()
 
-        # GPU tensors (non_blocking if pinned)
         nb = self.pin_memory
+
+        # ---- GPU tensors ----
         states = states_cpu.to(self.device, non_blocking=nb)
         actions = actions_cpu.to(self.device, non_blocking=nb)
         rewards = rewards_cpu.to(self.device, non_blocking=nb)
         dones = dones_cpu.to(self.device, non_blocking=nb)
         old_log_probs = old_logp_cpu.to(self.device, non_blocking=nb)
         values = values_cpu.to(self.device, non_blocking=nb)
+        masks = masks_cpu.to(self.device, non_blocking=nb)
 
-        if states.is_cuda and states.dim() == 4:
+        if states.is_cuda and states.dim() == 4 and self.channels_last:
             states = states.contiguous(memory_format=torch.channels_last)
 
         last_value_t = torch.tensor(last_value, device=self.device, dtype=torch.float32)
@@ -252,6 +303,9 @@ class PPOAgent:
                 with torch.amp.autocast("cuda", enabled=self.use_amp):
                     logits, v = self.model(states[mb])
                     v = v.squeeze(-1)
+
+                    # ✅ apply per-step action masks
+                    logits = self._apply_action_mask_to_logits(logits, masks[mb])
 
                     dist = Categorical(logits=logits)
                     new_log_probs = dist.log_prob(actions[mb])

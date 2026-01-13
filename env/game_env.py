@@ -34,25 +34,44 @@ class GameEnv:
 
         # reward engine (여기 값만 조절)
         r_cfg = RewardConfig(
-            alive_reward=0.1,
-            hit_pen=-5.0,
-            death_pen=-5.0,
-            abort_pen=-5.0,
+            # base
+            alive_reward=0.03,
+
+            # terminal-ish penalties
+            hit_pen=-1.5,
+            death_pen=-1.5,
+            abort_pen=-1.5,
+
+            # position shaping
             use_position_shaping=True,
+
+            # "위쪽을 싫어하게" 해서 기본적으로 아래쪽에 머물도록 유도
             y_floor=0.60,
-            y_zone_enter_pen=1.5,
-            y_zone_stay_pen_k=0.08,
+            y_zone_enter_pen=0.5,
+            y_zone_stay_pen_k=0.05,
+
+            # soft edge penalties (너무 구석/상단으로 붙는 습관 방지)
             top_soft_y=0.20,
             right_soft_x=0.80,
-            top_pen_k=0.020,
-            right_pen_k=0.010,
-            corner_bonus_pen=0.015,
+            top_pen_k=0.010,         # 0.020 -> 0.010 (누적 페널티 완화)
+            right_pen_k=0.005,       # 0.010 -> 0.005
+            corner_bonus_pen=0.008,  # 0.015 -> 0.008
+
+            # death fx reset
             death_fx_reset_cooldown=0.25,
         )
         self.reward_engine = RewardEngine(self.s, r_cfg)
 
+
         # masking + action executor
-        m_cfg = MaskingConfig(margin_px=90, use_flip=True, top_limit_px=None, top_limit_fudge_px=10)
+        m_cfg = MaskingConfig(
+            margin_px=90,
+            use_flip=True,
+            top_limit_px=None,
+            top_limit_fudge_px=10,
+            disable_bomb=True,          # ✅ 학습 중 폭탄 완전 금지
+            enable_bomb_gate=True,      # 나중에 disable_bomb=False로 바꾸면 게이트 방식으로 바로 복구 가능
+        )
         self.masker = ActionMasker(self.screen, self.obs, m_cfg)
         self.act = ActionExecutor(self.s, self.masker)
 

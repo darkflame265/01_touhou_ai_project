@@ -43,6 +43,9 @@ class MaskingConfig:
     bomb_use_candidate_mask: bool = True
     bomb_use_risk_heatmap: bool = True
 
+    disable_bomb: bool = True   # 학습 중 폭탄 완전 금지
+
+
 
 class ActionMasker:
     def __init__(self, screen, obs, cfg: MaskingConfig):
@@ -130,9 +133,13 @@ class ActionMasker:
         if pc is None:
             # 플레이어 위치가 없으면 이동 마스킹은 못 하되,
             # BOMB는 관측치만으로 가능하면 gate는 적용한다.
-            if self._bomb_idx is not None and self.cfg.enable_bomb_gate:
-                if not self._bomb_should_be_allowed():
+            # ===== BOMB disable / gating =====
+            if self._bomb_idx is not None:
+                if bool(getattr(self.cfg, "disable_bomb", False)):
                     mask[self._bomb_idx] = False
+                elif self.cfg.enable_bomb_gate:
+                    if not self._bomb_should_be_allowed():
+                        mask[self._bomb_idx] = False
             return mask
 
         px, py = int(pc[0]), int(pc[1])

@@ -7,6 +7,7 @@ from datetime import datetime
 from collections import Counter
 
 import cv2
+import numpy as np
 
 from env.game_env import GameEnv
 from env.controller import release_all, set_attack_hold, cleanup_inputs_on_exit
@@ -97,6 +98,44 @@ def _load_agent_and_env(ckpt_path: str, no_render: bool):
     return env, agent
 
 
+def _find_bomb_index() -> int | None:
+    for i, a in enumerate(ACTIONS):
+        if getattr(a, "name", "") == "BOMB":
+            return i
+    return None
+
+
+def _build_action_mask(env: GameEnv) -> np.ndarray:
+    """
+    1) env.masker가 있으면 화면 캡처 1회로 mask 계산
+    2) 안전장치: BOMB는 항상 금지(정책이 아예 뽑지 못하도록)
+    """
+    mask = np.ones((len(ACTIONS),), dtype=np.bool_)
+
+    # (A) 가능하면 env.masker 기반 마스크를 AND로 적용
+    try:
+        img = env.screen.capture()
+        if hasattr(env, "masker") and env.masker is not None:
+            m2 = env.masker.get_action_mask(img)
+            if m2 is not None and len(m2) == len(mask):
+                mask &= m2.astype(np.bool_, copy=False)
+    except Exception:
+        pass
+
+    # (B) 최종적으로 BOMB는 무조건 금지
+    bidx = _find_bomb_index()
+    if bidx is not None:
+        mask[int(bidx)] = False
+
+    # (C) 전부 False면 위험하니(샘플링 불가) 전부 True로 복구 후 BOMB만 금지
+    if not bool(mask.any()):
+        mask[:] = True
+        if bidx is not None:
+            mask[int(bidx)] = False
+
+    return mask
+
+
 def run(
     episodes: int = 1,
     no_render: bool = False,
@@ -118,7 +157,6 @@ def run(
 
     print("\n[INFO] ESC 중단: Windows 전역 감지(GetAsyncKeyState)")
     time.sleep(0.2)
-
 
     stop_requested = False
 
@@ -169,18 +207,21 @@ def run(
                     done = True
                     break
 
-                action_idx, log_prob, value = agent.select_action(state)
-
-                action_name = ACTIONS[action_idx].name
-                action_counter[action_name] += 1
-                if action_name.startswith("SLOW"):
-                    slow_count += 1
+                # ✅ action mask 생성 + PPO 샘플링에 반영
+                action_mask = _build_action_mask(env)
+                action_idx, log_prob, value = agent.select_action(state, action_mask=action_mask)
 
                 next_state, reward, done = env.step(action_idx)
 
+                # ✅ 실제 실행된 액션 기준으로 통계/저장/slow 카운트
+                exec_idx = getattr(env.s, "exec_action_idx", action_idx)
+                exec_name = ACTIONS[int(exec_idx)].name
+                action_counter[exec_name] += 1
+                if exec_name.startswith("SLOW"):
+                    slow_count += 1
+
                 if not eval_mode:
-                    exec_idx = getattr(env.s, "exec_action_idx", action_idx)
-                    agent.store(state, exec_idx, reward, done, log_prob, value)
+                    agent.store(state, int(action_idx), reward, done, log_prob, value, action_mask=action_mask)
 
                 state = next_state
                 total_reward += float(reward)
