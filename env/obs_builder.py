@@ -14,34 +14,38 @@ from env.reimu_tracker_debug_view import ReimuTrackerDebugView, DebugViewConfig
 class ObsBuilder:
     """
     4채널 관측 (float32):
-      ch0: crop_gray (0..1) + player marker + meta pixels(xy/conf)
+      ch0: gray (0..1) + player marker + meta pixels(xy/conf)
       ch1: absdiff(current_gray, prev_gray) (0..1)
       ch2: bullet_candidate_mask (0..1)
       ch3: risk_heatmap (distanceTransform 기반, 0..1)
+
+    ✅ 변경(요구사항):
+    - crop 기반이 아니라 "화면 전체"를 그대로 obs_out_size로 리사이즈해 사용.
+    - 기존 디버그/버퍼/트래커 pause/메타/마커 구조는 유지.
     """
 
     def __init__(
         self,
         screen,
         obs_out_size: int = 128,
-        crop_size: int = 256,
+        crop_size: int = 256,  # (호환용) 더 이상 crop에 쓰지 않음
         use_fallback_full_preprocess: bool = True,  # (호환용) 현재 미사용
     ):
         self.screen = screen
 
         self.obs_out_size = int(obs_out_size)
-        self.crop_size = int(crop_size)
+        self.crop_size = int(crop_size)  # 호환용으로만 보관
         self.obs_channels = 4
 
         img0 = self.screen.capture()
         h0, w0 = img0.shape[:2]
         self.H, self.W = int(h0), int(w0)
 
-        # playfield width 캐시
+        # playfield width 캐시 (기존 유지)
         self._playfield_ratio = float(getattr(self.screen, "PLAYFIELD_RIGHT_RATIO", 0.70))
         self._playfield_w = max(1, min(self.W, int(self.W * self._playfield_ratio)))
 
-        # tracker
+        # tracker (기존 인터페이스 유지)
         self.tracker = ReimuTrackerCV()
 
         # 정책/리워드용 좌표/신뢰도 (playfield 기준 정규화)
@@ -68,8 +72,7 @@ class ObsBuilder:
         self.diff_bullet_k_mad: float = 3.0
         self.max_bullet_fill_ratio: float = 0.35
 
-        # ----- Reimu brighten 제거 -----
-        # 트래커 bbox는 crop 중심 추정/메타(xy/conf)에만 사용됨.
+        # tracker bbox 캐시 (full 기준)
         self._last_bbox_full: Optional[Tuple[int, int, int, int]] = None  # (x,y,w,h)
 
         # bullet/risk
@@ -83,14 +86,11 @@ class ObsBuilder:
         self.risk_clip_max: float = 1.0
 
         # ===== player marker on ch0 (학습용) =====
-        # ✅ ch0에만 마커를 찍어서 다른 채널(diff/bullet/risk)을 오염시키지 않는다.
-        # ✅ 마커 위치는 "항상 중앙"이 아니라, 트래커가 잡은 player_center가
-        #    crop 내부에서 어디에 위치하는지(u,v)로 변환해 찍는다.
         self.mark_player_on_ch0: bool = True
-        self.marker_half: int = 2            # 2면 5x5 십자 정도
-        self.marker_value: float = 1.0       # ch0(0..1)에 찍을 값
-        self.marker_use_conf: bool = True    # conf로 밝기 스케일
-        self.marker_min_scale: float = 0.35  # conf가 낮아도 이 정도는 찍음
+        self.marker_half: int = 2
+        self.marker_value: float = 1.0
+        self.marker_use_conf: bool = True
+        self.marker_min_scale: float = 0.35
         self._last_player_uv_small: Tuple[int, int] = (self.obs_out_size // 2, self.obs_out_size // 2)
 
         # 레이무 디버그 창
@@ -103,7 +103,7 @@ class ObsBuilder:
         self.reimu_dbg_view = ReimuTrackerDebugView(self.tracker, cfg=dbg_cfg)
 
         # OBS 디버그
-        self.show_obs_debug: bool = False
+        self.show_obs_debug: bool = True
         self.win_crop: str = "OBS_CROP"
         self._obs_win_inited: bool = False
 
@@ -167,21 +167,6 @@ class ObsBuilder:
             pass
         self._obs_win_inited = True
 
-    @staticmethod
-    def _crop_square_bgr(img_bgr: np.ndarray, cx: int, cy: int, size: int):
-        h, w = img_bgr.shape[:2]
-        size = int(size)
-        half = size // 2
-
-        cx = int(np.clip(cx, half, w - half - 1))
-        cy = int(np.clip(cy, half, h - half - 1))
-
-        x1 = int(cx - half)
-        y1 = int(cy - half)
-        x2 = x1 + size
-        y2 = y1 + size
-        return img_bgr[y1:y2, x1:x2], (cx, cy), (x1, y1)
-
     def _inject_meta_pixels_ch0_only(self, ch0_01: np.ndarray) -> np.ndarray:
         try:
             x_n, y_n = self.last_xy_norm
@@ -200,20 +185,16 @@ class ObsBuilder:
             pass
         return ch0_01
 
-    def _update_player_uv_small(self, crop_xy: Tuple[int, int]) -> None:
+    def _update_player_uv_small_from_full(self) -> None:
         """
         전체화면 좌표 player_center(px,py)를
-        crop 좌상단(x1,y1) 기준으로 crop 내부 좌표로 바꾸고,
-        obs_out_size 해상도(u,v)로 스케일해서 저장.
+        obs_out_size 해상도(u,v)로 직접 스케일해서 저장.
+        (crop 좌표 불필요)
         """
         try:
-            x1, y1 = map(int, crop_xy)
             px, py = map(int, self.player_center)
-
-            scale = float(self.obs_out_size) / float(max(1, self.crop_size))
-            u = int(round((px - x1) * scale))
-            v = int(round((py - y1) * scale))
-
+            u = int(round(px * (self.obs_out_size - 1) / max(1, (self.W - 1))))
+            v = int(round(py * (self.obs_out_size - 1) / max(1, (self.H - 1))))
             u = int(np.clip(u, 0, self.obs_out_size - 1))
             v = int(np.clip(v, 0, self.obs_out_size - 1))
             self._last_player_uv_small = (u, v)
@@ -374,20 +355,16 @@ class ObsBuilder:
             self.last_conf = float(np.clip(conf, 0.0, 1.0))
             self.last_xy_norm = self._full_xy_to_playfield_norm(cx, cy)
 
-        # 2) crop (crop 좌상단(x1,y1) 필요)
-        cx, cy = self.player_center
-        crop_bgr, _, (x1, y1) = self._crop_square_bgr(img_bgr, cx, cy, self.crop_size)
+        # ✅ full 좌표 -> small uv 갱신 (crop 좌표 불필요)
+        self._update_player_uv_small_from_full()
 
-        # ✅ 현재 crop 내부에서 player_center가 어디인지 uv로 갱신
-        self._update_player_uv_small((x1, y1))
-
-        # 3) small resize
-        interp = cv2.INTER_AREA if self.crop_size >= self.obs_out_size else cv2.INTER_LINEAR
-        bgr_small = cv2.resize(crop_bgr, (self.obs_out_size, self.obs_out_size), interpolation=interp)
+        # 2) full -> small resize (obs_out_size)
+        interp = cv2.INTER_AREA if max(self.H, self.W) >= self.obs_out_size else cv2.INTER_LINEAR
+        bgr_small = cv2.resize(img_bgr, (self.obs_out_size, self.obs_out_size), interpolation=interp)
 
         gray_small_u8 = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2GRAY)
 
-        # 3.5) auto invert
+        # 3) auto invert
         gray_small_u8 = self._maybe_invert_gray_small(gray_small_u8)
 
         if self._prev_gray_small_u8 is None or self._prev_gray_small_u8.shape != gray_small_u8.shape:
@@ -439,7 +416,6 @@ class ObsBuilder:
                 vis = (np.clip(obs4[ch], 0.0, 1.0) * 255.0).astype(np.uint8)
                 vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
 
-                # 디버그 텍스트(옵션): conf와 uv 표시
                 u, v = self._last_player_uv_small
                 cv2.putText(
                     vis,
