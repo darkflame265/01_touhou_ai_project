@@ -124,6 +124,13 @@ class ObsBuilder:
         self._pause_active = False
         self._pause_reset_pending = False
 
+        # ✅ 디버그 윈도우 상태 리셋(새 게임에서 갱신 꼬임 방지)
+        self._obs_win_inited = False
+        try:
+            cv2.destroyWindow(self.win_crop)
+        except Exception:
+            pass
+
     def on_player_death(self):
         try:
             self.tracker.reset()
@@ -342,6 +349,8 @@ class ObsBuilder:
                     y=28,
                 )
                 cv2.imshow(self.win_crop, vis)
+                cv2.waitKey(1)  # ✅ 창 이벤트/리페인트 강제 처리
+
             except Exception:
                 pass
 
