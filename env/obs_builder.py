@@ -19,45 +19,57 @@ class ObsBuilder:
       ch2: bullet_candidate_mask (0..1)
       ch3: risk_heatmap (distanceTransform 기반, 0..1)
 
-    ✅ 현재 요구사항 + 초미세 회피용 추가:
-    - full-frame(img_bgr) -> obs_out_size 로 리사이즈 (UI crop 하지 않음)
-    - tracker: full-frame 기준 step(img_bgr)
-    - last_xy_norm: playfield 기준 정규화(가로는 UI 패널 제외 폭 기준, 세로는 전체 높이 기준)
+    ✅ UI 제외 버전(권장):
+    - playfield만 crop 한 뒤 -> obs_out_size로 리사이즈
+    - tracker는 full-frame 기준으로 step(img_bgr)
+    - last_xy_norm: playfield 기준 정규화(가로/세로 모두 playfield crop 기준)
     - ch0에 십자 마커 + meta pixels(x/y/conf)
-    - ✅ 추가: 레이무 주변 ROI에서 risk local 요약값을 계산해 속성으로 노출
-        - risk_local_p90 / risk_local_p99 / risk_local_mean
+    - ✅ 초미세 회피용 local risk:
         - risk_local_valid (conf 기반)
+        - risk_local_p90 / risk_local_p99 / risk_local_mean
+        - (포화 방지) ROI에서 '탄 픽셀(=risk~1)'은 제외하고 분위수 계산
     """
 
     def __init__(
         self,
         screen,
         obs_out_size: int = 128,
-        crop_size: int = 256,  # (호환용) 더 이상 crop에 쓰지 않음
-        use_fallback_full_preprocess: bool = True,  # (호환용) 현재 미사용
+        crop_size: int = 256,  # (호환용) 미사용
+        use_fallback_full_preprocess: bool = True,  # (호환용) 미사용
     ):
         self.screen = screen
 
         self.obs_out_size = int(obs_out_size)
-        self.crop_size = int(crop_size)  # 호환용
+        self.crop_size = int(crop_size)
         self.obs_channels = 4
 
         img0 = self.screen.capture()
         h0, w0 = img0.shape[:2]
         self.H, self.W = int(h0), int(w0)
 
-        # playfield width 캐시 (UI 패널 제외 폭 기준)
+        # ===== playfield crop 설정 =====
+        # 기본: 우측 UI 패널 제외 (x: 0 ~ playfield_w)
         self._playfield_ratio = float(getattr(self.screen, "PLAYFIELD_RIGHT_RATIO", 0.70))
-        self._playfield_w = max(1, min(self.W, int(self.W * self._playfield_ratio)))
+        self._playfield_x0 = 0
+        self._playfield_x1 = max(1, min(self.W, int(self.W * self._playfield_ratio)))
 
-        # tracker
+        # 세로 crop: Screen에 설정이 있으면 사용, 없으면 전체(0~H)
+        top = float(getattr(self.screen, "PLAYFIELD_TOP_CROP", 0.0))
+        bot = float(getattr(self.screen, "PLAYFIELD_BOTTOM_CROP", 1.0))
+        self._playfield_y0 = int(np.clip(round(self.H * top), 0, self.H - 1))
+        self._playfield_y1 = int(np.clip(round(self.H * bot), self._playfield_y0 + 1, self.H))
+
+        self._pf_w = max(1, self._playfield_x1 - self._playfield_x0)
+        self._pf_h = max(1, self._playfield_y1 - self._playfield_y0)
+
+        # tracker (full-frame)
         self.tracker = ReimuTrackerCV()
 
         # 정책/리워드용 좌표/신뢰도 (playfield 기준 정규화)
         self.last_xy_norm: Tuple[float, float] = (0.5, 0.78)
         self.last_conf: float = 0.0
 
-        # det None일 때 유지
+        # det None일 때 유지 (full-frame 좌표)
         self.player_center: Tuple[int, int] = (w0 // 2, int(h0 * 0.78))
 
         # meta pixels
@@ -75,7 +87,8 @@ class ObsBuilder:
         self.use_motion_for_bullets: bool = True
         self.diff_bullet_min: int = 10
         self.diff_bullet_k_mad: float = 3.0
-        self.max_bullet_fill_ratio: float = 0.35
+        # motion이 화면을 덮어버리면 risk 포화 → HSV fallback
+        self.max_bullet_fill_ratio: float = 0.30
 
         # tracker bbox 캐시 (full 기준)
         self._last_bbox_full: Optional[Tuple[int, int, int, int]] = None  # (x,y,w,h)
@@ -89,8 +102,9 @@ class ObsBuilder:
 
         self.risk_tau_px: float = 8.0
         self.risk_clip_max: float = 1.0
+        self.risk_use_max_normalize: bool = False
 
-        # ===== player marker on ch0 (학습용) =====
+        # ===== player marker on ch0 =====
         self.mark_player_on_ch0: bool = True
         self.marker_half: int = 2
         self.marker_value: float = 1.0
@@ -98,17 +112,26 @@ class ObsBuilder:
         self.marker_min_scale: float = 0.35
         self._last_player_uv_small: Tuple[int, int] = (self.obs_out_size // 2, self.obs_out_size // 2)
 
-        # ✅ local risk ROI 설정
+        # ===== local risk ROI =====
         self.local_risk_enable: bool = True
-        self.local_risk_radius: int = 12          # 8~16 추천 (obs_out_size=128 기준)
-        self.local_risk_quantile_p: float = 0.90  # 기본 p90
-        self.local_risk_conf_thr: float = 0.20    # conf 낮으면 local risk 무효
+        self.local_risk_radius: int = 12
+        self.local_risk_quantile_p: float = 0.90  # 노출용
+        self.local_risk_conf_thr: float = 0.20
 
-        # ✅ local risk 결과(외부에서 읽게끔 속성으로 유지)
+        self.local_risk_exclude_saturated: bool = True
+        self.local_risk_sat_thr: float = 0.999
+        self.local_risk_min_valid_bg_frac: float = 0.30
+
         self.risk_local_valid: bool = False
         self.risk_local_mean: float = 0.0
         self.risk_local_p90: float = 0.0
         self.risk_local_p99: float = 0.0
+        self.risk_local_bg_frac: float = 0.0
+        self.risk_local_max: float = 0.0
+
+        # 외부 getattr 안전
+        self.bullet_candidate_mask = None
+        self.risk_heatmap = None
 
         # 레이무 디버그 창
         self.show_reimu_debug: bool = True
@@ -119,26 +142,28 @@ class ObsBuilder:
         )
         self.reimu_dbg_view = ReimuTrackerDebugView(self.tracker, cfg=dbg_cfg)
 
-        # OBS 디버그
+        # OBS 디버그 (playfield만 보여줌)
         self.show_obs_debug: bool = True
         self.win_crop: str = "OBS_CROP"
         self._obs_win_inited: bool = False
         self.obs_debug_channel: int = 0
+
+        # 디버그 표시 업스케일 (텍스트 선명도)
+        self.debug_upscale: int = 4
+        self.debug_font_scale: float = 0.70
+        self.debug_thickness: int = 2
 
         # tracker pause (bomb etc.)
         self._track_pause_until: float = 0.0
         self._track_pause_active: bool = False
         self._track_pause_resume_reset_pending: bool = False
 
-        # =========================
-        # ✅ 최적화용 캐시/버퍼
-        # =========================
+        # ===== buffers =====
         s = self.obs_out_size
         self._zeros_small_u8 = np.zeros((s, s), dtype=np.uint8)
         self._zeros_small_f32 = np.zeros((s, s), dtype=np.float32)
-        self._obs_buf = np.empty((4, s, s), dtype=np.float32)  # 재사용
+        self._obs_buf = np.empty((4, s, s), dtype=np.float32)
 
-        # bullet morph kernel cache
         self._bullet_kernel = None
         self._bullet_kernel_k = -1
 
@@ -146,7 +171,11 @@ class ObsBuilder:
     # lifecycle / hooks
     # -------------------------
     def reset(self):
-        self.tracker.reset()
+        try:
+            self.tracker.reset()
+        except Exception:
+            pass
+
         self.player_center = (self.W // 2, int(self.H * 0.78))
         self.last_xy_norm = (0.5, 0.78)
         self.last_conf = 0.0
@@ -162,6 +191,8 @@ class ObsBuilder:
         self.risk_local_mean = 0.0
         self.risk_local_p90 = 0.0
         self.risk_local_p99 = 0.0
+        self.risk_local_bg_frac = 0.0
+        self.risk_local_max = 0.0
 
     def on_player_death(self):
         try:
@@ -194,6 +225,47 @@ class ObsBuilder:
         self._obs_win_inited = True
 
     # -------------------------
+    # playfield helpers
+    # -------------------------
+    def _crop_playfield(self, img_bgr: np.ndarray) -> np.ndarray:
+        # 안전하게 clamp
+        x0, x1 = int(self._playfield_x0), int(self._playfield_x1)
+        y0, y1 = int(self._playfield_y0), int(self._playfield_y1)
+        x0 = int(np.clip(x0, 0, img_bgr.shape[1] - 1))
+        x1 = int(np.clip(x1, x0 + 1, img_bgr.shape[1]))
+        y0 = int(np.clip(y0, 0, img_bgr.shape[0] - 1))
+        y1 = int(np.clip(y1, y0 + 1, img_bgr.shape[0]))
+        return img_bgr[y0:y1, x0:x1]
+
+    def _full_xy_to_playfield_norm(self, cx_full: int, cy_full: int) -> Tuple[float, float]:
+        # full 좌표 -> playfield 좌표
+        x_pf = float(cx_full - self._playfield_x0)
+        y_pf = float(cy_full - self._playfield_y0)
+
+        x_n = float(np.clip(x_pf / max(1, self._pf_w - 1), 0.0, 1.0))
+        y_n = float(np.clip(y_pf / max(1, self._pf_h - 1), 0.0, 1.0))
+        return x_n, y_n
+
+    def _update_player_uv_small_from_full(self) -> None:
+        """
+        full-frame player_center를 playfield->small 좌표(u,v)로 변환.
+        """
+        try:
+            px, py = map(int, self.player_center)
+
+            x_pf = float(px - self._playfield_x0)
+            y_pf = float(py - self._playfield_y0)
+
+            u = int(round(x_pf * (self.obs_out_size - 1) / max(1, (self._pf_w - 1))))
+            v = int(round(y_pf * (self.obs_out_size - 1) / max(1, (self._pf_h - 1))))
+
+            u = int(np.clip(u, 0, self.obs_out_size - 1))
+            v = int(np.clip(v, 0, self.obs_out_size - 1))
+            self._last_player_uv_small = (u, v)
+        except Exception:
+            self._last_player_uv_small = (self.obs_out_size // 2, self.obs_out_size // 2)
+
+    # -------------------------
     # meta pixels / marker
     # -------------------------
     def _inject_meta_pixels_ch0_only(self, ch0_01: np.ndarray) -> np.ndarray:
@@ -213,17 +285,6 @@ class ObsBuilder:
         except Exception:
             pass
         return ch0_01
-
-    def _update_player_uv_small_from_full(self) -> None:
-        try:
-            px, py = map(int, self.player_center)
-            u = int(round(px * (self.obs_out_size - 1) / max(1, (self.W - 1))))
-            v = int(round(py * (self.obs_out_size - 1) / max(1, (self.H - 1))))
-            u = int(np.clip(u, 0, self.obs_out_size - 1))
-            v = int(np.clip(v, 0, self.obs_out_size - 1))
-            self._last_player_uv_small = (u, v)
-        except Exception:
-            self._last_player_uv_small = (self.obs_out_size // 2, self.obs_out_size // 2)
 
     def _stamp_player_marker_ch0(self, ch0_01: np.ndarray) -> None:
         if not self.mark_player_on_ch0:
@@ -256,11 +317,6 @@ class ObsBuilder:
         ch0_01[cy, x1:x2] = v
         ch0_01[y1:y2, cx] = v
 
-    def _full_xy_to_playfield_norm(self, cx: int, cy: int) -> Tuple[float, float]:
-        x_n = float(np.clip(cx / max(1, self._playfield_w - 1), 0.0, 1.0))
-        y_n = float(np.clip(cy / max(1, self.H - 1), 0.0, 1.0))
-        return x_n, y_n
-
     # -------------------------
     # bullets / risk
     # -------------------------
@@ -279,7 +335,9 @@ class ObsBuilder:
         hsv = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2HSV)
         s = hsv[:, :, 1]
         v = hsv[:, :, 2]
-        mask = (s >= int(self.bullet_hsv_s_min)) & (v >= int(self.bullet_hsv_v_min)) & (v <= int(self.bullet_hsv_v_max))
+        mask = (s >= int(self.bullet_hsv_s_min)) & (v >= int(self.bullet_hsv_v_min)) & (
+            v <= int(self.bullet_hsv_v_max)
+        )
         mask_u8 = (mask.astype(np.uint8) * 255)
 
         kernel = self._get_bullet_kernel()
@@ -300,7 +358,6 @@ class ObsBuilder:
             return self._zeros_small_u8
 
         hsv_mask = self._compute_bullet_mask_u8_small(bgr_small)
-
         if not self.use_motion_for_bullets:
             return hsv_mask
 
@@ -310,8 +367,10 @@ class ObsBuilder:
 
         comb = cv2.bitwise_or(hsv_mask, motion)
         fill = float(np.mean(comb > 0))
+
+        # 포화 방지: motion이 화면을 덮으면 HSV로 fallback
         if fill >= float(self.max_bullet_fill_ratio):
-            comb = motion
+            comb = hsv_mask
 
         kernel = self._get_bullet_kernel()
         if kernel is not None:
@@ -344,9 +403,11 @@ class ObsBuilder:
         tau = max(1e-6, float(self.risk_tau_px))
         risk = np.exp(-dist / tau).astype(np.float32)
 
-        m = float(risk.max())
-        if m > 1e-6:
-            risk *= (1.0 / m)
+        # per-frame max normalize는 포화(=항상 1.00)를 쉽게 만든다.
+        if self.risk_use_max_normalize:
+            m = float(risk.max())
+            if m > 1e-6:
+                risk *= (1.0 / m)
 
         if self.risk_clip_max is not None:
             risk = np.clip(risk, 0.0, float(self.risk_clip_max), out=risk)
@@ -354,14 +415,12 @@ class ObsBuilder:
         return risk
 
     def _compute_local_risk_stats(self, risk_01: np.ndarray) -> None:
-        """
-        레이무 중심(u,v) 주변 ROI에서 local risk 통계를 계산해 속성에 저장.
-        - conf 낮으면 invalid 처리(엉뚱한 ROI로 shaping되는 걸 방지)
-        """
         self.risk_local_valid = False
         self.risk_local_mean = 0.0
         self.risk_local_p90 = 0.0
         self.risk_local_p99 = 0.0
+        self.risk_local_bg_frac = 0.0
+        self.risk_local_max = 0.0
 
         if not self.local_risk_enable:
             return
@@ -393,23 +452,35 @@ class ObsBuilder:
         if roi.size == 0:
             return
 
-        rr = roi.astype(np.float32, copy=False).reshape(-1)
-        # quantile은 numpy 버전에 따라 quantile/percentile 둘 다 가능하지만,
-        # 여기선 quantile 사용(이미 너 코드에 있음)
+        rr_all = roi.astype(np.float32, copy=False).reshape(-1)
+        self.risk_local_max = float(np.max(rr_all))
+
+        if self.local_risk_exclude_saturated:
+            sat_thr = float(self.local_risk_sat_thr)
+            bg = rr_all[rr_all < sat_thr]
+        else:
+            bg = rr_all
+
+        if bg.size == 0:
+            return
+
+        self.risk_local_bg_frac = float(bg.size / rr_all.size)
+        if self.risk_local_bg_frac < float(self.local_risk_min_valid_bg_frac):
+            return
+
         try:
-            self.risk_local_mean = float(np.mean(rr))
-            self.risk_local_p90 = float(np.quantile(rr, 0.90))
-            self.risk_local_p99 = float(np.quantile(rr, 0.99))
+            self.risk_local_mean = float(np.mean(bg))
+            self.risk_local_p90 = float(np.quantile(bg, 0.90))
+            self.risk_local_p99 = float(np.quantile(bg, 0.99))
             self.risk_local_valid = True
         except Exception:
-            # 실패하면 invalid 유지
             self.risk_local_valid = False
 
     # -------------------------
     # main
     # -------------------------
     def make_state(self, img_bgr: np.ndarray) -> np.ndarray:
-        # 1) tracker step (전체 화면 기준)
+        # 1) tracker step (full-frame)
         now = time.time()
         if self._track_pause_active and now < float(self._track_pause_until):
             bbox, conf = None, 0.0
@@ -431,15 +502,20 @@ class ObsBuilder:
             cy = int(round(y + 0.5 * h))
             self.player_center = (cx, cy)
             self.last_conf = float(np.clip(conf, 0.0, 1.0))
+
+            # ✅ playfield 기준으로 정규화
             self.last_xy_norm = self._full_xy_to_playfield_norm(cx, cy)
+
+            # ✅ marker uv도 playfield 기준으로 변환
             self._update_player_uv_small_from_full()
         else:
-            # bbox가 None이면 conf는 0에 가깝게 유지하는게 안전
             self.last_conf = float(np.clip(conf, 0.0, 1.0))
+            # last_xy_norm / player_center는 마지막 유효값 유지
 
-        # 2) full -> small resize (obs_out_size)
-        interp = cv2.INTER_AREA if max(self.H, self.W) >= self.obs_out_size else cv2.INTER_LINEAR
-        bgr_small = cv2.resize(img_bgr, (self.obs_out_size, self.obs_out_size), interpolation=interp)
+        # 2) UI 제외 playfield crop -> small resize
+        pf = self._crop_playfield(img_bgr)
+        interp = cv2.INTER_AREA if max(pf.shape[0], pf.shape[1]) >= self.obs_out_size else cv2.INTER_LINEAR
+        bgr_small = cv2.resize(pf, (self.obs_out_size, self.obs_out_size), interpolation=interp)
 
         gray_small_u8 = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2GRAY)
 
@@ -453,7 +529,7 @@ class ObsBuilder:
 
         self._prev_gray_small_u8 = gray_small_u8.copy()
 
-        # 4) bullet + risk
+        # 4) bullet + risk (playfield 기준)
         if self.enable_bullet_channels:
             bullet_mask_u8 = self._compute_bullet_mask_u8_small_robust(bgr_small, diff_small_u8)
             risk_01 = self._compute_risk_heat_small(bullet_mask_u8)
@@ -461,17 +537,14 @@ class ObsBuilder:
             bullet_mask_u8 = self._zeros_small_u8
             risk_01 = self._zeros_small_f32
 
-        # 외부가 참조할 수 있게 속성으로 노출
         self.bullet_candidate_mask = (bullet_mask_u8 > 0).astype(np.uint8)  # 0/1
         self.risk_heatmap = risk_01.astype(np.float32)
 
-        # ✅ local risk stats 계산
+        # 5) local risk stats
         self._compute_local_risk_stats(self.risk_heatmap)
 
-        # 5) float32 채널 구성
+        # 6) obs assemble
         self._obs_buf[0, :, :] = gray_small_u8.astype(np.float32) * (1.0 / 255.0)
-
-        # ✅ 플레이어 마커는 ch0에만
         self._stamp_player_marker_ch0(self._obs_buf[0])
 
         if diff_small_u8 is self._zeros_small_u8:
@@ -489,35 +562,49 @@ class ObsBuilder:
         else:
             self._obs_buf[3, :, :] = risk_01
 
-        # 6) meta pixels (ch0만)
         self._inject_meta_pixels_ch0_only(self._obs_buf[0])
 
         obs4 = self._obs_buf
 
-        # ---- debug windows ----
+        # ---- debug windows (playfield만 시각화) ----
         if self.show_obs_debug:
             try:
                 self._ensure_obs_window()
+
                 ch = int(np.clip(self.obs_debug_channel, 0, 3))
                 vis = (np.clip(obs4[ch], 0.0, 1.0) * 255.0).astype(np.uint8)
                 vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
 
-                u, v = self._last_player_uv_small
-                if self.risk_local_valid:
-                    extra = f" Lp90={self.risk_local_p90:.2f} Lp99={self.risk_local_p99:.2f}"
-                else:
-                    extra = " L=NA"
+                up = int(max(1, self.debug_upscale))
+                if up != 1:
+                    vis = cv2.resize(vis, (vis.shape[1] * up, vis.shape[0] * up), interpolation=cv2.INTER_NEAREST)
 
-                cv2.putText(
-                    vis,
-                    f"ch{ch} conf={self.last_conf:.2f} uv=({u},{v}) inv={int(self._last_inverted)}{extra}",
-                    (5, 14),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    (255, 255, 255),
-                    1,
-                    cv2.LINE_AA,
-                )
+                px, py = self.player_center
+                xn, yn = self.last_xy_norm
+
+                line1 = f"ch{ch} conf={self.last_conf:.2f} px=({int(px)},{int(py)}) n=({xn:.3f},{yn:.3f})"
+                if self.risk_local_valid:
+                    line2 = f"Lp90={self.risk_local_p90:.2f} Lp99={self.risk_local_p99:.2f} bg={self.risk_local_bg_frac:.2f}"
+                else:
+                    line2 = f"L=NA bg={self.risk_local_bg_frac:.2f}"
+
+                font_scale = float(self.debug_font_scale)
+                thickness = int(self.debug_thickness)
+
+                def put_text_outline(img, text, org):
+                    cv2.putText(
+                        img, text, org, cv2.FONT_HERSHEY_SIMPLEX,
+                        font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA
+                    )
+                    cv2.putText(
+                        img, text, org, cv2.FONT_HERSHEY_SIMPLEX,
+                        font_scale, (255, 255, 255), thickness, cv2.LINE_AA
+                    )
+
+                y0 = 24
+                put_text_outline(vis, line1, (10, y0))
+                put_text_outline(vis, line2, (10, y0 + 28))
+
                 cv2.imshow(self.win_crop, vis)
             except Exception:
                 pass

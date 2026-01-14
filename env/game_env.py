@@ -35,15 +35,13 @@ class GameEnv:
 
         # reward engine
         r_cfg = RewardConfig(
-            # base
             alive_reward=0.03,
 
-            # terminal-ish penalties
             hit_pen=-1.5,
             death_pen=-1.5,
             abort_pen=-1.5,
 
-            # ✅ tracker ON 상태이므로 position shaping 사용
+            # tracker ON
             use_position_shaping=True,
 
             y_floor=0.60,
@@ -56,7 +54,6 @@ class GameEnv:
             right_pen_k=0.005,
             corner_bonus_pen=0.008,
 
-            # death fx reset
             death_fx_reset_cooldown=0.25,
         )
         self.reward_engine = RewardEngine(self.s, r_cfg)
@@ -67,13 +64,13 @@ class GameEnv:
             use_flip=True,
             top_limit_px=None,
             top_limit_fudge_px=10,
-            disable_bomb=True,          # ✅ 학습 중 폭탄 완전 금지
+            disable_bomb=True,
             enable_bomb_gate=True,
         )
         self.masker = ActionMasker(self.screen, self.obs, m_cfg)
         self.act = ActionExecutor(self.s, self.masker)
 
-        # frame skipper (dup skip + profiling)
+        # frame skipper
         fs_cfg = FrameSkipperConfig(
             skip_dup_frames=True,
             dup_retry=2,
@@ -84,7 +81,7 @@ class GameEnv:
         )
         self.fs = FrameSkipper(self.screen, fs_cfg)
 
-        # obs packer (CHW + frame_stack concat + ep reward sum)
+        # obs packer
         self.packer = ObsPacker(self.s, ObsPackConfig())
 
         # timing
@@ -95,7 +92,7 @@ class GameEnv:
         self.dup_reward_zero = False
 
         # =========================
-        # ✅ 죽음 구간 스킵 설정
+        # 죽음 구간 스킵
         # =========================
         self.skip_death_segment = True
         self.death_skip_min_sec = 0.30
@@ -105,6 +102,16 @@ class GameEnv:
 
         # runner가 마스크 계산에 쓸 최근 프레임
         self.s.last_action_mask_img = None
+
+        # =========================
+        # ✅ local risk shaping 설정 (초미세 회피용)
+        # =========================
+        self.use_local_risk = True
+        # local p90/p99 혼합 (추천: 0.7/0.3)
+        self.local_risk_mix_p90 = 0.7
+        self.local_risk_mix_p99 = 0.3
+        # local이 없으면 global p90 fallback
+        self.global_risk_quantile = 0.90
 
     def close(self):
         try:
@@ -118,11 +125,9 @@ class GameEnv:
 
     def _end_episode(self, pen: float, reason: str):
         """
-        ✅ 역할 단순화:
         - terminated 플래그 + 종료 이유/패널티 기록
         - ep reward 누적
         - pack 반환
-        frame_stack 조작은 step()에서만 한다.
         """
         self.guard.set_terminated()
         self.s.episode_end_reason = str(reason)
@@ -134,7 +139,7 @@ class GameEnv:
         release_all()
         time.sleep(0.5)
 
-        # state defaults (필요한 것만)
+        # state defaults
         self.s.lives = 3
         self.s.prev_ui_lives = None
         self.s.last_hit_time = 0.0
@@ -149,7 +154,7 @@ class GameEnv:
         self.s.episode_end_pen = 0.0
         self.s.ep_total_reward = 0.0
 
-        # 폭탄 금지 타이머
+        # bomb timers
         now = time.time()
         self.s.episode_start_time = float(now)
         self.s.bomb_forbid_until = float(now + 5.0)
@@ -178,9 +183,6 @@ class GameEnv:
         set_always_slow(True)
         return self.packer.pack_frames_concat()
 
-    # =========================
-    # ✅ 죽음 구간 스킵: 내부 프레임 소비
-    # =========================
     def _consume_death_segment(self):
         t0 = time.time()
         clear_streak = 0
@@ -237,6 +239,41 @@ class GameEnv:
 
         return last_img, last_g, last_ui_ok
 
+    # =========================
+    # ✅ risk scalar 뽑기 (local 우선 + fallback)
+    # =========================
+    def _get_risk_scalar(self) -> float:
+        """
+        reward_engine.risk_penalty()에 넣을 scalar risk 값을 만든다.
+        우선순위:
+          1) local valid면: mix = a*p90 + b*p99
+          2) 아니면: global p90 (risk_heatmap 전체)
+          3) 실패하면: 0
+        """
+        try:
+            if self.use_local_risk and bool(getattr(self.obs, "risk_local_valid", False)):
+                p90 = float(getattr(self.obs, "risk_local_p90", 0.0))
+                p99 = float(getattr(self.obs, "risk_local_p99", 0.0))
+                a = float(self.local_risk_mix_p90)
+                b = float(self.local_risk_mix_p99)
+                # 혹시 합이 1이 아니어도 안전하게
+                s = a + b
+                if s > 1e-9:
+                    a /= s
+                    b /= s
+                return a * p90 + b * p99
+
+            risk = getattr(self.obs, "risk_heatmap", None)
+            if risk is None:
+                return 0.0
+
+            r = risk.astype(np.float32, copy=False)
+            q = float(self.global_risk_quantile)
+            q = float(np.clip(q, 0.0, 1.0))
+            return float(np.quantile(r, q))
+        except Exception:
+            return 0.0
+
     def step(self, action_idx: int):
         # already terminated
         if self.s.episode_terminated:
@@ -263,8 +300,7 @@ class GameEnv:
             ui_ok = self.screen.ui_panel_present(pre_img, gray=pre_g)
             self.ui.update_ui_absent(ui_ok)
             if self.s.ui_absent_count >= self.s.ui_absent_needed:
-                # ✅ 종료 시에도 마지막 관측을 스택에 남기는 게 안정적
-                # (여기서는 pre_img로 1번 obs 만들어 넣는다)
+                # 마지막 관측 남기기
                 try:
                     st = self.obs.make_state(pre_img)
                     self.packer.push_prev_state(self.packer.as_chw(st))
@@ -310,11 +346,10 @@ class GameEnv:
                     release_all()
                     time.sleep(0.02)
 
-                # ✅ abort도 "현재 프레임"을 마지막으로 남기고 끝내기
+                # abort도 마지막 관측 남기기
                 try:
                     st = self.obs.make_state(img)
-                    state_chw_abort = self.packer.as_chw(st)
-                    self.packer.push_prev_state(state_chw_abort)
+                    self.packer.push_prev_state(self.packer.as_chw(st))
                 except Exception:
                     pass
 
@@ -329,17 +364,11 @@ class GameEnv:
             # base reward
             reward = float(self.reward_engine.alive_reward)
 
-            # risk shaping (local p90 우선)
-            risk = getattr(self.obs, "risk_heatmap", None)
-            if risk is not None:
+            # ✅ risk shaping: local mix 우선
+            risk_v = self._get_risk_scalar()
+            if risk_v > 0.0:
                 try:
-                    local_valid = bool(getattr(self.obs, "risk_local_valid", False))
-                    if local_valid:
-                        risk_v = float(getattr(self.obs, "risk_local_p90", 0.0))
-                    else:
-                        r = risk.astype(np.float32, copy=False)
-                        risk_v = float(np.quantile(r, 0.90))
-                    reward += float(self.reward_engine.risk_penalty(risk_v))
+                    reward += float(self.reward_engine.risk_penalty(float(risk_v)))
                 except Exception:
                     pass
 
@@ -347,19 +376,22 @@ class GameEnv:
             x_n, y_n = getattr(self.obs, "last_xy_norm", (None, None))
             if x_n is not None and y_n is not None:
                 conf = float(getattr(self.obs, "last_conf", 0.0))
-                reward += float(self.reward_engine.position_penalties(float(x_n), float(y_n), conf))
+                try:
+                    reward += float(self.reward_engine.position_penalties(float(x_n), float(y_n), conf))
+                except Exception:
+                    pass
 
             # remask / key update
             r1 = self.act.remask_if_needed(masked_idx, img)
             masked_idx = int(r1.masked_idx)
 
-            # death FX (✅ 호출 직전에 now를 새로 잡기)
+            # death FX
             _, gameover_fx = self.screen.detect_death(img, gray=g)
             now_fx = time.time()
             term, reason, pen = self.reward_engine.on_death_fx(gameover_fx, now_fx, reset_tracker_cb=reset_tracker)
 
             if term:
-                # ✅ 종료 시 현재 관측을 마지막 프레임으로 확실히 넣고 끝내기
+                # 종료 시 현재 관측을 마지막 프레임으로 넣고 끝내기
                 self.packer.push_prev_state(state_chw)
 
                 for _ in range(3):
@@ -388,6 +420,7 @@ class GameEnv:
                 state2 = self.obs.make_state(last_img)
                 state2_chw = self.packer.as_chw(state2)
 
+                # 스킵 이후 UI lives 반영
                 try:
                     ui_now = self.ui.ui_lives_safe(last_img, last_ui_ok)
                     now_ui = time.time()
@@ -404,7 +437,7 @@ class GameEnv:
                 self.s.step_i += 1
                 return self.packer.pack_frames_concat(), float(total_reward), False
 
-            # UI lives (✅ 호출 직전에 now를 새로 잡기)
+            # UI lives
             ui_now = self.ui.ui_lives_safe(img, ui_ok)
             now_ui = time.time()
             ro = self.reward_engine.on_ui_lives(ui_now, now_ui, reset_tracker_cb=reset_tracker)
