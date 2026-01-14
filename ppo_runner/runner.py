@@ -12,8 +12,6 @@ import platform
 import torch
 import subprocess
 
-
-
 from env.game_env import GameEnv
 from env.controller import release_all, set_attack_hold, cleanup_inputs_on_exit
 from env.menu import boot_into_practice
@@ -42,6 +40,7 @@ def safe_release_inputs():
     except Exception:
         pass
 
+
 def _print_hw_info():
     # OS / CPU
     try:
@@ -69,17 +68,15 @@ def _print_hw_info():
                 cap = torch.cuda.get_device_capability(i)
                 props = torch.cuda.get_device_properties(i)
                 total_gb = props.total_memory / (1024**3)
-                print(
-                    f"[HW] GPU[{i}] {name} | cc={cap[0]}.{cap[1]} | VRAM={total_gb:.2f} GB"
-                )
+                print(f"[HW] GPU[{i}] {name} | cc={cap[0]}.{cap[1]} | VRAM={total_gb:.2f} GB")
         except Exception as e:
             print(f"[HW][WARN] GPU info failed: {e}")
+
 
 def _torch_mem_str(device: str = "cuda") -> str:
     if (not torch.cuda.is_available()) or (device != "cuda"):
         return "CUDA: N/A"
     try:
-        # bytes -> MiB
         alloc = torch.cuda.memory_allocated() / (1024**2)
         reserv = torch.cuda.memory_reserved() / (1024**2)
         max_alloc = torch.cuda.max_memory_allocated() / (1024**2)
@@ -107,16 +104,10 @@ def _nvidia_smi_query() -> str | None:
         if not out:
             return None
 
-        # If multiple GPUs, take GPU0 line (or join them)
         lines = [x.strip() for x in out.splitlines() if x.strip()]
-        # Format per line: "18, 12, 1234, 8192, 55"
         parts = [p.strip() for p in lines[0].split(",")]
         if len(parts) >= 5:
-            util_gpu = parts[0]
-            util_mem = parts[1]
-            mem_used = parts[2]
-            mem_total = parts[3]
-            temp = parts[4]
+            util_gpu, util_mem, mem_used, mem_total, temp = parts[:5]
             return f"nvidia-smi util={util_gpu}% memUtil={util_mem}% mem={mem_used}/{mem_total}MiB temp={temp}C"
         return f"nvidia-smi raw={lines[0]}"
     except Exception:
@@ -124,14 +115,12 @@ def _nvidia_smi_query() -> str | None:
 
 
 def _print_runtime_gpu_stats(agent, prefix: str = "[GPU]"):
-    # 1) torch VRAM
     dev = getattr(agent, "device", "cpu")
     if isinstance(dev, str) and dev.startswith("cuda") and torch.cuda.is_available():
         print(f"{prefix} {_torch_mem_str('cuda')}")
     else:
         print(f"{prefix} CUDA: OFF (agent.device={dev})")
 
-    # 2) nvidia-smi util
     smi = _nvidia_smi_query()
     if smi is not None:
         print(f"{prefix} {smi}")
@@ -195,7 +184,6 @@ def _load_agent_and_env(ckpt_path: str, no_render: bool):
         f"ent_coef={agent.ent_coef:.3f}, ent_min={agent.ent_min:.3f}, "
         f"clip_eps={agent.clip_eps:.2f}, rollout_steps={agent.rollout_steps}, update_epochs={agent.update_epochs}"
     )
-    # ✅ 에이전트 디바이스(실제 학습 device)도 출력
     try:
         print(f"[HW] Agent device={agent.device} | AMP={getattr(agent, 'use_amp', False)}")
     except Exception:
@@ -211,29 +199,28 @@ def _find_bomb_index() -> int | None:
     return None
 
 
-def _build_action_mask(env: GameEnv) -> np.ndarray:
+def _build_action_mask_from_img(env: GameEnv, img: np.ndarray | None) -> np.ndarray:
     """
-    1) env.masker가 있으면 화면 캡처 1회로 mask 계산
-    2) 안전장치: BOMB는 항상 금지(정책이 아예 뽑지 못하도록)
+    ✅ runner는 절대 캡처하지 않는다.
+    - img는 env가 이미 캡처한 프레임(env.s.last_action_mask_img)을 넘겨받는다.
+    - img가 None이면 "마스크를 안 건다(=all True)"로 안전 fallback.
     """
     mask = np.ones((len(ACTIONS),), dtype=np.bool_)
 
-    # (A) 가능하면 env.masker 기반 마스크를 AND로 적용
     try:
-        img = env.screen.capture()
-        if hasattr(env, "masker") and env.masker is not None:
+        if img is not None and hasattr(env, "masker") and env.masker is not None:
             m2 = env.masker.get_action_mask(img)
             if m2 is not None and len(m2) == len(mask):
                 mask &= m2.astype(np.bool_, copy=False)
     except Exception:
         pass
 
-    # (B) 최종적으로 BOMB는 무조건 금지
+    # BOMB는 무조건 금지
     bidx = _find_bomb_index()
     if bidx is not None:
         mask[int(bidx)] = False
 
-    # (C) 전부 False면 위험하니(샘플링 불가) 전부 True로 복구 후 BOMB만 금지
+    # 전부 False면 위험하니 복구
     if not bool(mask.any()):
         mask[:] = True
         if bidx is not None:
@@ -247,7 +234,7 @@ def run(
     no_render: bool = False,
     eval_mode: bool = False,
     ckpt_path: str = "checkpoints/lunatic_v1_ch4.pth",
-    # ✅ 모니터링 옵션
+    # 모니터링 옵션
     monitor_gpu: bool = False,
     monitor_every_steps: int = 200,
     monitor_every_sec: float = 0.0,
@@ -257,7 +244,6 @@ def run(
     pth_name = os.path.splitext(os.path.basename(ckpt_path))[0]
     log_path = os.path.join(os.path.dirname(ckpt_path), f"{pth_name}_episode_log.txt")
 
-    # stats 파일 헤더/블록 보장 + RUN 헤더 append
     stats = ensure_stats_header(log_path)
     run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     append_run_header(log_path, run_ts, int(episodes), bool(eval_mode), stats)
@@ -266,8 +252,7 @@ def run(
     env, agent = _load_agent_and_env(ckpt_path, no_render=no_render)
 
     if monitor_gpu:
-        # torch max 메모리 peak 측정용 reset (원하면)
-        if torch.cuda.is_available() and getattr(agent, "device", "").startswith("cuda"):
+        if torch.cuda.is_available() and str(getattr(agent, "device", "")).startswith("cuda"):
             try:
                 torch.cuda.reset_peak_memory_stats()
             except Exception:
@@ -288,23 +273,22 @@ def run(
 
             print(f"\n========== EPISODE {ep}/{episodes} ==========")
 
-            # ✅ 메뉴 들어가기 전에 무조건 입력/공격홀드 해제
             safe_release_inputs()
             time.sleep(0.05)
 
-            # 에피소드 시작 전(로비/스코어 등)에서만 메뉴 제어
             print("[MENU] [practice 준비/진입 중.]")
             ok = boot_into_practice(env.screen, max_sec_lobby=12.0)
             if not ok:
                 print("[EP_PREP][WARN] boot_into_practice failed (continue)")
             print("[MENU] [practice 준비/진입 완료]")
 
-            # 메뉴 끝난 직후에도 한 번 더(잔류 방지)
             safe_release_inputs()
             time.sleep(0.05)
 
             state = env.reset()
 
+            # ✅ reset 직후, env.fs.capture()로 잡힌 프레임이 env.s.last_action_mask_img에 들어있어야 함
+            # (GameEnv.reset()에서 이미 self.s.last_action_mask_img = img 했기 때문)
             if not no_render:
                 pump_cv_events_once()
 
@@ -318,8 +302,6 @@ def run(
             last_mon_t = time.time()
             last_mon_step = 0
 
-
-            # ✅ 인게임 루프: update 금지(렉 방지)
             while not done:
                 if esc_pressed():
                     stop_requested = True
@@ -329,13 +311,13 @@ def run(
                     done = True
                     break
 
-                # ✅ action mask 생성 + PPO 샘플링에 반영
-                action_mask = _build_action_mask(env)
-                action_idx, log_prob, value = agent.select_action(state, action_mask=action_mask)
+                # ✅ runner 캡처 0개: env가 마지막으로 캡처한 프레임을 사용
+                img_for_mask = getattr(env.s, "last_action_mask_img", None)
+                action_mask = _build_action_mask_from_img(env, img_for_mask)
 
+                action_idx, log_prob, value = agent.select_action(state, action_mask=action_mask)
                 next_state, reward, done = env.step(action_idx)
 
-                # ✅ 실제 실행된 액션 기준으로 통계/저장/slow 카운트
                 exec_idx = getattr(env.s, "exec_action_idx", action_idx)
                 exec_name = ACTIONS[int(exec_idx)].name
                 action_counter[exec_name] += 1
@@ -348,31 +330,24 @@ def run(
                 state = next_state
                 total_reward += float(reward)
                 steps += 1
-                # ---- optional GPU monitor ----
+
                 if monitor_gpu:
                     do_print = False
-
-                    # step-based
                     if monitor_every_steps and monitor_every_steps > 0:
                         if (steps - last_mon_step) >= int(monitor_every_steps):
                             do_print = True
                             last_mon_step = steps
-
-                    # time-based
                     if monitor_every_sec and monitor_every_sec > 0:
                         now_t = time.time()
                         if (now_t - last_mon_t) >= float(monitor_every_sec):
                             do_print = True
                             last_mon_t = now_t
-
                     if do_print:
                         _print_runtime_gpu_stats(agent, prefix=f"[GPU][ep{ep} step{steps}]")
-
 
                 if not no_render:
                     pump_cv_events_once()
 
-            # 에피소드 종료 후(로비/스코어) 무거운 작업
             survival_sec = time.time() - ep_t0
             slow_ratio = slow_count / max(1, steps)
             top_actions = action_counter.most_common(5)
@@ -391,7 +366,6 @@ def run(
                 f"top_actions={top_actions_str} {note}"
             )
 
-            # episode log append (원본 포맷 유지)
             ep_tag = f"({ep}/{episodes})"
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(f"{ep_tag}\t{total_reward:.6f}\t{survival_sec:.3f}\t{note}\n")
@@ -403,7 +377,6 @@ def run(
                 break
 
             if not eval_mode:
-                # ✅ update는 여기서만
                 updates = 0
                 while agent.should_update():
                     agent.update(last_state=state, last_done=True)
@@ -411,12 +384,10 @@ def run(
                 if updates:
                     print(f"[PPO] updates_after_episode={updates}")
 
-                # stats 갱신/기록
                 maybe_update_records(stats, total_reward, survival_sec, run_ts, ep_tag)
                 update_stats_in_file(log_path, stats)
                 print(stats_one_line(stats))
 
-                # ✅ 에피소드마다 저장
                 ok_save = _safe_save_checkpoint(agent, ckpt_path)
                 if ok_save:
                     print("[PPO] checkpoint saved")
