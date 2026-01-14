@@ -13,17 +13,15 @@ from env.reimu_tracker_debug_view import ReimuTrackerDebugView, DebugViewConfig
 class ObsBuilder:
     """
     4ch obs (float32):
-      ch0: gray(0..1) + player marker + meta(x,y,conf)
-      ch1: signed diff (gray_t - gray_{t-1}), global-shift removed (0..1)
-      ch2: motion_hazard (0..1)  # ✅ 잔상 없음: 현재 프레임 기반 hazard만
-           + (선택) 플레이어 근접 강조(지우지 않고 '조금 더 위험'으로)
-      ch3: risk_heat (0..1) from distanceTransform on hazard_bin
-           + (선택) hazard fill에 따라 tau 동적 조절
+      ch0: current gray (0..1) + player marker + meta(x,y,conf)
+      ch1: prev gray (0..1)                # 원본 그대로(이전 프레임)
+      ch2: absdiff(current, prev) (0..1)   # 원본 그대로(차이). threshold/morph/EMA/잔상 없음
+      ch3: player position hint (0..1)     # gaussian coord-map (플레이어 위치를 "채널"로 명확히)
 
-    핵심 변경(요청 반영):
-      - persistence(잔상) 완전 제거
-      - EMA도 기본 off 유지 (원하면 켤 수는 있음)
-      - ch2는 "현재 프레임의 움직임 위험"만 보여서 디버그 시각화도 깔끔
+    설계 의도:
+      - ch0: 공간정보(현재 화면)
+      - ch1/ch2: 시간정보(이전 프레임/움직임)
+      - ch3: "내 위치"를 항상 명확히(레이무를 장애물로 오해하는 혼란 감소)
     """
 
     def __init__(
@@ -65,92 +63,30 @@ class ObsBuilder:
         self.marker_use_conf = True
         self.marker_min_scale = 0.35
 
-        # prev
+        # ch3: player position hint (gaussian)
+        # - sigma가 작을수록 "점"에 가까움 (정확 좌표 강조)
+        # - sigma가 크면 완만한 언덕(학습은 편한데, 미세회피엔 과할 수 있음)
+        self.player_hint_enable = True
+        self.player_hint_sigma = 2.0     # s좌표 기준. 1.5~3.5 추천
+        self.player_hint_peak = 1.0      # 최대값(0..1)
+        self._grid_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None
+
+        # prev gray (s,s) uint8
         self._prev_gray: Optional[np.ndarray] = None
 
-        # gray invert (선택)
-        self.auto_invert_gray = True
-        self.invert_mean_thr = 0.58
-        self._last_inverted = False
-
-        # (옵션) ch0/ch1 안정화: CLAHE
-        self.gray_clahe_enable = False
-        self.gray_clahe_clip = 2.0
-        self.gray_clahe_tile = 8
-        self._clahe = None
-        self._clahe_key = None  # (clip,tile) 변경 감지
-
-        # hazard on/off
-        self.enable_hazard = True
-
-        # diff -> motion mask params (MAD threshold)
-        self.diff_min = 10
-        self.diff_k_mad = 3.0
-
-        # diff 포화(플래시/톤 변화) 대응
-        self.diff_saturation_ratio = 0.30
-        self.diff_saturation_boost = 2.0
-
-        # morph (기본 off: 뭉개짐 방지)
-        self.motion_open = 0
-        self.motion_close = 0
-        self._ker_open = None
-        self._ker_close = None
-        self._ker_open_k = -1
-        self._ker_close_k = -1
-
-        # ch1: signed diff 설정
-        self.signed_diff_enable = True
-        self.signed_diff_remove_global_shift = True  # d - median(d)
-        self.signed_diff_clip = 48.0                 # [-clip, +clip] 후 0..1 매핑
-
-        # ✅ 잔상/EMA 제거(기본)
-        self.hazard_ema_enable = False
-        self.hazard_ema_alpha = 0.65
-        self._hazard_ema: Optional[np.ndarray] = None
-
-        # 플레이어 근접 강조 (지우지 않고 "조금 더 위험"으로)
-        self.hazard_proximity_boost_enable = True
-        self.hazard_proximity_w = 0.35     # 0.0~0.8
-        self.hazard_proximity_tau = 10.0   # s좌표 기준 거리 감쇠(6~16)
-        self._grid_xy = None               # (xx,yy) 캐시
-
-        # hazard bin threshold (risk 입력용)
-        self.hazard_bin_thr_for_risk = 0.35
-
-        # risk map
-        self.risk_tau_px = 8.0
-        self.risk_clip_max = 1.0
-        self.risk_use_max_normalize = False
-
-        # tau 동적 조절(선택): hazard가 많을수록 tau 줄여 과포화 방지
-        self.risk_dynamic_tau_enable = True
-        self.risk_tau_min = 4.0
-        self.risk_tau_max = 10.0
-        self.risk_tau_fill_lo = 0.02
-        self.risk_tau_fill_hi = 0.20
-
-        # exported maps
-        self.hazard_bin = None          # (s,s) uint8 {0,1}
-        self.risk_heatmap = None        # (s,s) float32 0..1
-        self.hazard_global_fill = 0.0
-
-        # debug windows (최소)
+        # debug windows
         self.show_reimu_debug = False
-        self.reimu_dbg_view = ReimuTrackerDebugView(
-            self.tracker,
-            cfg=DebugViewConfig(window_name="debug_hell", enable_keys=False, wait_ms=1),
-        )
+        self.reimu_dbg_view: Optional[ReimuTrackerDebugView] = None  # lazy init
 
         self.show_obs_debug = True
         self.win_crop = "OBS_CROP"
         self._obs_win_inited = False
-        self.obs_debug_channel = 3
+        self.obs_debug_channel = 2
         self.debug_upscale = 4
         self.debug_font_scale = 0.70
         self.debug_thickness = 2
 
-        # debug cross (시각화 전용)
+        # debug cross
         self.debug_draw_cross = True
         self.debug_cross_half = 1
         self.debug_cross_thickness = 2
@@ -183,12 +119,6 @@ class ObsBuilder:
         self._uv = (self.s // 2, self.s // 2)
 
         self._prev_gray = None
-        self._hazard_ema = None
-        self._last_inverted = False
-
-        self.hazard_bin = None
-        self.risk_heatmap = None
-        self.hazard_global_fill = 0.0
 
         self._pause_until = 0.0
         self._pause_active = False
@@ -263,49 +193,6 @@ class ObsBuilder:
         ch0[v, x1:x2] = val
         ch0[y1:y2, u] = val
 
-    def _maybe_invert(self, gray_u8):
-        if not self.auto_invert_gray:
-            self._last_inverted = False
-            return gray_u8
-        inv = (float(gray_u8.mean(dtype=np.float32) / 255.0) >= float(self.invert_mean_thr))
-        self._last_inverted = bool(inv)
-        return (255 - gray_u8) if inv else gray_u8
-
-    def _maybe_clahe(self, gray_u8: np.ndarray) -> np.ndarray:
-        if not self.gray_clahe_enable:
-            return gray_u8
-        tile = int(max(2, self.gray_clahe_tile))
-        clip = float(max(0.5, self.gray_clahe_clip))
-        key = (clip, tile)
-        if self._clahe is None or self._clahe_key != key:
-            self._clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile))
-            self._clahe_key = key
-        return self._clahe.apply(gray_u8)
-
-    @staticmethod
-    def _mad_u8(x):
-        med = float(np.median(x))
-        mad = float(np.median(np.abs(x.astype(np.float32) - med)))
-        return med, mad
-
-    def _ker(self, kind: str, k: int):
-        k = int(k)
-        if k <= 0:
-            return None
-        if kind == "open":
-            if self._ker_open is not None and self._ker_open_k == k:
-                return self._ker_open
-            self._ker_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
-            self._ker_open_k = k
-            return self._ker_open
-        if kind == "close":
-            if self._ker_close is not None and self._ker_close_k == k:
-                return self._ker_close
-            self._ker_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
-            self._ker_close_k = k
-            return self._ker_close
-        return None
-
     def _get_grid(self):
         if self._grid_xy is not None:
             return self._grid_xy
@@ -315,83 +202,23 @@ class ObsBuilder:
         self._grid_xy = (xx, yy)
         return self._grid_xy
 
-    # -------------------------
-    # motion hazard
-    # -------------------------
-    def _motion_mask(self, diff_u8: np.ndarray) -> np.ndarray:
-        med, mad = self._mad_u8(diff_u8)
-        thr = max(float(self.diff_min), med + float(self.diff_k_mad) * mad)
-
-        base = (diff_u8.astype(np.float32) >= float(thr)).astype(np.uint8) * 255
-        fill = float(np.mean(base > 0)) if base.size else 0.0
-
-        # 포화(플래시/톤변화)면 threshold 강화
-        if fill >= float(self.diff_saturation_ratio):
-            thr2 = max(float(self.diff_min), med + float(self.diff_k_mad) * float(self.diff_saturation_boost) * mad)
-            base = (diff_u8.astype(np.float32) >= float(thr2)).astype(np.uint8) * 255
-
-        k = int(self.motion_open)
-        if k > 0:
-            base = cv2.morphologyEx(base, cv2.MORPH_OPEN, self._ker("open", k), iterations=1)
-        k2 = int(self.motion_close)
-        if k2 > 0:
-            base = cv2.morphologyEx(base, cv2.MORPH_CLOSE, self._ker("close", k2), iterations=1)
-
-        return base
-
-    def _signed_diff_map(self, gray_u8: np.ndarray, prev_u8: np.ndarray) -> np.ndarray:
-        if prev_u8 is None or prev_u8.shape != gray_u8.shape:
+    def _player_hint_map(self) -> np.ndarray:
+        if not self.player_hint_enable:
             return self._z_f32
 
-        d = gray_u8.astype(np.int16) - prev_u8.astype(np.int16)
+        sigma = float(max(1e-6, self.player_hint_sigma))
+        peak = float(np.clip(self.player_hint_peak, 0.0, 1.0))
 
-        if self.signed_diff_remove_global_shift:
-            d = d - int(np.median(d))
-
-        clip = float(max(1.0, self.signed_diff_clip))
-        d = np.clip(d.astype(np.float32), -clip, clip)
-        return (d + clip) * (0.5 / clip)
-
-    # -------------------------
-    # risk
-    # -------------------------
-    def _dynamic_tau(self, fill: float) -> float:
-        if not self.risk_dynamic_tau_enable:
-            return float(self.risk_tau_px)
-
-        lo = float(np.clip(self.risk_tau_fill_lo, 0.0, 1.0))
-        hi = float(np.clip(self.risk_tau_fill_hi, lo + 1e-6, 1.0))
-        tmin = float(max(1e-6, self.risk_tau_min))
-        tmax = float(max(tmin, self.risk_tau_max))
-
-        if fill <= lo:
-            return tmax
-        if fill >= hi:
-            return tmin
-
-        a = (fill - lo) / (hi - lo)
-        return (1.0 - a) * tmax + a * tmin
-
-    def _risk(self, hazard_u8_bin: np.ndarray, tau_override: Optional[float] = None) -> np.ndarray:
-        if hazard_u8_bin is None or hazard_u8_bin.size == 0 or int(np.count_nonzero(hazard_u8_bin)) == 0:
-            return self._z_f32
-
-        inv = cv2.bitwise_not(hazard_u8_bin)
-        dist = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
-
-        tau = float(self.risk_tau_px) if tau_override is None else float(tau_override)
-        tau = max(1e-6, tau)
-        risk = np.exp(-dist / tau).astype(np.float32)
-
-        if self.risk_use_max_normalize:
-            mx = float(risk.max())
-            if mx > 1e-6:
-                risk *= (1.0 / mx)
-
-        if self.risk_clip_max is not None:
-            np.clip(risk, 0.0, float(self.risk_clip_max), out=risk)
-
-        return risk
+        xx, yy = self._get_grid()
+        u, v = self._uv
+        du = xx - float(u)
+        dv = yy - float(v)
+        d2 = du * du + dv * dv
+        # gaussian: exp(-d^2 / (2*sigma^2))
+        hint = np.exp(-d2 / (2.0 * sigma * sigma)).astype(np.float32)
+        if peak != 1.0:
+            hint *= peak
+        return hint
 
     # -------------------------
     # debug
@@ -434,7 +261,6 @@ class ObsBuilder:
         cv2.line(vis_bgr, (x, y1), (x, y2), c_out, th_out, cv2.LINE_AA)
         cv2.line(vis_bgr, (x1, y), (x2, y), c_in, th_in, cv2.LINE_AA)
         cv2.line(vis_bgr, (x, y1), (x, y2), c_in, th_in, cv2.LINE_AA)
-
         cv2.circle(vis_bgr, (x, y), max(1, up), c_out, thickness=-1, lineType=cv2.LINE_AA)
         cv2.circle(vis_bgr, (x, y), max(1, up // 2), c_in, thickness=-1, lineType=cv2.LINE_AA)
 
@@ -466,74 +292,35 @@ class ObsBuilder:
         else:
             self.last_conf = float(np.clip(conf, 0.0, 1.0))
 
-        # 2) crop -> small
+        # 2) crop -> small (형태 변화의 유일한 원인: 리사이즈)
         pf = self._crop_pf(img_bgr)
         interp = cv2.INTER_AREA if max(pf.shape[:2]) >= self.s else cv2.INTER_LINEAR
         bgr = cv2.resize(pf, (self.s, self.s), interpolation=interp)
 
-        # 3) gray
-        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-        gray = self._maybe_invert(gray)
-        gray = self._maybe_clahe(gray)
+        # 3) gray (원본 그대로)
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)  # uint8
 
-        # 4) ch1 signed diff
-        ch1_map = self._signed_diff_map(gray, self._prev_gray) if self.signed_diff_enable else self._z_f32
-
-        # hazard용 absdiff
+        # 4) prev/diff (원본 그대로)
         if self._prev_gray is None or self._prev_gray.shape != gray.shape:
-            diff_u8 = self._z_u8
+            prev = self._z_u8
+            diff = self._z_u8
         else:
-            diff_u8 = cv2.absdiff(gray, self._prev_gray)
+            prev = self._prev_gray
+            diff = cv2.absdiff(gray, prev)
 
-        self._prev_gray = gray.copy()
-
-        # 5) hazard (현재 프레임만) + (선택)근접 강조 + risk
-        if self.enable_hazard:
-            hazard_u8 = self._motion_mask(diff_u8)  # 0/255
-            ch2_map = (hazard_u8 > 0).astype(np.float32)  # 0/1
-        else:
-            ch2_map = self._z_f32
-
-        # (선택) EMA - 잔상과 달리 "평균화"라 더 짧게 남지만, 기본 off
-        if self.hazard_ema_enable:
-            if self._hazard_ema is None or self._hazard_ema.shape != ch2_map.shape:
-                self._hazard_ema = ch2_map.copy()
-            else:
-                a = float(np.clip(self.hazard_ema_alpha, 0.0, 0.999))
-                self._hazard_ema = a * self._hazard_ema + (1.0 - a) * ch2_map
-            ch2_map = np.clip(self._hazard_ema, 0.0, 1.0)
-
-        # proximity boost (multiply, then clip)
-        if self.hazard_proximity_boost_enable and float(self.hazard_proximity_w) > 0.0:
-            xx, yy = self._get_grid()
-            u, v = self._uv
-            du = xx - float(u)
-            dv = yy - float(v)
-            dist = np.sqrt(du * du + dv * dv)
-            tau = float(max(1e-6, self.hazard_proximity_tau))
-            w = float(max(0.0, self.hazard_proximity_w))
-            boost = 1.0 + w * np.exp(-dist / tau)
-            ch2_map = np.clip(ch2_map * boost, 0.0, 1.0)
-
-        # hazard bin for risk
-        hazard_for_risk_u8 = (ch2_map >= float(self.hazard_bin_thr_for_risk)).astype(np.uint8) * 255
-        self.hazard_bin = (hazard_for_risk_u8 > 0).astype(np.uint8)
-        self.hazard_global_fill = float(np.mean(self.hazard_bin > 0)) if self.hazard_bin.size else 0.0
-
-        tau_eff = self._dynamic_tau(self.hazard_global_fill)
-        risk = self._risk(hazard_for_risk_u8, tau_override=tau_eff) if self.enable_hazard else self._z_f32
-        self.risk_heatmap = risk.astype(np.float32, copy=False)
+        # 5) ch3 player hint
+        hint = self._player_hint_map()
 
         # 6) assemble obs
         self._obs[0] = gray.astype(np.float32) * (1.0 / 255.0)
         self._stamp_marker(self._obs[0])
         self._inject_meta(self._obs[0])
 
-        self._obs[1] = ch1_map.astype(np.float32, copy=False)
-        self._obs[2] = ch2_map.astype(np.float32, copy=False)
-        self._obs[3] = self.risk_heatmap
+        self._obs[1] = prev.astype(np.float32) * (1.0 / 255.0)
+        self._obs[2] = diff.astype(np.float32) * (1.0 / 255.0)
+        self._obs[3] = hint
 
-        # debug (minimal)
+        # 7) debug
         if self.show_obs_debug:
             try:
                 self._ensure_obs_window()
@@ -550,7 +337,7 @@ class ObsBuilder:
                 u, v = self._uv
                 self._put_text(
                     vis,
-                    f"ch{ch} conf={self.last_conf:.2f} uv=({u},{v}) fill={self.hazard_global_fill:.3f} tau={tau_eff:.2f}",
+                    f"ch{ch} conf={self.last_conf:.2f} uv=({u},{v}) sigma={self.player_hint_sigma:.2f}",
                     x=10,
                     y=28,
                 )
@@ -558,10 +345,18 @@ class ObsBuilder:
             except Exception:
                 pass
 
-        if self.show_reimu_debug and self.reimu_dbg_view is not None:
+        # reimu debug (lazy init)
+        if self.show_reimu_debug:
+            if self.reimu_dbg_view is None:
+                self.reimu_dbg_view = ReimuTrackerDebugView(
+                    self.tracker,
+                    cfg=DebugViewConfig(window_name="debug_hell", enable_keys=False, wait_ms=1),
+                )
             try:
                 self.reimu_dbg_view.render(img_bgr)
             except Exception as e:
                 print("[reimu_dbg_view.render ERROR]", repr(e))
 
+        # 8) update prev
+        self._prev_gray = gray
         return self._obs.copy()
