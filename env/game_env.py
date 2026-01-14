@@ -32,7 +32,7 @@ class GameEnv:
             use_fallback_full_preprocess=True,
         )
 
-        # reward engine (여기 값만 조절)
+        # reward engine (트래커 OFF 실험용)
         r_cfg = RewardConfig(
             # base
             alive_reward=0.03,
@@ -42,25 +42,26 @@ class GameEnv:
             death_pen=-1.5,
             abort_pen=-1.5,
 
-            # position shaping
-            use_position_shaping=True,
+            # ✅ tracker OFF면 x/y를 못 믿으니 position shaping은 끈다
+            use_position_shaping=False,
 
-            # "위쪽을 싫어하게" 해서 기본적으로 아래쪽에 머물도록 유도
+            # (아래는 use_position_shaping=False면 실질적으로 사용되지 않지만,
+            #  나중에 tracker ON으로 되돌릴 때를 위해 값은 유지해둬도 됨)
             y_floor=0.60,
             y_zone_enter_pen=0.5,
             y_zone_stay_pen_k=0.05,
 
-            # soft edge penalties (너무 구석/상단으로 붙는 습관 방지)
             top_soft_y=0.20,
             right_soft_x=0.80,
-            top_pen_k=0.010,         # 0.020 -> 0.010 (누적 페널티 완화)
-            right_pen_k=0.005,       # 0.010 -> 0.005
-            corner_bonus_pen=0.008,  # 0.015 -> 0.008
+            top_pen_k=0.010,
+            right_pen_k=0.005,
+            corner_bonus_pen=0.008,
 
             # death fx reset
             death_fx_reset_cooldown=0.25,
         )
         self.reward_engine = RewardEngine(self.s, r_cfg)
+
 
         # masking + action executor
         m_cfg = MaskingConfig(
