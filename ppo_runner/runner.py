@@ -8,6 +8,11 @@ from collections import Counter
 
 import cv2
 import numpy as np
+import platform
+import torch
+import subprocess
+
+
 
 from env.game_env import GameEnv
 from env.controller import release_all, set_attack_hold, cleanup_inputs_on_exit
@@ -36,6 +41,102 @@ def safe_release_inputs():
         release_all()
     except Exception:
         pass
+
+def _print_hw_info():
+    # OS / CPU
+    try:
+        print(f"[HW] OS={platform.platform()}")
+        print(f"[HW] CPU={platform.processor() or 'UNKNOWN'} | cores(logical)={os.cpu_count()}")
+    except Exception as e:
+        print(f"[HW][WARN] CPU info failed: {e}")
+
+    # PyTorch / CUDA
+    try:
+        print(f"[HW] torch={torch.__version__}")
+        print(f"[HW] torch.cuda.is_available()={torch.cuda.is_available()}")
+        print(f"[HW] torch.version.cuda={torch.version.cuda}")
+        print(f"[HW] cuDNN={torch.backends.cudnn.version()}")
+    except Exception as e:
+        print(f"[HW][WARN] torch info failed: {e}")
+
+    # GPU
+    if torch.cuda.is_available():
+        try:
+            n = torch.cuda.device_count()
+            print(f"[HW] CUDA device_count={n}")
+            for i in range(n):
+                name = torch.cuda.get_device_name(i)
+                cap = torch.cuda.get_device_capability(i)
+                props = torch.cuda.get_device_properties(i)
+                total_gb = props.total_memory / (1024**3)
+                print(
+                    f"[HW] GPU[{i}] {name} | cc={cap[0]}.{cap[1]} | VRAM={total_gb:.2f} GB"
+                )
+        except Exception as e:
+            print(f"[HW][WARN] GPU info failed: {e}")
+
+def _torch_mem_str(device: str = "cuda") -> str:
+    if (not torch.cuda.is_available()) or (device != "cuda"):
+        return "CUDA: N/A"
+    try:
+        # bytes -> MiB
+        alloc = torch.cuda.memory_allocated() / (1024**2)
+        reserv = torch.cuda.memory_reserved() / (1024**2)
+        max_alloc = torch.cuda.max_memory_allocated() / (1024**2)
+        max_reserv = torch.cuda.max_memory_reserved() / (1024**2)
+        return (
+            f"VRAM alloc={alloc:.0f}MiB reserv={reserv:.0f}MiB "
+            f"(max alloc={max_alloc:.0f}MiB max reserv={max_reserv:.0f}MiB)"
+        )
+    except Exception as e:
+        return f"VRAM: ERROR({e})"
+
+
+def _nvidia_smi_query() -> str | None:
+    """
+    returns one-line summary or None if nvidia-smi not available.
+    Query: util.gpu, util.mem, mem.used, mem.total, temperature.
+    """
+    try:
+        cmd = [
+            "nvidia-smi",
+            "--query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu",
+            "--format=csv,noheader,nounits",
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
+        if not out:
+            return None
+
+        # If multiple GPUs, take GPU0 line (or join them)
+        lines = [x.strip() for x in out.splitlines() if x.strip()]
+        # Format per line: "18, 12, 1234, 8192, 55"
+        parts = [p.strip() for p in lines[0].split(",")]
+        if len(parts) >= 5:
+            util_gpu = parts[0]
+            util_mem = parts[1]
+            mem_used = parts[2]
+            mem_total = parts[3]
+            temp = parts[4]
+            return f"nvidia-smi util={util_gpu}% memUtil={util_mem}% mem={mem_used}/{mem_total}MiB temp={temp}C"
+        return f"nvidia-smi raw={lines[0]}"
+    except Exception:
+        return None
+
+
+def _print_runtime_gpu_stats(agent, prefix: str = "[GPU]"):
+    # 1) torch VRAM
+    dev = getattr(agent, "device", "cpu")
+    if isinstance(dev, str) and dev.startswith("cuda") and torch.cuda.is_available():
+        print(f"{prefix} {_torch_mem_str('cuda')}")
+    else:
+        print(f"{prefix} CUDA: OFF (agent.device={dev})")
+
+    # 2) nvidia-smi util
+    smi = _nvidia_smi_query()
+    if smi is not None:
+        print(f"{prefix} {smi}")
+    else:
+        print(f"{prefix} nvidia-smi: N/A (not found or failed)")
 
 
 def _try_clear_agent_rollout(agent):
@@ -94,6 +195,11 @@ def _load_agent_and_env(ckpt_path: str, no_render: bool):
         f"ent_coef={agent.ent_coef:.3f}, ent_min={agent.ent_min:.3f}, "
         f"clip_eps={agent.clip_eps:.2f}, rollout_steps={agent.rollout_steps}, update_epochs={agent.update_epochs}"
     )
+    # ✅ 에이전트 디바이스(실제 학습 device)도 출력
+    try:
+        print(f"[HW] Agent device={agent.device} | AMP={getattr(agent, 'use_amp', False)}")
+    except Exception:
+        pass
 
     return env, agent
 
@@ -141,6 +247,10 @@ def run(
     no_render: bool = False,
     eval_mode: bool = False,
     ckpt_path: str = "checkpoints/lunatic_v1_ch4.pth",
+    # ✅ 모니터링 옵션
+    monitor_gpu: bool = False,
+    monitor_every_steps: int = 200,
+    monitor_every_sec: float = 0.0,
 ):
     os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
 
@@ -154,6 +264,15 @@ def run(
     print(stats_one_line(stats))
 
     env, agent = _load_agent_and_env(ckpt_path, no_render=no_render)
+
+    if monitor_gpu:
+        # torch max 메모리 peak 측정용 reset (원하면)
+        if torch.cuda.is_available() and getattr(agent, "device", "").startswith("cuda"):
+            try:
+                torch.cuda.reset_peak_memory_stats()
+            except Exception:
+                pass
+        _print_runtime_gpu_stats(agent, prefix="[GPU][INIT]")
 
     print("\n[INFO] ESC 중단: Windows 전역 감지(GetAsyncKeyState)")
     time.sleep(0.2)
@@ -196,6 +315,9 @@ def run(
             slow_count = 0
             action_counter = Counter()
             aborted = False
+            last_mon_t = time.time()
+            last_mon_step = 0
+
 
             # ✅ 인게임 루프: update 금지(렉 방지)
             while not done:
@@ -226,6 +348,26 @@ def run(
                 state = next_state
                 total_reward += float(reward)
                 steps += 1
+                # ---- optional GPU monitor ----
+                if monitor_gpu:
+                    do_print = False
+
+                    # step-based
+                    if monitor_every_steps and monitor_every_steps > 0:
+                        if (steps - last_mon_step) >= int(monitor_every_steps):
+                            do_print = True
+                            last_mon_step = steps
+
+                    # time-based
+                    if monitor_every_sec and monitor_every_sec > 0:
+                        now_t = time.time()
+                        if (now_t - last_mon_t) >= float(monitor_every_sec):
+                            do_print = True
+                            last_mon_t = now_t
+
+                    if do_print:
+                        _print_runtime_gpu_stats(agent, prefix=f"[GPU][ep{ep} step{steps}]")
+
 
                 if not no_render:
                     pump_cv_events_once()

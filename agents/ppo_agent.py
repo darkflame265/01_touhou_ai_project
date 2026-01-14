@@ -12,10 +12,11 @@ class PPOAgent:
     """
     PPOAgent with action masking support.
 
-    Key additions vs your current version:
-    - select_action(state, action_mask): apply mask to logits so forbidden actions are never sampled.
-    - store(..., action_mask): store per-step mask in rollout buffer.
-    - update(...): apply the stored masks to logits during PPO loss computation (consistent training).
+    Improvements vs your current version:
+    - Value function clipping (PPO2-style) to stabilize value learning.
+    - Extra PPO diagnostics: approx_kl, clipfrac, explained_variance.
+    - Safer entropy schedule defaults (less "constant shaking" in late training).
+    - Minor perf: avoid re-allocating neg tensor every masking call.
     """
 
     def __init__(
@@ -28,14 +29,17 @@ class PPOAgent:
         gae_lambda=0.95,
         clip_eps=0.15,
         vf_coef=0.5,
-        ent_coef=0.04,
-        ent_min=0.005,
-        ent_decay=0.9995,
-        rollout_steps=128,
+        # ✅ entropy: safer defaults for your task
+        ent_coef=0.01,
+        ent_min=0.001,
+        ent_decay=0.999,
+        rollout_steps=256,
         update_epochs=5,
-        mini_batch_size=64,
+        mini_batch_size=128,
         max_grad_norm=0.5,
-        ent_warmup_updates=30,
+        ent_warmup_updates=15,
+        # ✅ value clipping
+        value_clip_eps=0.2,
         device=None,
         # ---- speed options ----
         use_amp=True,
@@ -71,7 +75,7 @@ class PPOAgent:
             except Exception as e:
                 print(f"[WARN] torch.compile failed, continue without it: {e}")
 
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=float(lr))
         self.scaler = torch.amp.GradScaler("cuda", enabled=self.use_amp)
 
         # PPO params
@@ -79,6 +83,9 @@ class PPOAgent:
         self.gae_lambda = float(gae_lambda)
         self.clip_eps = float(clip_eps)
         self.vf_coef = float(vf_coef)
+
+        # Value clipping
+        self.value_clip_eps = float(value_clip_eps)
 
         # Entropy schedule
         self.ent_coef = float(ent_coef)
@@ -94,6 +101,10 @@ class PPOAgent:
 
         self.global_step = 0
         self.update_step = 0
+
+        # cached "very negative" for masking
+        self._neg_large_fp16 = None
+        self._neg_large_fp32 = None
 
         # ---- prealloc buffers ----
         self._buf_inited = False
@@ -112,10 +123,8 @@ class PPOAgent:
         T = self.rollout_steps
         A = self.num_actions
 
-        # States: float32
         self.states = np.zeros((T,) + self._state_shape, dtype=np.float32)
 
-        # Scalars
         self.actions = np.zeros((T,), dtype=np.int64)
         self.rewards = np.zeros((T,), dtype=np.float32)
         self.dones = np.zeros((T,), dtype=np.float32)       # 1.0 if done else 0.0
@@ -127,8 +136,18 @@ class PPOAgent:
 
         self._buf_inited = True
 
-    @staticmethod
-    def _apply_action_mask_to_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    def _get_neg_large(self, dtype: torch.dtype) -> torch.Tensor:
+        # allocate once per dtype/device
+        if dtype in (torch.float16, torch.bfloat16):
+            if self._neg_large_fp16 is None or self._neg_large_fp16.dtype != dtype or self._neg_large_fp16.device != torch.device(self.device):
+                self._neg_large_fp16 = torch.tensor(-1e4, device=self.device, dtype=dtype)
+            return self._neg_large_fp16
+        else:
+            if self._neg_large_fp32 is None or self._neg_large_fp32.dtype != dtype or self._neg_large_fp32.device != torch.device(self.device):
+                self._neg_large_fp32 = torch.tensor(-1e9, device=self.device, dtype=dtype)
+            return self._neg_large_fp32
+
+    def _apply_action_mask_to_logits(self, logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
         """
         logits: (B, A)
         mask:  (B, A) bool, True=allowed
@@ -140,27 +159,19 @@ class PPOAgent:
 
         mask = mask.to(dtype=torch.bool)
 
-        # row safety: if any row has no allowed actions, skip masking for those rows
         row_any = mask.any(dim=-1, keepdim=True)  # (B,1)
         safe_mask = torch.where(row_any, mask, torch.ones_like(mask, dtype=torch.bool))
 
-        # ✅ dtype-safe very negative value
-        if logits.dtype in (torch.float16, torch.bfloat16):
-            neg = torch.tensor(-1e4, device=logits.device, dtype=logits.dtype)  # fp16-safe
-        else:
-            neg = torch.tensor(-1e9, device=logits.device, dtype=logits.dtype)
-
+        neg = self._get_neg_large(logits.dtype)
         return logits.masked_fill(~safe_mask, neg)
-
 
     @torch.no_grad()
     def select_action(self, state: np.ndarray, action_mask: np.ndarray | None = None):
         s = torch.from_numpy(state).to(self.device, dtype=torch.float32).unsqueeze(0)
-
         if s.is_cuda and s.dim() == 4 and self.channels_last:
             s = s.contiguous(memory_format=torch.channels_last)
 
-        logits, value = self.model(s)  # logits: (1, A)
+        logits, value = self.model(s)
 
         if action_mask is not None:
             m = torch.as_tensor(action_mask, device=self.device, dtype=torch.bool).view(1, -1)
@@ -177,10 +188,6 @@ class PPOAgent:
         )
 
     def store(self, state, action, reward, done, log_prob, value, action_mask=None):
-        """
-        action_mask: (A,) bool array where True=allowed.
-        If None, defaults to all-True (no masking).
-        """
         self._ensure_buffer(state)
 
         i = self._buf_ptr
@@ -198,11 +205,7 @@ class PPOAgent:
             self.action_masks[i] = True
         else:
             am = np.asarray(action_mask, dtype=np.bool_)
-            if am.shape[0] == self.num_actions:
-                self.action_masks[i] = am
-            else:
-                # shape mismatch -> fallback to no masking for this step
-                self.action_masks[i] = True
+            self.action_masks[i] = am if (am.shape[0] == self.num_actions) else True
 
         self._buf_ptr += 1
         self.global_step += 1
@@ -226,6 +229,16 @@ class PPOAgent:
         ret = adv + values_t
         adv = (adv - adv.mean()) / (adv.std(unbiased=False) + 1e-8)
         return ret, adv
+
+    @staticmethod
+    def _explained_variance(y_true: torch.Tensor, y_pred: torch.Tensor) -> float:
+        # 1 - Var[y_true - y_pred] / Var[y_true]
+        y_true = y_true.detach()
+        y_pred = y_pred.detach()
+        var_y = torch.var(y_true, unbiased=False)
+        if float(var_y.item()) < 1e-12:
+            return 0.0
+        return float((1.0 - torch.var(y_true - y_pred, unbiased=False) / var_y).clamp(-1.0, 1.0).item())
 
     def update(self, last_state=None, last_done=False):
         T = self._buf_ptr
@@ -253,13 +266,13 @@ class PPOAgent:
         masks_np = self.action_masks[:T]
 
         # ---- CPU tensors ----
-        states_cpu = torch.from_numpy(states_np)         # float32
-        actions_cpu = torch.from_numpy(actions_np)       # int64
-        rewards_cpu = torch.from_numpy(rewards_np)       # float32
-        dones_cpu = torch.from_numpy(dones_np)           # float32
-        old_logp_cpu = torch.from_numpy(old_logp_np)     # float32
-        values_cpu = torch.from_numpy(values_np)         # float32
-        masks_cpu = torch.from_numpy(masks_np.astype(np.bool_, copy=False))  # bool
+        states_cpu = torch.from_numpy(states_np)
+        actions_cpu = torch.from_numpy(actions_np)
+        rewards_cpu = torch.from_numpy(rewards_np)
+        dones_cpu = torch.from_numpy(dones_np)
+        old_logp_cpu = torch.from_numpy(old_logp_np)
+        values_cpu = torch.from_numpy(values_np)
+        masks_cpu = torch.from_numpy(masks_np.astype(np.bool_, copy=False))
 
         if self.pin_memory:
             states_cpu = states_cpu.pin_memory()
@@ -278,20 +291,23 @@ class PPOAgent:
         rewards = rewards_cpu.to(self.device, non_blocking=nb)
         dones = dones_cpu.to(self.device, non_blocking=nb)
         old_log_probs = old_logp_cpu.to(self.device, non_blocking=nb)
-        values = values_cpu.to(self.device, non_blocking=nb)
+        old_values = values_cpu.to(self.device, non_blocking=nb)
         masks = masks_cpu.to(self.device, non_blocking=nb)
 
         if states.is_cuda and states.dim() == 4 and self.channels_last:
             states = states.contiguous(memory_format=torch.channels_last)
 
         last_value_t = torch.tensor(last_value, device=self.device, dtype=torch.float32)
-        returns, advantages = self._compute_gae_torch(rewards, dones, values, last_value_t)
+        returns, advantages = self._compute_gae_torch(rewards, dones, old_values, last_value_t)
 
         n = states.size(0)
+
         total_loss = 0.0
         total_policy = 0.0
         total_value = 0.0
         total_entropy = 0.0
+        total_kl = 0.0
+        total_clipfrac = 0.0
         steps = 0
 
         for _ in range(self.update_epochs):
@@ -304,20 +320,35 @@ class PPOAgent:
                     logits, v = self.model(states[mb])
                     v = v.squeeze(-1)
 
-                    # ✅ apply per-step action masks
                     logits = self._apply_action_mask_to_logits(logits, masks[mb])
 
                     dist = Categorical(logits=logits)
                     new_log_probs = dist.log_prob(actions[mb])
                     entropy = dist.entropy().mean()
 
-                    ratio = torch.exp(new_log_probs - old_log_probs[mb])
+                    # ---- PPO policy loss ----
+                    log_ratio = new_log_probs - old_log_probs[mb]
+                    ratio = torch.exp(log_ratio)
+
                     surr1 = ratio * advantages[mb]
                     surr2 = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * advantages[mb]
                     policy_loss = -torch.min(surr1, surr2).mean()
 
-                    value_loss = F.mse_loss(v, returns[mb])
+                    # ---- value loss with clipping ----
+                    if self.value_clip_eps is not None and self.value_clip_eps > 0:
+                        v_old = old_values[mb]
+                        v_clipped = v_old + torch.clamp(v - v_old, -self.value_clip_eps, self.value_clip_eps)
+                        v_loss_1 = (v - returns[mb]).pow(2)
+                        v_loss_2 = (v_clipped - returns[mb]).pow(2)
+                        value_loss = 0.5 * torch.max(v_loss_1, v_loss_2).mean()
+                    else:
+                        value_loss = 0.5 * F.mse_loss(v, returns[mb])
+
                     loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
+
+                    # ---- diagnostics ----
+                    approx_kl = 0.5 * (log_ratio.pow(2)).mean()
+                    clipfrac = (torch.abs(ratio - 1.0) > self.clip_eps).float().mean()
 
                 self.optimizer.zero_grad(set_to_none=True)
 
@@ -336,11 +367,19 @@ class PPOAgent:
                 total_policy += float(policy_loss.item())
                 total_value += float(value_loss.item())
                 total_entropy += float(entropy.item())
+                total_kl += float(approx_kl.item())
+                total_clipfrac += float(clipfrac.item())
                 steps += 1
 
         self.update_step += 1
         if self.update_step > self.ent_warmup_updates:
             self.ent_coef = max(self.ent_min, self.ent_coef * self.ent_decay)
+
+        # explained variance (full batch)
+        with torch.no_grad():
+            # recompute v on full states for EV
+            logits_all, v_all = self.model(states)
+            ev = self._explained_variance(returns, v_all.squeeze(-1))
 
         self.reset_buffer()
 
@@ -353,6 +392,9 @@ class PPOAgent:
             "value_loss": total_value / steps,
             "entropy": total_entropy / steps,
             "entropy_coef": float(self.ent_coef),
+            "approx_kl": total_kl / steps,
+            "clipfrac": total_clipfrac / steps,
+            "explained_variance": float(ev),
             "rollout_steps": int(n),
             "update_step": int(self.update_step),
         }
