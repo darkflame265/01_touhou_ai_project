@@ -19,11 +19,14 @@ class ObsBuilder:
       ch2: bullet_candidate_mask (0..1)
       ch3: risk_heatmap (distanceTransform 기반, 0..1)
 
-    ✅ 요구사항:
-    - "UI 제외 crop"이 아니라 "게임 화면 전체(img_bgr)"를 그대로 obs_out_size로 리사이즈해 사용.
-    - 트래커는 full-frame 기준으로 step(img_bgr) 수행.
-    - 정책/리워드용 last_xy_norm은 playfield 기준 정규화(가로는 UI 패널 제외 폭 기준, 세로는 전체 높이 기준).
-    - ch0에만 십자 마커 + meta pixels(x/y/conf) 주입.
+    ✅ 현재 요구사항 + 초미세 회피용 추가:
+    - full-frame(img_bgr) -> obs_out_size 로 리사이즈 (UI crop 하지 않음)
+    - tracker: full-frame 기준 step(img_bgr)
+    - last_xy_norm: playfield 기준 정규화(가로는 UI 패널 제외 폭 기준, 세로는 전체 높이 기준)
+    - ch0에 십자 마커 + meta pixels(x/y/conf)
+    - ✅ 추가: 레이무 주변 ROI에서 risk local 요약값을 계산해 속성으로 노출
+        - risk_local_p90 / risk_local_p99 / risk_local_mean
+        - risk_local_valid (conf 기반)
     """
 
     def __init__(
@@ -36,18 +39,18 @@ class ObsBuilder:
         self.screen = screen
 
         self.obs_out_size = int(obs_out_size)
-        self.crop_size = int(crop_size)  # 호환용으로만 보관
+        self.crop_size = int(crop_size)  # 호환용
         self.obs_channels = 4
 
         img0 = self.screen.capture()
         h0, w0 = img0.shape[:2]
         self.H, self.W = int(h0), int(w0)
 
-        # playfield width 캐시 (기존 유지)
+        # playfield width 캐시 (UI 패널 제외 폭 기준)
         self._playfield_ratio = float(getattr(self.screen, "PLAYFIELD_RIGHT_RATIO", 0.70))
         self._playfield_w = max(1, min(self.W, int(self.W * self._playfield_ratio)))
 
-        # tracker (기존 인터페이스 유지)
+        # tracker
         self.tracker = ReimuTrackerCV()
 
         # 정책/리워드용 좌표/신뢰도 (playfield 기준 정규화)
@@ -63,9 +66,9 @@ class ObsBuilder:
         # prev gray (obs_out_size 기준으로 저장)
         self._prev_gray_small_u8: Optional[np.ndarray] = None
 
-        # ----- auto inversion / illumination robustness -----
+        # ----- auto inversion -----
         self.auto_invert_gray: bool = True
-        self.invert_mean_thr: float = 0.58  # 0..1, 이 이상이면 invert
+        self.invert_mean_thr: float = 0.58  # 0..1
         self._last_inverted: bool = False
 
         # ----- bullet/background separation -----
@@ -95,6 +98,18 @@ class ObsBuilder:
         self.marker_min_scale: float = 0.35
         self._last_player_uv_small: Tuple[int, int] = (self.obs_out_size // 2, self.obs_out_size // 2)
 
+        # ✅ local risk ROI 설정
+        self.local_risk_enable: bool = True
+        self.local_risk_radius: int = 12          # 8~16 추천 (obs_out_size=128 기준)
+        self.local_risk_quantile_p: float = 0.90  # 기본 p90
+        self.local_risk_conf_thr: float = 0.20    # conf 낮으면 local risk 무효
+
+        # ✅ local risk 결과(외부에서 읽게끔 속성으로 유지)
+        self.risk_local_valid: bool = False
+        self.risk_local_mean: float = 0.0
+        self.risk_local_p90: float = 0.0
+        self.risk_local_p99: float = 0.0
+
         # 레이무 디버그 창
         self.show_reimu_debug: bool = True
         dbg_cfg = DebugViewConfig(
@@ -108,8 +123,6 @@ class ObsBuilder:
         self.show_obs_debug: bool = True
         self.win_crop: str = "OBS_CROP"
         self._obs_win_inited: bool = False
-
-        # OBS 디버그에 무엇을 보여줄지 (0/1/2/3)
         self.obs_debug_channel: int = 0
 
         # tracker pause (bomb etc.)
@@ -145,6 +158,11 @@ class ObsBuilder:
         self._track_pause_resume_reset_pending = False
         self._last_player_uv_small = (self.obs_out_size // 2, self.obs_out_size // 2)
 
+        self.risk_local_valid = False
+        self.risk_local_mean = 0.0
+        self.risk_local_p90 = 0.0
+        self.risk_local_p99 = 0.0
+
     def on_player_death(self):
         try:
             self.tracker.reset()
@@ -179,9 +197,6 @@ class ObsBuilder:
     # meta pixels / marker
     # -------------------------
     def _inject_meta_pixels_ch0_only(self, ch0_01: np.ndarray) -> np.ndarray:
-        """
-        ch0 좌상단에 x/y/conf를 타일로 주입.
-        """
         try:
             x_n, y_n = self.last_xy_norm
             c = float(self.last_conf)
@@ -200,10 +215,6 @@ class ObsBuilder:
         return ch0_01
 
     def _update_player_uv_small_from_full(self) -> None:
-        """
-        전체화면 좌표 player_center(px,py)를
-        obs_out_size 해상도(u,v)로 직접 스케일해서 저장.
-        """
         try:
             px, py = map(int, self.player_center)
             u = int(round(px * (self.obs_out_size - 1) / max(1, (self.W - 1))))
@@ -215,10 +226,6 @@ class ObsBuilder:
             self._last_player_uv_small = (self.obs_out_size // 2, self.obs_out_size // 2)
 
     def _stamp_player_marker_ch0(self, ch0_01: np.ndarray) -> None:
-        """
-        ch0(0..1)에만 플레이어 마커(십자)를 찍는다.
-        위치는 self._last_player_uv_small(u,v)를 사용한다.
-        """
         if not self.mark_player_on_ch0:
             return
         if ch0_01 is None or ch0_01.size == 0:
@@ -250,10 +257,6 @@ class ObsBuilder:
         ch0_01[y1:y2, cx] = v
 
     def _full_xy_to_playfield_norm(self, cx: int, cy: int) -> Tuple[float, float]:
-        """
-        x는 playfield 폭(_playfield_w) 기준으로 0..1
-        y는 전체 높이(H) 기준으로 0..1
-        """
         x_n = float(np.clip(cx / max(1, self._playfield_w - 1), 0.0, 1.0))
         y_n = float(np.clip(cy / max(1, self.H - 1), 0.0, 1.0))
         return x_n, y_n
@@ -350,6 +353,58 @@ class ObsBuilder:
 
         return risk
 
+    def _compute_local_risk_stats(self, risk_01: np.ndarray) -> None:
+        """
+        레이무 중심(u,v) 주변 ROI에서 local risk 통계를 계산해 속성에 저장.
+        - conf 낮으면 invalid 처리(엉뚱한 ROI로 shaping되는 걸 방지)
+        """
+        self.risk_local_valid = False
+        self.risk_local_mean = 0.0
+        self.risk_local_p90 = 0.0
+        self.risk_local_p99 = 0.0
+
+        if not self.local_risk_enable:
+            return
+        if risk_01 is None or risk_01.size == 0:
+            return
+
+        conf = float(self.last_conf)
+        if conf < float(self.local_risk_conf_thr):
+            return
+
+        s = int(risk_01.shape[0])
+        if s <= 0:
+            return
+
+        u, v = self._last_player_uv_small
+        u = int(np.clip(u, 0, s - 1))
+        v = int(np.clip(v, 0, s - 1))
+
+        r = int(self.local_risk_radius)
+        if r <= 0:
+            return
+
+        y1 = max(0, v - r)
+        y2 = min(s, v + r + 1)
+        x1 = max(0, u - r)
+        x2 = min(s, u + r + 1)
+
+        roi = risk_01[y1:y2, x1:x2]
+        if roi.size == 0:
+            return
+
+        rr = roi.astype(np.float32, copy=False).reshape(-1)
+        # quantile은 numpy 버전에 따라 quantile/percentile 둘 다 가능하지만,
+        # 여기선 quantile 사용(이미 너 코드에 있음)
+        try:
+            self.risk_local_mean = float(np.mean(rr))
+            self.risk_local_p90 = float(np.quantile(rr, 0.90))
+            self.risk_local_p99 = float(np.quantile(rr, 0.99))
+            self.risk_local_valid = True
+        except Exception:
+            # 실패하면 invalid 유지
+            self.risk_local_valid = False
+
     # -------------------------
     # main
     # -------------------------
@@ -377,9 +432,10 @@ class ObsBuilder:
             self.player_center = (cx, cy)
             self.last_conf = float(np.clip(conf, 0.0, 1.0))
             self.last_xy_norm = self._full_xy_to_playfield_norm(cx, cy)
-
-            # ✅ full 좌표 -> small uv 갱신 (crop 좌표 불필요)
             self._update_player_uv_small_from_full()
+        else:
+            # bbox가 None이면 conf는 0에 가깝게 유지하는게 안전
+            self.last_conf = float(np.clip(conf, 0.0, 1.0))
 
         # 2) full -> small resize (obs_out_size)
         interp = cv2.INTER_AREA if max(self.H, self.W) >= self.obs_out_size else cv2.INTER_LINEAR
@@ -405,14 +461,17 @@ class ObsBuilder:
             bullet_mask_u8 = self._zeros_small_u8
             risk_01 = self._zeros_small_f32
 
-        # (추가) 외부가 참조할 수 있게 속성으로 노출
+        # 외부가 참조할 수 있게 속성으로 노출
         self.bullet_candidate_mask = (bullet_mask_u8 > 0).astype(np.uint8)  # 0/1
         self.risk_heatmap = risk_01.astype(np.float32)
 
-        # 5) float32 채널 구성 (0..1) - obs buffer 재사용
+        # ✅ local risk stats 계산
+        self._compute_local_risk_stats(self.risk_heatmap)
+
+        # 5) float32 채널 구성
         self._obs_buf[0, :, :] = gray_small_u8.astype(np.float32) * (1.0 / 255.0)
 
-        # ✅ 플레이어 마커는 ch0에만 (uv 기반)
+        # ✅ 플레이어 마커는 ch0에만
         self._stamp_player_marker_ch0(self._obs_buf[0])
 
         if diff_small_u8 is self._zeros_small_u8:
@@ -444,9 +503,14 @@ class ObsBuilder:
                 vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
 
                 u, v = self._last_player_uv_small
+                if self.risk_local_valid:
+                    extra = f" Lp90={self.risk_local_p90:.2f} Lp99={self.risk_local_p99:.2f}"
+                else:
+                    extra = " L=NA"
+
                 cv2.putText(
                     vis,
-                    f"ch{ch} conf={self.last_conf:.2f} uv=({u},{v}) inv={int(self._last_inverted)}",
+                    f"ch{ch} conf={self.last_conf:.2f} uv=({u},{v}) inv={int(self._last_inverted)}{extra}",
                     (5, 14),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.45,
