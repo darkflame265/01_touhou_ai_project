@@ -2,7 +2,6 @@
 import time
 import numpy as np
 
-
 from env.screen import Screen
 from env.controller import release_all, set_attack_hold, set_always_slow
 from env.episode_guard import EpisodeGuard
@@ -45,7 +44,7 @@ class GameEnv:
             abort_pen=-1.5,
 
             # ✅ tracker OFF면 x/y를 못 믿으니 position shaping은 끈다
-            use_position_shaping=False,
+            use_position_shaping=True,
 
             # (아래는 use_position_shaping=False면 실질적으로 사용되지 않지만,
             #  나중에 tracker ON으로 되돌릴 때를 위해 값은 유지해둬도 됨)
@@ -63,7 +62,6 @@ class GameEnv:
             death_fx_reset_cooldown=0.25,
         )
         self.reward_engine = RewardEngine(self.s, r_cfg)
-
 
         # masking + action executor
         m_cfg = MaskingConfig(
@@ -325,11 +323,13 @@ class GameEnv:
             now = time.time()
 
             # ✅ risk_heatmap shaping: 위험할수록 reward 조금 깎기
+            #    mean -> p90 (상위 10% 분위수)
             risk = getattr(self.obs, "risk_heatmap", None)
             if risk is not None:
                 try:
-                    risk_mean = float(np.mean(risk, dtype=np.float32))
-                    reward += float(self.reward_engine.risk_penalty(risk_mean))
+                    r = risk.astype(np.float32, copy=False)
+                    risk_p90 = float(np.quantile(r, 0.90))
+                    reward += float(self.reward_engine.risk_penalty(risk_p90))
                 except Exception:
                     pass
 

@@ -7,26 +7,30 @@ from typing import Optional, Tuple
 import cv2
 import numpy as np
 
+from env.reimu_tracker_cv import ReimuTrackerCV
+from env.reimu_tracker_debug_view import ReimuTrackerDebugView, DebugViewConfig
+
 
 class ObsBuilder:
     """
     4채널 관측 (float32):
-      ch0: gray (0..1)
+      ch0: gray (0..1) + player marker + meta pixels(xy/conf)
       ch1: absdiff(current_gray, prev_gray) (0..1)
       ch2: bullet_candidate_mask (0..1)
       ch3: risk_heatmap (distanceTransform 기반, 0..1)
 
-    ✅ TRACER/십자가/메타 완전 OFF 모드 + UI 제외(playfield crop):
-    - 트래커 미사용
-    - 관측은 "플레이필드 영역만" 잘라서 obs_out_size 정사각으로 리사이즈
-    - last_xy_norm/last_conf/player_center는 외부 호환용 고정값 유지
+    ✅ 요구사항:
+    - "UI 제외 crop"이 아니라 "게임 화면 전체(img_bgr)"를 그대로 obs_out_size로 리사이즈해 사용.
+    - 트래커는 full-frame 기준으로 step(img_bgr) 수행.
+    - 정책/리워드용 last_xy_norm은 playfield 기준 정규화(가로는 UI 패널 제외 폭 기준, 세로는 전체 높이 기준).
+    - ch0에만 십자 마커 + meta pixels(x/y/conf) 주입.
     """
 
     def __init__(
         self,
         screen,
         obs_out_size: int = 128,
-        crop_size: int = 256,  # (호환용) 더 이상 사용하지 않음
+        crop_size: int = 256,  # (호환용) 더 이상 crop에 쓰지 않음
         use_fallback_full_preprocess: bool = True,  # (호환용) 현재 미사용
     ):
         self.screen = screen
@@ -39,21 +43,22 @@ class ObsBuilder:
         h0, w0 = img0.shape[:2]
         self.H, self.W = int(h0), int(w0)
 
-        # playfield crop params (Screen 값을 그대로 사용)
-        self._playfield_ratio = float(getattr(self.screen, "PLAYFIELD_RIGHT_RATIO", 0.67))
-        self._pf_left_crop = float(getattr(self.screen, "PLAYFIELD_LEFT_CROP", 0.00))
-        self._pf_right_crop = float(getattr(self.screen, "PLAYFIELD_RIGHT_CROP", 1.00))
-        self._pf_top_crop = float(getattr(self.screen, "PLAYFIELD_TOP_CROP", 0.00))
-        self._pf_bottom_crop = float(getattr(self.screen, "PLAYFIELD_BOTTOM_CROP", 1.00))
-
-        # playfield width 캐시 (기존 유지: RewardEngine/기타 코드 호환)
+        # playfield width 캐시 (기존 유지)
+        self._playfield_ratio = float(getattr(self.screen, "PLAYFIELD_RIGHT_RATIO", 0.70))
         self._playfield_w = max(1, min(self.W, int(self.W * self._playfield_ratio)))
 
-        # ===== 외부 호환용 상태 (고정값 유지) =====
+        # tracker (기존 인터페이스 유지)
+        self.tracker = ReimuTrackerCV()
+
+        # 정책/리워드용 좌표/신뢰도 (playfield 기준 정규화)
         self.last_xy_norm: Tuple[float, float] = (0.5, 0.78)
         self.last_conf: float = 0.0
+
+        # det None일 때 유지
         self.player_center: Tuple[int, int] = (w0 // 2, int(h0 * 0.78))
-        self._last_bbox_full: Optional[Tuple[int, int, int, int]] = None
+
+        # meta pixels
+        self.meta_patch: int = 4
 
         # prev gray (obs_out_size 기준으로 저장)
         self._prev_gray_small_u8: Optional[np.ndarray] = None
@@ -69,6 +74,9 @@ class ObsBuilder:
         self.diff_bullet_k_mad: float = 3.0
         self.max_bullet_fill_ratio: float = 0.35
 
+        # tracker bbox 캐시 (full 기준)
+        self._last_bbox_full: Optional[Tuple[int, int, int, int]] = None  # (x,y,w,h)
+
         # bullet/risk
         self.enable_bullet_channels: bool = True
         self.bullet_hsv_s_min: int = 40
@@ -79,17 +87,32 @@ class ObsBuilder:
         self.risk_tau_px: float = 8.0
         self.risk_clip_max: float = 1.0
 
-        # ===== TRACER/마커/메타 완전 OFF =====
-        self.mark_player_on_ch0: bool = False
-        self.meta_patch: int = 0  # (혹시 외부가 접근하더라도 안전)
+        # ===== player marker on ch0 (학습용) =====
+        self.mark_player_on_ch0: bool = True
+        self.marker_half: int = 2
+        self.marker_value: float = 1.0
+        self.marker_use_conf: bool = True
+        self.marker_min_scale: float = 0.35
+        self._last_player_uv_small: Tuple[int, int] = (self.obs_out_size // 2, self.obs_out_size // 2)
+
+        # 레이무 디버그 창
+        self.show_reimu_debug: bool = True
+        dbg_cfg = DebugViewConfig(
+            window_name="debug_hell",
+            enable_keys=False,
+            wait_ms=1,
+        )
+        self.reimu_dbg_view = ReimuTrackerDebugView(self.tracker, cfg=dbg_cfg)
 
         # OBS 디버그
         self.show_obs_debug: bool = True
         self.win_crop: str = "OBS_CROP"
         self._obs_win_inited: bool = False
-        self.obs_debug_channel: int = 0  # 0/1/2/3
 
-        # tracker pause (bomb etc.) - 인터페이스 호환용으로만 유지 (실제 사용 안 함)
+        # OBS 디버그에 무엇을 보여줄지 (0/1/2/3)
+        self.obs_debug_channel: int = 0
+
+        # tracker pause (bomb etc.)
         self._track_pause_until: float = 0.0
         self._track_pause_active: bool = False
         self._track_pause_resume_reset_pending: bool = False
@@ -106,39 +129,39 @@ class ObsBuilder:
         self._bullet_kernel = None
         self._bullet_kernel_k = -1
 
-        # (호환용) obs에 있던 속성들 접근 대비
-        self._last_player_uv_small: Tuple[int, int] = (s // 2, int(s * 0.78))
-
     # -------------------------
     # lifecycle / hooks
     # -------------------------
     def reset(self):
+        self.tracker.reset()
         self.player_center = (self.W // 2, int(self.H * 0.78))
         self.last_xy_norm = (0.5, 0.78)
         self.last_conf = 0.0
         self._prev_gray_small_u8 = None
         self._last_inverted = False
         self._last_bbox_full = None
-
         self._track_pause_until = 0.0
         self._track_pause_active = False
         self._track_pause_resume_reset_pending = False
-
-        s = self.obs_out_size
-        self._last_player_uv_small = (s // 2, int(s * 0.78))
+        self._last_player_uv_small = (self.obs_out_size // 2, self.obs_out_size // 2)
 
     def on_player_death(self):
-        return
+        try:
+            self.tracker.reset()
+        except Exception:
+            pass
 
     def on_bomb_used(self, pause_sec: float = 2.0):
-        # 트래커가 없으므로 실제 pause 의미 없음(호환용)
         now = time.time()
         self._track_pause_until = float(now + float(pause_sec))
         self._track_pause_active = True
         self._track_pause_resume_reset_pending = True
 
     def pump_key(self, key: int):
-        return
+        if key is None or key < 0:
+            return
+        if self.reimu_dbg_view is not None:
+            self.reimu_dbg_view.handle_key(int(key))
 
     # -------------------------
     # debug window
@@ -153,35 +176,87 @@ class ObsBuilder:
         self._obs_win_inited = True
 
     # -------------------------
-    # playfield crop (BGR)
+    # meta pixels / marker
     # -------------------------
-    def _crop_playfield_bgr(self, img_bgr: np.ndarray) -> np.ndarray:
+    def _inject_meta_pixels_ch0_only(self, ch0_01: np.ndarray) -> np.ndarray:
         """
-        Screen의 PLAYFIELD_RIGHT_RATIO + (LEFT/RIGHT/TOP/BOTTOM)_CROP 를 이용해
-        UI 패널을 제외한 playfield BGR만 반환한다.
+        ch0 좌상단에 x/y/conf를 타일로 주입.
         """
-        h, w = img_bgr.shape[:2]
-        pf_w = int(round(w * float(self._playfield_ratio)))
-        pf_w = int(np.clip(pf_w, 1, w))
+        try:
+            x_n, y_n = self.last_xy_norm
+            c = float(self.last_conf)
 
-        # 1) 먼저 좌측 playfield 영역만 자르기
-        play = img_bgr[:, :pf_w]
+            x_n = float(np.clip(x_n, 0.0, 1.0))
+            y_n = float(np.clip(y_n, 0.0, 1.0))
+            c = float(np.clip(c, 0.0, 1.0))
 
-        ph, pw = play.shape[:2]
+            p = int(self.meta_patch)
+            if p > 0 and ch0_01.shape[0] >= p and ch0_01.shape[1] >= p * 3:
+                ch0_01[0:p, 0:p] = x_n
+                ch0_01[0:p, p:2 * p] = y_n
+                ch0_01[0:p, 2 * p:3 * p] = c
+        except Exception:
+            pass
+        return ch0_01
 
-        # 2) playfield 내부 crop 비율 적용
-        x0 = int(round(pw * float(self._pf_left_crop)))
-        x1 = int(round(pw * float(self._pf_right_crop)))
-        y0 = int(round(ph * float(self._pf_top_crop)))
-        y1 = int(round(ph * float(self._pf_bottom_crop)))
+    def _update_player_uv_small_from_full(self) -> None:
+        """
+        전체화면 좌표 player_center(px,py)를
+        obs_out_size 해상도(u,v)로 직접 스케일해서 저장.
+        """
+        try:
+            px, py = map(int, self.player_center)
+            u = int(round(px * (self.obs_out_size - 1) / max(1, (self.W - 1))))
+            v = int(round(py * (self.obs_out_size - 1) / max(1, (self.H - 1))))
+            u = int(np.clip(u, 0, self.obs_out_size - 1))
+            v = int(np.clip(v, 0, self.obs_out_size - 1))
+            self._last_player_uv_small = (u, v)
+        except Exception:
+            self._last_player_uv_small = (self.obs_out_size // 2, self.obs_out_size // 2)
 
-        # 안전 클램프
-        x0 = int(np.clip(x0, 0, pw - 1))
-        x1 = int(np.clip(x1, x0 + 1, pw))
-        y0 = int(np.clip(y0, 0, ph - 1))
-        y1 = int(np.clip(y1, y0 + 1, ph))
+    def _stamp_player_marker_ch0(self, ch0_01: np.ndarray) -> None:
+        """
+        ch0(0..1)에만 플레이어 마커(십자)를 찍는다.
+        위치는 self._last_player_uv_small(u,v)를 사용한다.
+        """
+        if not self.mark_player_on_ch0:
+            return
+        if ch0_01 is None or ch0_01.size == 0:
+            return
 
-        return play[y0:y1, x0:x1]
+        s = int(ch0_01.shape[0])
+        if s <= 0:
+            return
+
+        cx, cy = self._last_player_uv_small
+        cx = int(np.clip(cx, 0, s - 1))
+        cy = int(np.clip(cy, 0, s - 1))
+
+        r = int(self.marker_half)
+        if r <= 0:
+            return
+
+        v = float(self.marker_value)
+        if self.marker_use_conf:
+            c = float(np.clip(self.last_conf, 0.0, 1.0))
+            v *= max(float(self.marker_min_scale), c)
+
+        y1 = max(0, cy - r)
+        y2 = min(s, cy + r + 1)
+        x1 = max(0, cx - r)
+        x2 = min(s, cx + r + 1)
+
+        ch0_01[cy, x1:x2] = v
+        ch0_01[y1:y2, cx] = v
+
+    def _full_xy_to_playfield_norm(self, cx: int, cy: int) -> Tuple[float, float]:
+        """
+        x는 playfield 폭(_playfield_w) 기준으로 0..1
+        y는 전체 높이(H) 기준으로 0..1
+        """
+        x_n = float(np.clip(cx / max(1, self._playfield_w - 1), 0.0, 1.0))
+        y_n = float(np.clip(cy / max(1, self.H - 1), 0.0, 1.0))
+        return x_n, y_n
 
     # -------------------------
     # bullets / risk
@@ -279,20 +354,42 @@ class ObsBuilder:
     # main
     # -------------------------
     def make_state(self, img_bgr: np.ndarray) -> np.ndarray:
-        # ✅ 0) UI 제외: playfield만 crop
-        play_bgr = self._crop_playfield_bgr(img_bgr)
+        # 1) tracker step (전체 화면 기준)
+        now = time.time()
+        if self._track_pause_active and now < float(self._track_pause_until):
+            bbox, conf = None, 0.0
+        else:
+            if self._track_pause_active and self._track_pause_resume_reset_pending:
+                try:
+                    self.tracker.reset()
+                except Exception:
+                    pass
+                self._track_pause_resume_reset_pending = False
+                self._track_pause_active = False
 
-        # 1) playfield -> small resize (정사각)
-        ph, pw = play_bgr.shape[:2]
-        interp = cv2.INTER_AREA if max(ph, pw) >= self.obs_out_size else cv2.INTER_LINEAR
-        bgr_small = cv2.resize(play_bgr, (self.obs_out_size, self.obs_out_size), interpolation=interp)
+            bbox, conf = self.tracker.step(img_bgr)
+
+        if bbox is not None:
+            self._last_bbox_full = bbox
+            x, y, w, h = map(int, bbox)
+            cx = int(round(x + 0.5 * w))
+            cy = int(round(y + 0.5 * h))
+            self.player_center = (cx, cy)
+            self.last_conf = float(np.clip(conf, 0.0, 1.0))
+            self.last_xy_norm = self._full_xy_to_playfield_norm(cx, cy)
+
+            # ✅ full 좌표 -> small uv 갱신 (crop 좌표 불필요)
+            self._update_player_uv_small_from_full()
+
+        # 2) full -> small resize (obs_out_size)
+        interp = cv2.INTER_AREA if max(self.H, self.W) >= self.obs_out_size else cv2.INTER_LINEAR
+        bgr_small = cv2.resize(img_bgr, (self.obs_out_size, self.obs_out_size), interpolation=interp)
 
         gray_small_u8 = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2GRAY)
 
-        # 2) auto invert
+        # 3) auto invert
         gray_small_u8 = self._maybe_invert_gray_small(gray_small_u8)
 
-        # 3) diff
         if self._prev_gray_small_u8 is None or self._prev_gray_small_u8.shape != gray_small_u8.shape:
             diff_small_u8 = self._zeros_small_u8
         else:
@@ -300,7 +397,7 @@ class ObsBuilder:
 
         self._prev_gray_small_u8 = gray_small_u8.copy()
 
-        # 4) bullet + risk (playfield 기반으로만)
+        # 4) bullet + risk
         if self.enable_bullet_channels:
             bullet_mask_u8 = self._compute_bullet_mask_u8_small_robust(bgr_small, diff_small_u8)
             risk_01 = self._compute_risk_heat_small(bullet_mask_u8)
@@ -308,12 +405,15 @@ class ObsBuilder:
             bullet_mask_u8 = self._zeros_small_u8
             risk_01 = self._zeros_small_f32
 
-        # (추가) 외부(ActionMasker/Reward shaping)가 참조할 수 있게 속성으로 노출
-        self.bullet_candidate_mask = (bullet_mask_u8 > 0).astype(np.uint8)   # 0/1
+        # (추가) 외부가 참조할 수 있게 속성으로 노출
+        self.bullet_candidate_mask = (bullet_mask_u8 > 0).astype(np.uint8)  # 0/1
         self.risk_heatmap = risk_01.astype(np.float32)
 
-        # 5) float32 채널 구성 (0..1)
+        # 5) float32 채널 구성 (0..1) - obs buffer 재사용
         self._obs_buf[0, :, :] = gray_small_u8.astype(np.float32) * (1.0 / 255.0)
+
+        # ✅ 플레이어 마커는 ch0에만 (uv 기반)
+        self._stamp_player_marker_ch0(self._obs_buf[0])
 
         if diff_small_u8 is self._zeros_small_u8:
             self._obs_buf[1, :, :] = 0.0
@@ -330,18 +430,23 @@ class ObsBuilder:
         else:
             self._obs_buf[3, :, :] = risk_01
 
+        # 6) meta pixels (ch0만)
+        self._inject_meta_pixels_ch0_only(self._obs_buf[0])
+
         obs4 = self._obs_buf
 
-        # ---- debug window ----
+        # ---- debug windows ----
         if self.show_obs_debug:
             try:
                 self._ensure_obs_window()
                 ch = int(np.clip(self.obs_debug_channel, 0, 3))
                 vis = (np.clip(obs4[ch], 0.0, 1.0) * 255.0).astype(np.uint8)
                 vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
+
+                u, v = self._last_player_uv_small
                 cv2.putText(
                     vis,
-                    f"ch{ch} PLAYFIELD_ONLY TRACKER_OFF inv={int(self._last_inverted)}",
+                    f"ch{ch} conf={self.last_conf:.2f} uv=({u},{v}) inv={int(self._last_inverted)}",
                     (5, 14),
                     cv2.FONT_HERSHEY_SIMPLEX,
                     0.45,
@@ -352,5 +457,11 @@ class ObsBuilder:
                 cv2.imshow(self.win_crop, vis)
             except Exception:
                 pass
+
+        if self.show_reimu_debug and (self.reimu_dbg_view is not None):
+            try:
+                self.reimu_dbg_view.render(img_bgr)
+            except Exception as e:
+                print("[reimu_dbg_view.render ERROR]", repr(e))
 
         return obs4.copy()
