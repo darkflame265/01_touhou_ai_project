@@ -439,3 +439,4 @@ class ObsBuilder:
                 print("[reimu_dbg_view.render ERROR]", repr(e))
 
         return obs4.copy()
+#ss
