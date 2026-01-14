@@ -80,6 +80,7 @@ class GameEnv:
         )
         self.fs = FrameSkipper(self.screen, fs_cfg)
 
+        self.s.frame_stack_size = 4
         # obs packer: frame_stack=4 강제
         p_cfg = ObsPackConfig()
         if hasattr(p_cfg, "frame_stack"):
@@ -335,7 +336,7 @@ class GameEnv:
             if self.s.ui_absent_count >= self.s.ui_absent_needed:
                 try:
                     st = self.obs.make_state(pre_img)
-                    self.packer.push_prev_state(self.packer.as_chw(st))
+                    self.packer.push_prev_state(self.packer.as_chw(st), is_dup=bool(pre_is_dup))
                 except Exception:
                     pass
                 return self._end_episode(self.reward_engine.abort_pen, "ABORT:UI_ABSENT(pre)")
@@ -360,7 +361,7 @@ class GameEnv:
             # DUP skip
             if is_dup and self.fs.cfg.skip_dup_frames:
                 r = float(self.reward_engine.alive_reward) if not self.dup_reward_zero else 0.0
-                self.s.frame_stack.append(self.s.prev_state)
+                self.packer.push_prev_state(self.s.prev_state, is_dup=True)
                 total_reward += r
                 self.packer.ep_add(r)
                 continue

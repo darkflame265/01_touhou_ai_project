@@ -26,6 +26,10 @@ class FrameSkipper:
     Screen.capture()를 감싸서:
       - DUP frame 감지(샘플링 기반) + 재시도
       - profiling 합산(캡처 시간만)
+
+    ✅ 변경점:
+      - dup로 판정된 프레임에서는 _prev_sample을 업데이트하지 않음
+        -> retry가 "마지막 유효(비-dup) 프레임"을 기준으로 계속 비교하게 됨
     """
 
     def __init__(self, screen, cfg: FrameSkipperConfig):
@@ -53,6 +57,7 @@ class FrameSkipper:
         else:
             ch0 = img
         s = int(self.cfg.dup_sample_stride)
+        s = max(1, s)
         return ch0[::s, ::s].astype(np.uint8, copy=False)
 
     def _is_dup(self, img: np.ndarray) -> bool:
@@ -70,10 +75,15 @@ class FrameSkipper:
         diff = np.abs(sample.astype(np.int16) - self._prev_sample.astype(np.int16))
         mean_abs = float(diff.mean())
         max_abs = int(diff.max())
-        self._prev_sample = sample
 
         thr = float(self.cfg.dup_thr_mean_abs)
-        return bool((max_abs == 0) or (mean_abs < thr))
+        is_dup = bool((max_abs == 0) or (mean_abs < thr))
+
+        # ✅ 핵심: dup면 prev 갱신하지 않음 (retry의 비교 기준 고정)
+        if not is_dup:
+            self._prev_sample = sample
+
+        return is_dup
 
     def _capture_once(self) -> np.ndarray:
         t0 = time.perf_counter()
@@ -104,6 +114,7 @@ class FrameSkipper:
             is_dup2 = self._is_dup(img2)
             if not is_dup2:
                 return img2, False
+
             img = img2
             is_dup = True
 
