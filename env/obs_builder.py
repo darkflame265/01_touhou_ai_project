@@ -1,4 +1,3 @@
-# env/obs_builder.py
 from __future__ import annotations
 
 import time
@@ -13,162 +12,164 @@ from env.reimu_tracker_debug_view import ReimuTrackerDebugView, DebugViewConfig
 
 class ObsBuilder:
     """
-    4채널 관측 (float32):
-      ch0: gray (0..1) + player marker + meta pixels(xy/conf)
-      ch1: absdiff(current_gray, prev_gray) (0..1)
-      ch2: bullet_candidate_mask (0..1)
-      ch3: risk_heatmap (distanceTransform 기반, 0..1)
+    4ch obs (float32):
+      ch0: gray(0..1) + player marker + meta(x,y,conf)
+      ch1: signed diff (gray_t - gray_{t-1}), global-shift removed (0..1)
+      ch2: motion_hazard (0..1)  # ✅ 잔상 없음: 현재 프레임 기반 hazard만
+           + (선택) 플레이어 근접 강조(지우지 않고 '조금 더 위험'으로)
+      ch3: risk_heat (0..1) from distanceTransform on hazard_bin
+           + (선택) hazard fill에 따라 tau 동적 조절
 
-    ✅ UI 제외 버전(권장):
-    - playfield만 crop 한 뒤 -> obs_out_size로 리사이즈
-    - tracker는 full-frame 기준으로 step(img_bgr)
-    - last_xy_norm: playfield 기준 정규화(가로/세로 모두 playfield crop 기준)
-    - ch0에 십자 마커 + meta pixels(x/y/conf)
-    - ✅ 초미세 회피용 local risk:
-        - risk_local_valid (conf 기반)
-        - risk_local_p90 / risk_local_p99 / risk_local_mean
-        - (포화 방지) ROI에서 '탄 픽셀(=risk~1)'은 제외하고 분위수 계산
+    핵심 변경(요청 반영):
+      - persistence(잔상) 완전 제거
+      - EMA도 기본 off 유지 (원하면 켤 수는 있음)
+      - ch2는 "현재 프레임의 움직임 위험"만 보여서 디버그 시각화도 깔끔
     """
 
     def __init__(
         self,
         screen,
         obs_out_size: int = 128,
-        crop_size: int = 256,  # (호환용) 미사용
-        use_fallback_full_preprocess: bool = True,  # (호환용) 미사용
+        crop_size: int = 256,
+        use_fallback_full_preprocess: bool = True,
     ):
         self.screen = screen
-
-        self.obs_out_size = int(obs_out_size)
-        self.crop_size = int(crop_size)
+        self.s = int(obs_out_size)
         self.obs_channels = 4
 
         img0 = self.screen.capture()
-        h0, w0 = img0.shape[:2]
-        self.H, self.W = int(h0), int(w0)
+        self.H, self.W = map(int, img0.shape[:2])
 
-        # ===== playfield crop 설정 =====
-        # 기본: 우측 UI 패널 제외 (x: 0 ~ playfield_w)
-        self._playfield_ratio = float(getattr(self.screen, "PLAYFIELD_RIGHT_RATIO", 0.70))
-        self._playfield_x0 = 0
-        self._playfield_x1 = max(1, min(self.W, int(self.W * self._playfield_ratio)))
-
-        # 세로 crop: Screen에 설정이 있으면 사용, 없으면 전체(0~H)
+        # playfield crop (UI 제거)
+        ratio = float(getattr(self.screen, "PLAYFIELD_RIGHT_RATIO", 0.70))
+        self._x0, self._x1 = 0, max(1, min(self.W, int(self.W * ratio)))
         top = float(getattr(self.screen, "PLAYFIELD_TOP_CROP", 0.0))
         bot = float(getattr(self.screen, "PLAYFIELD_BOTTOM_CROP", 1.0))
-        self._playfield_y0 = int(np.clip(round(self.H * top), 0, self.H - 1))
-        self._playfield_y1 = int(np.clip(round(self.H * bot), self._playfield_y0 + 1, self.H))
-
-        self._pf_w = max(1, self._playfield_x1 - self._playfield_x0)
-        self._pf_h = max(1, self._playfield_y1 - self._playfield_y0)
+        self._y0 = int(np.clip(round(self.H * top), 0, self.H - 1))
+        self._y1 = int(np.clip(round(self.H * bot), self._y0 + 1, self.H))
+        self._pw = max(1, self._x1 - self._x0)
+        self._ph = max(1, self._y1 - self._y0)
 
         # tracker (full-frame)
         self.tracker = ReimuTrackerCV()
-
-        # 정책/리워드용 좌표/신뢰도 (playfield 기준 정규화)
         self.last_xy_norm: Tuple[float, float] = (0.5, 0.78)
         self.last_conf: float = 0.0
+        self.player_center: Tuple[int, int] = (self.W // 2, int(self.H * 0.78))
+        self._uv = (self.s // 2, self.s // 2)
 
-        # det None일 때 유지 (full-frame 좌표)
-        self.player_center: Tuple[int, int] = (w0 // 2, int(h0 * 0.78))
+        # meta/marker (ch0 only)
+        self.meta_patch = 4
+        self.mark_player_on_ch0 = True
+        self.marker_half = 2
+        self.marker_value = 1.0
+        self.marker_use_conf = True
+        self.marker_min_scale = 0.35
 
-        # meta pixels
-        self.meta_patch: int = 4
+        # prev
+        self._prev_gray: Optional[np.ndarray] = None
 
-        # prev gray (obs_out_size 기준으로 저장)
-        self._prev_gray_small_u8: Optional[np.ndarray] = None
+        # gray invert (선택)
+        self.auto_invert_gray = True
+        self.invert_mean_thr = 0.58
+        self._last_inverted = False
 
-        # ----- auto inversion -----
-        self.auto_invert_gray: bool = True
-        self.invert_mean_thr: float = 0.58  # 0..1
-        self._last_inverted: bool = False
+        # (옵션) ch0/ch1 안정화: CLAHE
+        self.gray_clahe_enable = False
+        self.gray_clahe_clip = 2.0
+        self.gray_clahe_tile = 8
+        self._clahe = None
+        self._clahe_key = None  # (clip,tile) 변경 감지
 
-        # ----- bullet/background separation -----
-        self.use_motion_for_bullets: bool = True
-        self.diff_bullet_min: int = 10
-        self.diff_bullet_k_mad: float = 3.0
-        # motion이 화면을 덮어버리면 risk 포화 → HSV fallback
-        self.max_bullet_fill_ratio: float = 0.30
+        # hazard on/off
+        self.enable_hazard = True
 
-        # tracker bbox 캐시 (full 기준)
-        self._last_bbox_full: Optional[Tuple[int, int, int, int]] = None  # (x,y,w,h)
+        # diff -> motion mask params (MAD threshold)
+        self.diff_min = 10
+        self.diff_k_mad = 3.0
 
-        # bullet/risk
-        self.enable_bullet_channels: bool = True
-        self.bullet_hsv_s_min: int = 40
-        self.bullet_hsv_v_min: int = 140
-        self.bullet_hsv_v_max: int = 255
-        self.bullet_close_morph: int = 0  # 0이면 morph 스킵
+        # diff 포화(플래시/톤 변화) 대응
+        self.diff_saturation_ratio = 0.30
+        self.diff_saturation_boost = 2.0
 
-        self.risk_tau_px: float = 8.0
-        self.risk_clip_max: float = 1.0
-        self.risk_use_max_normalize: bool = False
+        # morph (기본 off: 뭉개짐 방지)
+        self.motion_open = 0
+        self.motion_close = 0
+        self._ker_open = None
+        self._ker_close = None
+        self._ker_open_k = -1
+        self._ker_close_k = -1
 
-        # ===== player marker on ch0 =====
-        self.mark_player_on_ch0: bool = True
-        self.marker_half: int = 2
-        self.marker_value: float = 1.0
-        self.marker_use_conf: bool = True
-        self.marker_min_scale: float = 0.35
-        self._last_player_uv_small: Tuple[int, int] = (self.obs_out_size // 2, self.obs_out_size // 2)
+        # ch1: signed diff 설정
+        self.signed_diff_enable = True
+        self.signed_diff_remove_global_shift = True  # d - median(d)
+        self.signed_diff_clip = 48.0                 # [-clip, +clip] 후 0..1 매핑
 
-        # ===== local risk ROI =====
-        self.local_risk_enable: bool = True
-        self.local_risk_radius: int = 12
-        self.local_risk_quantile_p: float = 0.90  # 노출용
-        self.local_risk_conf_thr: float = 0.20
+        # ✅ 잔상/EMA 제거(기본)
+        self.hazard_ema_enable = False
+        self.hazard_ema_alpha = 0.65
+        self._hazard_ema: Optional[np.ndarray] = None
 
-        self.local_risk_exclude_saturated: bool = True
-        self.local_risk_sat_thr: float = 0.999
-        self.local_risk_min_valid_bg_frac: float = 0.30
+        # 플레이어 근접 강조 (지우지 않고 "조금 더 위험"으로)
+        self.hazard_proximity_boost_enable = True
+        self.hazard_proximity_w = 0.35     # 0.0~0.8
+        self.hazard_proximity_tau = 10.0   # s좌표 기준 거리 감쇠(6~16)
+        self._grid_xy = None               # (xx,yy) 캐시
 
-        self.risk_local_valid: bool = False
-        self.risk_local_mean: float = 0.0
-        self.risk_local_p90: float = 0.0
-        self.risk_local_p99: float = 0.0
-        self.risk_local_bg_frac: float = 0.0
-        self.risk_local_max: float = 0.0
+        # hazard bin threshold (risk 입력용)
+        self.hazard_bin_thr_for_risk = 0.35
 
-        # 외부 getattr 안전
-        self.bullet_candidate_mask = None
-        self.risk_heatmap = None
+        # risk map
+        self.risk_tau_px = 8.0
+        self.risk_clip_max = 1.0
+        self.risk_use_max_normalize = False
 
-        # 레이무 디버그 창
-        self.show_reimu_debug: bool = True
-        dbg_cfg = DebugViewConfig(
-            window_name="debug_hell",
-            enable_keys=False,
-            wait_ms=1,
+        # tau 동적 조절(선택): hazard가 많을수록 tau 줄여 과포화 방지
+        self.risk_dynamic_tau_enable = True
+        self.risk_tau_min = 4.0
+        self.risk_tau_max = 10.0
+        self.risk_tau_fill_lo = 0.02
+        self.risk_tau_fill_hi = 0.20
+
+        # exported maps
+        self.hazard_bin = None          # (s,s) uint8 {0,1}
+        self.risk_heatmap = None        # (s,s) float32 0..1
+        self.hazard_global_fill = 0.0
+
+        # debug windows (최소)
+        self.show_reimu_debug = False
+        self.reimu_dbg_view = ReimuTrackerDebugView(
+            self.tracker,
+            cfg=DebugViewConfig(window_name="debug_hell", enable_keys=False, wait_ms=1),
         )
-        self.reimu_dbg_view = ReimuTrackerDebugView(self.tracker, cfg=dbg_cfg)
 
-        # OBS 디버그 (playfield만 보여줌)
-        self.show_obs_debug: bool = True
-        self.win_crop: str = "OBS_CROP"
-        self._obs_win_inited: bool = False
-        self.obs_debug_channel: int = 0
+        self.show_obs_debug = True
+        self.win_crop = "OBS_CROP"
+        self._obs_win_inited = False
+        self.obs_debug_channel = 3
+        self.debug_upscale = 4
+        self.debug_font_scale = 0.70
+        self.debug_thickness = 2
 
-        # 디버그 표시 업스케일 (텍스트 선명도)
-        self.debug_upscale: int = 4
-        self.debug_font_scale: float = 0.70
-        self.debug_thickness: int = 2
+        # debug cross (시각화 전용)
+        self.debug_draw_cross = True
+        self.debug_cross_half = 1
+        self.debug_cross_thickness = 2
+        self.debug_cross_outer_thickness = 3
+        self.debug_cross_color = (255, 255, 255)
+        self.debug_cross_outer_color = (0, 0, 0)
 
-        # tracker pause (bomb etc.)
-        self._track_pause_until: float = 0.0
-        self._track_pause_active: bool = False
-        self._track_pause_resume_reset_pending: bool = False
+        # tracker pause (bomb 등)
+        self._pause_until = 0.0
+        self._pause_active = False
+        self._pause_reset_pending = False
 
-        # ===== buffers =====
-        s = self.obs_out_size
-        self._zeros_small_u8 = np.zeros((s, s), dtype=np.uint8)
-        self._zeros_small_f32 = np.zeros((s, s), dtype=np.float32)
-        self._obs_buf = np.empty((4, s, s), dtype=np.float32)
-
-        self._bullet_kernel = None
-        self._bullet_kernel_k = -1
+        # buffers
+        self._z_u8 = np.zeros((self.s, self.s), np.uint8)
+        self._z_f32 = np.zeros((self.s, self.s), np.float32)
+        self._obs = np.empty((4, self.s, self.s), np.float32)
 
     # -------------------------
-    # lifecycle / hooks
+    # public hooks
     # -------------------------
     def reset(self):
         try:
@@ -179,20 +180,19 @@ class ObsBuilder:
         self.player_center = (self.W // 2, int(self.H * 0.78))
         self.last_xy_norm = (0.5, 0.78)
         self.last_conf = 0.0
-        self._prev_gray_small_u8 = None
-        self._last_inverted = False
-        self._last_bbox_full = None
-        self._track_pause_until = 0.0
-        self._track_pause_active = False
-        self._track_pause_resume_reset_pending = False
-        self._last_player_uv_small = (self.obs_out_size // 2, self.obs_out_size // 2)
+        self._uv = (self.s // 2, self.s // 2)
 
-        self.risk_local_valid = False
-        self.risk_local_mean = 0.0
-        self.risk_local_p90 = 0.0
-        self.risk_local_p99 = 0.0
-        self.risk_local_bg_frac = 0.0
-        self.risk_local_max = 0.0
+        self._prev_gray = None
+        self._hazard_ema = None
+        self._last_inverted = False
+
+        self.hazard_bin = None
+        self.risk_heatmap = None
+        self.hazard_global_fill = 0.0
+
+        self._pause_until = 0.0
+        self._pause_active = False
+        self._pause_reset_pending = False
 
     def on_player_death(self):
         try:
@@ -202,18 +202,199 @@ class ObsBuilder:
 
     def on_bomb_used(self, pause_sec: float = 2.0):
         now = time.time()
-        self._track_pause_until = float(now + float(pause_sec))
-        self._track_pause_active = True
-        self._track_pause_resume_reset_pending = True
+        self._pause_until = float(now + float(pause_sec))
+        self._pause_active = True
+        self._pause_reset_pending = True
 
     def pump_key(self, key: int):
         if key is None or key < 0:
             return
-        if self.reimu_dbg_view is not None:
+        if self.show_reimu_debug and self.reimu_dbg_view is not None:
             self.reimu_dbg_view.handle_key(int(key))
 
     # -------------------------
-    # debug window
+    # helpers
+    # -------------------------
+    def _crop_pf(self, img):
+        h, w = img.shape[:2]
+        x0 = int(np.clip(self._x0, 0, w - 1))
+        x1 = int(np.clip(self._x1, x0 + 1, w))
+        y0 = int(np.clip(self._y0, 0, h - 1))
+        y1 = int(np.clip(self._y1, y0 + 1, h))
+        return img[y0:y1, x0:x1]
+
+    def _xy_norm(self, cx, cy):
+        x_pf = float(cx - self._x0)
+        y_pf = float(cy - self._y0)
+        x_n = float(np.clip(x_pf / max(1, self._pw - 1), 0.0, 1.0))
+        y_n = float(np.clip(y_pf / max(1, self._ph - 1), 0.0, 1.0))
+        return x_n, y_n
+
+    def _update_uv(self):
+        px, py = map(int, self.player_center)
+        x_pf = float(px - self._x0)
+        y_pf = float(py - self._y0)
+        u = int(round(x_pf * (self.s - 1) / max(1, (self._pw - 1))))
+        v = int(round(y_pf * (self.s - 1) / max(1, (self._ph - 1))))
+        self._uv = (int(np.clip(u, 0, self.s - 1)), int(np.clip(v, 0, self.s - 1)))
+
+    def _inject_meta(self, ch0):
+        p = int(self.meta_patch)
+        if p <= 0 or ch0.shape[0] < p or ch0.shape[1] < p * 3:
+            return
+        x_n, y_n = self.last_xy_norm
+        c = float(np.clip(self.last_conf, 0.0, 1.0))
+        ch0[0:p, 0:p] = float(np.clip(x_n, 0.0, 1.0))
+        ch0[0:p, p:2 * p] = float(np.clip(y_n, 0.0, 1.0))
+        ch0[0:p, 2 * p:3 * p] = c
+
+    def _stamp_marker(self, ch0):
+        if not self.mark_player_on_ch0:
+            return
+        u, v = self._uv
+        r = int(self.marker_half)
+        if r <= 0:
+            return
+        val = float(self.marker_value)
+        if self.marker_use_conf:
+            val *= max(float(self.marker_min_scale), float(np.clip(self.last_conf, 0.0, 1.0)))
+        x1, x2 = max(0, u - r), min(self.s, u + r + 1)
+        y1, y2 = max(0, v - r), min(self.s, v + r + 1)
+        ch0[v, x1:x2] = val
+        ch0[y1:y2, u] = val
+
+    def _maybe_invert(self, gray_u8):
+        if not self.auto_invert_gray:
+            self._last_inverted = False
+            return gray_u8
+        inv = (float(gray_u8.mean(dtype=np.float32) / 255.0) >= float(self.invert_mean_thr))
+        self._last_inverted = bool(inv)
+        return (255 - gray_u8) if inv else gray_u8
+
+    def _maybe_clahe(self, gray_u8: np.ndarray) -> np.ndarray:
+        if not self.gray_clahe_enable:
+            return gray_u8
+        tile = int(max(2, self.gray_clahe_tile))
+        clip = float(max(0.5, self.gray_clahe_clip))
+        key = (clip, tile)
+        if self._clahe is None or self._clahe_key != key:
+            self._clahe = cv2.createCLAHE(clipLimit=clip, tileGridSize=(tile, tile))
+            self._clahe_key = key
+        return self._clahe.apply(gray_u8)
+
+    @staticmethod
+    def _mad_u8(x):
+        med = float(np.median(x))
+        mad = float(np.median(np.abs(x.astype(np.float32) - med)))
+        return med, mad
+
+    def _ker(self, kind: str, k: int):
+        k = int(k)
+        if k <= 0:
+            return None
+        if kind == "open":
+            if self._ker_open is not None and self._ker_open_k == k:
+                return self._ker_open
+            self._ker_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
+            self._ker_open_k = k
+            return self._ker_open
+        if kind == "close":
+            if self._ker_close is not None and self._ker_close_k == k:
+                return self._ker_close
+            self._ker_close = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
+            self._ker_close_k = k
+            return self._ker_close
+        return None
+
+    def _get_grid(self):
+        if self._grid_xy is not None:
+            return self._grid_xy
+        xs = np.arange(self.s, dtype=np.float32)
+        ys = np.arange(self.s, dtype=np.float32)
+        xx, yy = np.meshgrid(xs, ys)
+        self._grid_xy = (xx, yy)
+        return self._grid_xy
+
+    # -------------------------
+    # motion hazard
+    # -------------------------
+    def _motion_mask(self, diff_u8: np.ndarray) -> np.ndarray:
+        med, mad = self._mad_u8(diff_u8)
+        thr = max(float(self.diff_min), med + float(self.diff_k_mad) * mad)
+
+        base = (diff_u8.astype(np.float32) >= float(thr)).astype(np.uint8) * 255
+        fill = float(np.mean(base > 0)) if base.size else 0.0
+
+        # 포화(플래시/톤변화)면 threshold 강화
+        if fill >= float(self.diff_saturation_ratio):
+            thr2 = max(float(self.diff_min), med + float(self.diff_k_mad) * float(self.diff_saturation_boost) * mad)
+            base = (diff_u8.astype(np.float32) >= float(thr2)).astype(np.uint8) * 255
+
+        k = int(self.motion_open)
+        if k > 0:
+            base = cv2.morphologyEx(base, cv2.MORPH_OPEN, self._ker("open", k), iterations=1)
+        k2 = int(self.motion_close)
+        if k2 > 0:
+            base = cv2.morphologyEx(base, cv2.MORPH_CLOSE, self._ker("close", k2), iterations=1)
+
+        return base
+
+    def _signed_diff_map(self, gray_u8: np.ndarray, prev_u8: np.ndarray) -> np.ndarray:
+        if prev_u8 is None or prev_u8.shape != gray_u8.shape:
+            return self._z_f32
+
+        d = gray_u8.astype(np.int16) - prev_u8.astype(np.int16)
+
+        if self.signed_diff_remove_global_shift:
+            d = d - int(np.median(d))
+
+        clip = float(max(1.0, self.signed_diff_clip))
+        d = np.clip(d.astype(np.float32), -clip, clip)
+        return (d + clip) * (0.5 / clip)
+
+    # -------------------------
+    # risk
+    # -------------------------
+    def _dynamic_tau(self, fill: float) -> float:
+        if not self.risk_dynamic_tau_enable:
+            return float(self.risk_tau_px)
+
+        lo = float(np.clip(self.risk_tau_fill_lo, 0.0, 1.0))
+        hi = float(np.clip(self.risk_tau_fill_hi, lo + 1e-6, 1.0))
+        tmin = float(max(1e-6, self.risk_tau_min))
+        tmax = float(max(tmin, self.risk_tau_max))
+
+        if fill <= lo:
+            return tmax
+        if fill >= hi:
+            return tmin
+
+        a = (fill - lo) / (hi - lo)
+        return (1.0 - a) * tmax + a * tmin
+
+    def _risk(self, hazard_u8_bin: np.ndarray, tau_override: Optional[float] = None) -> np.ndarray:
+        if hazard_u8_bin is None or hazard_u8_bin.size == 0 or int(np.count_nonzero(hazard_u8_bin)) == 0:
+            return self._z_f32
+
+        inv = cv2.bitwise_not(hazard_u8_bin)
+        dist = cv2.distanceTransform(inv, cv2.DIST_L2, 3)
+
+        tau = float(self.risk_tau_px) if tau_override is None else float(tau_override)
+        tau = max(1e-6, tau)
+        risk = np.exp(-dist / tau).astype(np.float32)
+
+        if self.risk_use_max_normalize:
+            mx = float(risk.max())
+            if mx > 1e-6:
+                risk *= (1.0 / mx)
+
+        if self.risk_clip_max is not None:
+            np.clip(risk, 0.0, float(self.risk_clip_max), out=risk)
+
+        return risk
+
+    # -------------------------
+    # debug
     # -------------------------
     def _ensure_obs_window(self):
         if self._obs_win_inited:
@@ -224,395 +405,163 @@ class ObsBuilder:
             pass
         self._obs_win_inited = True
 
-    # -------------------------
-    # playfield helpers
-    # -------------------------
-    def _crop_playfield(self, img_bgr: np.ndarray) -> np.ndarray:
-        # 안전하게 clamp
-        x0, x1 = int(self._playfield_x0), int(self._playfield_x1)
-        y0, y1 = int(self._playfield_y0), int(self._playfield_y1)
-        x0 = int(np.clip(x0, 0, img_bgr.shape[1] - 1))
-        x1 = int(np.clip(x1, x0 + 1, img_bgr.shape[1]))
-        y0 = int(np.clip(y0, 0, img_bgr.shape[0] - 1))
-        y1 = int(np.clip(y1, y0 + 1, img_bgr.shape[0]))
-        return img_bgr[y0:y1, x0:x1]
+    def _put_text(self, img, text: str, x=10, y=28):
+        fs = float(self.debug_font_scale)
+        th = int(self.debug_thickness)
+        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, fs, (0, 0, 0), th + 2, cv2.LINE_AA)
+        cv2.putText(img, text, (x, y), cv2.FONT_HERSHEY_SIMPLEX, fs, (255, 255, 255), th, cv2.LINE_AA)
 
-    def _full_xy_to_playfield_norm(self, cx_full: int, cy_full: int) -> Tuple[float, float]:
-        # full 좌표 -> playfield 좌표
-        x_pf = float(cx_full - self._playfield_x0)
-        y_pf = float(cy_full - self._playfield_y0)
-
-        x_n = float(np.clip(x_pf / max(1, self._pf_w - 1), 0.0, 1.0))
-        y_n = float(np.clip(y_pf / max(1, self._pf_h - 1), 0.0, 1.0))
-        return x_n, y_n
-
-    def _update_player_uv_small_from_full(self) -> None:
-        """
-        full-frame player_center를 playfield->small 좌표(u,v)로 변환.
-        """
-        try:
-            px, py = map(int, self.player_center)
-
-            x_pf = float(px - self._playfield_x0)
-            y_pf = float(py - self._playfield_y0)
-
-            u = int(round(x_pf * (self.obs_out_size - 1) / max(1, (self._pf_w - 1))))
-            v = int(round(y_pf * (self.obs_out_size - 1) / max(1, (self._pf_h - 1))))
-
-            u = int(np.clip(u, 0, self.obs_out_size - 1))
-            v = int(np.clip(v, 0, self.obs_out_size - 1))
-            self._last_player_uv_small = (u, v)
-        except Exception:
-            self._last_player_uv_small = (self.obs_out_size // 2, self.obs_out_size // 2)
-
-    # -------------------------
-    # meta pixels / marker
-    # -------------------------
-    def _inject_meta_pixels_ch0_only(self, ch0_01: np.ndarray) -> np.ndarray:
-        try:
-            x_n, y_n = self.last_xy_norm
-            c = float(self.last_conf)
-
-            x_n = float(np.clip(x_n, 0.0, 1.0))
-            y_n = float(np.clip(y_n, 0.0, 1.0))
-            c = float(np.clip(c, 0.0, 1.0))
-
-            p = int(self.meta_patch)
-            if p > 0 and ch0_01.shape[0] >= p and ch0_01.shape[1] >= p * 3:
-                ch0_01[0:p, 0:p] = x_n
-                ch0_01[0:p, p:2 * p] = y_n
-                ch0_01[0:p, 2 * p:3 * p] = c
-        except Exception:
-            pass
-        return ch0_01
-
-    def _stamp_player_marker_ch0(self, ch0_01: np.ndarray) -> None:
-        if not self.mark_player_on_ch0:
-            return
-        if ch0_01 is None or ch0_01.size == 0:
+    def _draw_debug_cross(self, vis_bgr: np.ndarray, up: int):
+        if not self.debug_draw_cross:
             return
 
-        s = int(ch0_01.shape[0])
-        if s <= 0:
-            return
+        u, v = self._uv
+        up = int(max(1, up))
+        x = int(u * up)
+        y = int(v * up)
 
-        cx, cy = self._last_player_uv_small
-        cx = int(np.clip(cx, 0, s - 1))
-        cy = int(np.clip(cy, 0, s - 1))
+        half = int(max(1, self.debug_cross_half)) * up
+        th_in = int(max(1, self.debug_cross_thickness))
+        th_out = int(max(th_in + 1, self.debug_cross_outer_thickness))
+        c_in = tuple(map(int, self.debug_cross_color))
+        c_out = tuple(map(int, self.debug_cross_outer_color))
 
-        r = int(self.marker_half)
-        if r <= 0:
-            return
+        h, w = vis_bgr.shape[:2]
+        x1, x2 = max(0, x - half), min(w - 1, x + half)
+        y1, y2 = max(0, y - half), min(h - 1, y + half)
 
-        v = float(self.marker_value)
-        if self.marker_use_conf:
-            c = float(np.clip(self.last_conf, 0.0, 1.0))
-            v *= max(float(self.marker_min_scale), c)
+        cv2.line(vis_bgr, (x1, y), (x2, y), c_out, th_out, cv2.LINE_AA)
+        cv2.line(vis_bgr, (x, y1), (x, y2), c_out, th_out, cv2.LINE_AA)
+        cv2.line(vis_bgr, (x1, y), (x2, y), c_in, th_in, cv2.LINE_AA)
+        cv2.line(vis_bgr, (x, y1), (x, y2), c_in, th_in, cv2.LINE_AA)
 
-        y1 = max(0, cy - r)
-        y2 = min(s, cy + r + 1)
-        x1 = max(0, cx - r)
-        x2 = min(s, cx + r + 1)
-
-        ch0_01[cy, x1:x2] = v
-        ch0_01[y1:y2, cx] = v
-
-    # -------------------------
-    # bullets / risk
-    # -------------------------
-    def _get_bullet_kernel(self):
-        k = int(self.bullet_close_morph)
-        if k <= 0:
-            return None
-        if self._bullet_kernel is not None and self._bullet_kernel_k == k:
-            return self._bullet_kernel
-        ksz = 2 * k + 1
-        self._bullet_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksz, ksz))
-        self._bullet_kernel_k = k
-        return self._bullet_kernel
-
-    def _compute_bullet_mask_u8_small(self, bgr_small: np.ndarray) -> np.ndarray:
-        hsv = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2HSV)
-        s = hsv[:, :, 1]
-        v = hsv[:, :, 2]
-        mask = (s >= int(self.bullet_hsv_s_min)) & (v >= int(self.bullet_hsv_v_min)) & (
-            v <= int(self.bullet_hsv_v_max)
-        )
-        mask_u8 = (mask.astype(np.uint8) * 255)
-
-        kernel = self._get_bullet_kernel()
-        if kernel is not None:
-            mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel, iterations=1)
-            mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-        return mask_u8
-
-    @staticmethod
-    def _mad_u8(x: np.ndarray):
-        med = float(np.median(x))
-        mad = float(np.median(np.abs(x.astype(np.float32) - med)))
-        return med, mad
-
-    def _compute_bullet_mask_u8_small_robust(self, bgr_small: np.ndarray, diff_small_u8: np.ndarray) -> np.ndarray:
-        if not self.enable_bullet_channels:
-            return self._zeros_small_u8
-
-        hsv_mask = self._compute_bullet_mask_u8_small(bgr_small)
-        if not self.use_motion_for_bullets:
-            return hsv_mask
-
-        med, mad = self._mad_u8(diff_small_u8)
-        thr = max(float(self.diff_bullet_min), med + float(self.diff_bullet_k_mad) * mad)
-        motion = (diff_small_u8.astype(np.float32) >= float(thr)).astype(np.uint8) * 255
-
-        comb = cv2.bitwise_or(hsv_mask, motion)
-        fill = float(np.mean(comb > 0))
-
-        # 포화 방지: motion이 화면을 덮으면 HSV로 fallback
-        if fill >= float(self.max_bullet_fill_ratio):
-            comb = hsv_mask
-
-        kernel = self._get_bullet_kernel()
-        if kernel is not None:
-            comb = cv2.morphologyEx(comb, cv2.MORPH_OPEN, kernel, iterations=1)
-            comb = cv2.morphologyEx(comb, cv2.MORPH_CLOSE, kernel, iterations=1)
-
-        return comb
-
-    def _maybe_invert_gray_small(self, gray_small_u8: np.ndarray) -> np.ndarray:
-        if not self.auto_invert_gray:
-            self._last_inverted = False
-            return gray_small_u8
-
-        m = float(np.mean(gray_small_u8, dtype=np.float32) / 255.0)
-        inv = bool(m >= float(self.invert_mean_thr))
-        self._last_inverted = inv
-        if inv:
-            return (255 - gray_small_u8)
-        return gray_small_u8
-
-    def _compute_risk_heat_small(self, bullet_mask_u8_small: np.ndarray) -> np.ndarray:
-        if bullet_mask_u8_small is None or bullet_mask_u8_small.size == 0:
-            return self._zeros_small_f32
-        if int(np.count_nonzero(bullet_mask_u8_small)) == 0:
-            return self._zeros_small_f32
-
-        inv = cv2.bitwise_not(bullet_mask_u8_small)  # 탄=0, 배경=255
-        dist = cv2.distanceTransform(inv, distanceType=cv2.DIST_L2, maskSize=3)
-
-        tau = max(1e-6, float(self.risk_tau_px))
-        risk = np.exp(-dist / tau).astype(np.float32)
-
-        # per-frame max normalize는 포화(=항상 1.00)를 쉽게 만든다.
-        if self.risk_use_max_normalize:
-            m = float(risk.max())
-            if m > 1e-6:
-                risk *= (1.0 / m)
-
-        if self.risk_clip_max is not None:
-            risk = np.clip(risk, 0.0, float(self.risk_clip_max), out=risk)
-
-        return risk
-
-    def _compute_local_risk_stats(self, risk_01: np.ndarray) -> None:
-        self.risk_local_valid = False
-        self.risk_local_mean = 0.0
-        self.risk_local_p90 = 0.0
-        self.risk_local_p99 = 0.0
-        self.risk_local_bg_frac = 0.0
-        self.risk_local_max = 0.0
-
-        if not self.local_risk_enable:
-            return
-        if risk_01 is None or risk_01.size == 0:
-            return
-
-        conf = float(self.last_conf)
-        if conf < float(self.local_risk_conf_thr):
-            return
-
-        s = int(risk_01.shape[0])
-        if s <= 0:
-            return
-
-        u, v = self._last_player_uv_small
-        u = int(np.clip(u, 0, s - 1))
-        v = int(np.clip(v, 0, s - 1))
-
-        r = int(self.local_risk_radius)
-        if r <= 0:
-            return
-
-        y1 = max(0, v - r)
-        y2 = min(s, v + r + 1)
-        x1 = max(0, u - r)
-        x2 = min(s, u + r + 1)
-
-        roi = risk_01[y1:y2, x1:x2]
-        if roi.size == 0:
-            return
-
-        rr_all = roi.astype(np.float32, copy=False).reshape(-1)
-        self.risk_local_max = float(np.max(rr_all))
-
-        if self.local_risk_exclude_saturated:
-            sat_thr = float(self.local_risk_sat_thr)
-            bg = rr_all[rr_all < sat_thr]
-        else:
-            bg = rr_all
-
-        if bg.size == 0:
-            return
-
-        self.risk_local_bg_frac = float(bg.size / rr_all.size)
-        if self.risk_local_bg_frac < float(self.local_risk_min_valid_bg_frac):
-            return
-
-        try:
-            self.risk_local_mean = float(np.mean(bg))
-            self.risk_local_p90 = float(np.quantile(bg, 0.90))
-            self.risk_local_p99 = float(np.quantile(bg, 0.99))
-            self.risk_local_valid = True
-        except Exception:
-            self.risk_local_valid = False
+        cv2.circle(vis_bgr, (x, y), max(1, up), c_out, thickness=-1, lineType=cv2.LINE_AA)
+        cv2.circle(vis_bgr, (x, y), max(1, up // 2), c_in, thickness=-1, lineType=cv2.LINE_AA)
 
     # -------------------------
     # main
     # -------------------------
     def make_state(self, img_bgr: np.ndarray) -> np.ndarray:
-        # 1) tracker step (full-frame)
+        # 1) tracker
         now = time.time()
-        if self._track_pause_active and now < float(self._track_pause_until):
+        if self._pause_active and now < float(self._pause_until):
             bbox, conf = None, 0.0
         else:
-            if self._track_pause_active and self._track_pause_resume_reset_pending:
+            if self._pause_active and self._pause_reset_pending:
                 try:
                     self.tracker.reset()
                 except Exception:
                     pass
-                self._track_pause_resume_reset_pending = False
-                self._track_pause_active = False
-
+                self._pause_reset_pending = False
+                self._pause_active = False
             bbox, conf = self.tracker.step(img_bgr)
 
         if bbox is not None:
-            self._last_bbox_full = bbox
             x, y, w, h = map(int, bbox)
-            cx = int(round(x + 0.5 * w))
-            cy = int(round(y + 0.5 * h))
+            cx, cy = int(round(x + 0.5 * w)), int(round(y + 0.5 * h))
             self.player_center = (cx, cy)
             self.last_conf = float(np.clip(conf, 0.0, 1.0))
-
-            # ✅ playfield 기준으로 정규화
-            self.last_xy_norm = self._full_xy_to_playfield_norm(cx, cy)
-
-            # ✅ marker uv도 playfield 기준으로 변환
-            self._update_player_uv_small_from_full()
+            self.last_xy_norm = self._xy_norm(cx, cy)
+            self._update_uv()
         else:
             self.last_conf = float(np.clip(conf, 0.0, 1.0))
-            # last_xy_norm / player_center는 마지막 유효값 유지
 
-        # 2) UI 제외 playfield crop -> small resize
-        pf = self._crop_playfield(img_bgr)
-        interp = cv2.INTER_AREA if max(pf.shape[0], pf.shape[1]) >= self.obs_out_size else cv2.INTER_LINEAR
-        bgr_small = cv2.resize(pf, (self.obs_out_size, self.obs_out_size), interpolation=interp)
+        # 2) crop -> small
+        pf = self._crop_pf(img_bgr)
+        interp = cv2.INTER_AREA if max(pf.shape[:2]) >= self.s else cv2.INTER_LINEAR
+        bgr = cv2.resize(pf, (self.s, self.s), interpolation=interp)
 
-        gray_small_u8 = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2GRAY)
+        # 3) gray
+        gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+        gray = self._maybe_invert(gray)
+        gray = self._maybe_clahe(gray)
 
-        # 3) auto invert
-        gray_small_u8 = self._maybe_invert_gray_small(gray_small_u8)
+        # 4) ch1 signed diff
+        ch1_map = self._signed_diff_map(gray, self._prev_gray) if self.signed_diff_enable else self._z_f32
 
-        if self._prev_gray_small_u8 is None or self._prev_gray_small_u8.shape != gray_small_u8.shape:
-            diff_small_u8 = self._zeros_small_u8
+        # hazard용 absdiff
+        if self._prev_gray is None or self._prev_gray.shape != gray.shape:
+            diff_u8 = self._z_u8
         else:
-            diff_small_u8 = cv2.absdiff(gray_small_u8, self._prev_gray_small_u8)
+            diff_u8 = cv2.absdiff(gray, self._prev_gray)
 
-        self._prev_gray_small_u8 = gray_small_u8.copy()
+        self._prev_gray = gray.copy()
 
-        # 4) bullet + risk (playfield 기준)
-        if self.enable_bullet_channels:
-            bullet_mask_u8 = self._compute_bullet_mask_u8_small_robust(bgr_small, diff_small_u8)
-            risk_01 = self._compute_risk_heat_small(bullet_mask_u8)
+        # 5) hazard (현재 프레임만) + (선택)근접 강조 + risk
+        if self.enable_hazard:
+            hazard_u8 = self._motion_mask(diff_u8)  # 0/255
+            ch2_map = (hazard_u8 > 0).astype(np.float32)  # 0/1
         else:
-            bullet_mask_u8 = self._zeros_small_u8
-            risk_01 = self._zeros_small_f32
+            ch2_map = self._z_f32
 
-        self.bullet_candidate_mask = (bullet_mask_u8 > 0).astype(np.uint8)  # 0/1
-        self.risk_heatmap = risk_01.astype(np.float32)
+        # (선택) EMA - 잔상과 달리 "평균화"라 더 짧게 남지만, 기본 off
+        if self.hazard_ema_enable:
+            if self._hazard_ema is None or self._hazard_ema.shape != ch2_map.shape:
+                self._hazard_ema = ch2_map.copy()
+            else:
+                a = float(np.clip(self.hazard_ema_alpha, 0.0, 0.999))
+                self._hazard_ema = a * self._hazard_ema + (1.0 - a) * ch2_map
+            ch2_map = np.clip(self._hazard_ema, 0.0, 1.0)
 
-        # 5) local risk stats
-        self._compute_local_risk_stats(self.risk_heatmap)
+        # proximity boost (multiply, then clip)
+        if self.hazard_proximity_boost_enable and float(self.hazard_proximity_w) > 0.0:
+            xx, yy = self._get_grid()
+            u, v = self._uv
+            du = xx - float(u)
+            dv = yy - float(v)
+            dist = np.sqrt(du * du + dv * dv)
+            tau = float(max(1e-6, self.hazard_proximity_tau))
+            w = float(max(0.0, self.hazard_proximity_w))
+            boost = 1.0 + w * np.exp(-dist / tau)
+            ch2_map = np.clip(ch2_map * boost, 0.0, 1.0)
 
-        # 6) obs assemble
-        self._obs_buf[0, :, :] = gray_small_u8.astype(np.float32) * (1.0 / 255.0)
-        self._stamp_player_marker_ch0(self._obs_buf[0])
+        # hazard bin for risk
+        hazard_for_risk_u8 = (ch2_map >= float(self.hazard_bin_thr_for_risk)).astype(np.uint8) * 255
+        self.hazard_bin = (hazard_for_risk_u8 > 0).astype(np.uint8)
+        self.hazard_global_fill = float(np.mean(self.hazard_bin > 0)) if self.hazard_bin.size else 0.0
 
-        if diff_small_u8 is self._zeros_small_u8:
-            self._obs_buf[1, :, :] = 0.0
-        else:
-            self._obs_buf[1, :, :] = diff_small_u8.astype(np.float32) * (1.0 / 255.0)
+        tau_eff = self._dynamic_tau(self.hazard_global_fill)
+        risk = self._risk(hazard_for_risk_u8, tau_override=tau_eff) if self.enable_hazard else self._z_f32
+        self.risk_heatmap = risk.astype(np.float32, copy=False)
 
-        if bullet_mask_u8 is self._zeros_small_u8:
-            self._obs_buf[2, :, :] = 0.0
-        else:
-            self._obs_buf[2, :, :] = bullet_mask_u8.astype(np.float32) * (1.0 / 255.0)
+        # 6) assemble obs
+        self._obs[0] = gray.astype(np.float32) * (1.0 / 255.0)
+        self._stamp_marker(self._obs[0])
+        self._inject_meta(self._obs[0])
 
-        if risk_01 is self._zeros_small_f32:
-            self._obs_buf[3, :, :] = 0.0
-        else:
-            self._obs_buf[3, :, :] = risk_01
+        self._obs[1] = ch1_map.astype(np.float32, copy=False)
+        self._obs[2] = ch2_map.astype(np.float32, copy=False)
+        self._obs[3] = self.risk_heatmap
 
-        self._inject_meta_pixels_ch0_only(self._obs_buf[0])
-
-        obs4 = self._obs_buf
-
-        # ---- debug windows (playfield만 시각화) ----
+        # debug (minimal)
         if self.show_obs_debug:
             try:
                 self._ensure_obs_window()
-
                 ch = int(np.clip(self.obs_debug_channel, 0, 3))
-                vis = (np.clip(obs4[ch], 0.0, 1.0) * 255.0).astype(np.uint8)
+                vis = (np.clip(self._obs[ch], 0.0, 1.0) * 255.0).astype(np.uint8)
                 vis = cv2.cvtColor(vis, cv2.COLOR_GRAY2BGR)
 
                 up = int(max(1, self.debug_upscale))
                 if up != 1:
                     vis = cv2.resize(vis, (vis.shape[1] * up, vis.shape[0] * up), interpolation=cv2.INTER_NEAREST)
 
-                px, py = self.player_center
-                xn, yn = self.last_xy_norm
+                self._draw_debug_cross(vis, up)
 
-                line1 = f"ch{ch} conf={self.last_conf:.2f} px=({int(px)},{int(py)}) n=({xn:.3f},{yn:.3f})"
-                if self.risk_local_valid:
-                    line2 = f"Lp90={self.risk_local_p90:.2f} Lp99={self.risk_local_p99:.2f} bg={self.risk_local_bg_frac:.2f}"
-                else:
-                    line2 = f"L=NA bg={self.risk_local_bg_frac:.2f}"
-
-                font_scale = float(self.debug_font_scale)
-                thickness = int(self.debug_thickness)
-
-                def put_text_outline(img, text, org):
-                    cv2.putText(
-                        img, text, org, cv2.FONT_HERSHEY_SIMPLEX,
-                        font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA
-                    )
-                    cv2.putText(
-                        img, text, org, cv2.FONT_HERSHEY_SIMPLEX,
-                        font_scale, (255, 255, 255), thickness, cv2.LINE_AA
-                    )
-
-                y0 = 24
-                put_text_outline(vis, line1, (10, y0))
-                put_text_outline(vis, line2, (10, y0 + 28))
-
+                u, v = self._uv
+                self._put_text(
+                    vis,
+                    f"ch{ch} conf={self.last_conf:.2f} uv=({u},{v}) fill={self.hazard_global_fill:.3f} tau={tau_eff:.2f}",
+                    x=10,
+                    y=28,
+                )
                 cv2.imshow(self.win_crop, vis)
             except Exception:
                 pass
 
-        if self.show_reimu_debug and (self.reimu_dbg_view is not None):
+        if self.show_reimu_debug and self.reimu_dbg_view is not None:
             try:
                 self.reimu_dbg_view.render(img_bgr)
             except Exception as e:
                 print("[reimu_dbg_view.render ERROR]", repr(e))
 
-        return obs4.copy()
+        return self._obs.copy()
