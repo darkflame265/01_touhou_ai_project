@@ -17,6 +17,7 @@ class RewardConfig:
     use_position_shaping: bool = True
 
     # y bad zone
+    # y_n < y_floor 이면 "위쪽"으로 보고 패널티 (즉, 아래쪽에 머물게 유도)
     y_floor: float = 0.60
     y_zone_enter_pen: float = 1.5
     y_zone_stay_pen_k: float = 0.08
@@ -27,6 +28,13 @@ class RewardConfig:
     top_pen_k: float = 0.020
     right_pen_k: float = 0.010
     corner_bonus_pen: float = 0.015
+
+    # ✅ risk shaping (obs.risk_heatmap 기반)
+    use_risk_shaping: bool = True
+    # 평균 risk(0..1)에 비례해서 깎음. alive_reward=0.03이면 0.02~0.06 근처로 시작 추천
+    risk_mean_pen_k: float = 0.03
+    # risk_mean이 너무 커질 때 폭주 방지용 클립
+    risk_clip_max: float = 0.35
 
     # "UI=0 이후 다음 죽음에서 종료"
     death_fx_reset_cooldown: float = 0.25
@@ -41,6 +49,7 @@ class RewardEngine:
       - step() 루프에서
           reward = engine.alive_reward
           reward += engine.position_penalties(x_n, y_n, conf)
+          reward += engine.risk_penalty(risk_mean)   # ✅ 추가 (원할 때만)
           term = engine.on_death_fx(gameover_fx, now, reset_tracker_cb)
           ui_term_or_hit = engine.on_ui_lives(ui_now, now, reset_tracker_cb)
       - (추가) 기존 danger postprocess는 그대로 engine.postprocess() 호출
@@ -57,6 +66,7 @@ class RewardEngine:
         self._in_y_bad_zone = False
         self._last_y_pen = 0.0
         self._last_pos_pen = 0.0
+        self._last_risk_pen = 0.0
 
         self._last_death_fx_reset_t = 0.0
 
@@ -87,6 +97,10 @@ class RewardEngine:
     def last_pos_pen(self) -> float:
         return float(self._last_pos_pen)
 
+    @property
+    def last_risk_pen(self) -> float:
+        return float(self._last_risk_pen)
+
     # -------------------------
     # lifecycle
     # -------------------------
@@ -97,6 +111,7 @@ class RewardEngine:
         self._in_y_bad_zone = False
         self._last_y_pen = 0.0
         self._last_pos_pen = 0.0
+        self._last_risk_pen = 0.0
 
         self._last_death_fx_reset_t = 0.0
 
@@ -157,6 +172,30 @@ class RewardEngine:
         # conf는 현재는 미사용(나중에 conf 낮으면 shaping 약화 같은 확장용)
         _ = float(conf)
         return float(self._y_zone_penalty(y_n) + self._position_shaping_penalty(x_n, y_n))
+
+    # -------------------------
+    # ✅ risk shaping
+    # -------------------------
+    def risk_penalty(self, risk_mean_01: float) -> float:
+        """
+        obs.risk_heatmap의 평균(0..1)을 받아서 위험할수록 보상을 깎는다.
+        - 너무 큰 값은 clip 해서 학습 폭주 방지
+        """
+        if not bool(getattr(self.cfg, "use_risk_shaping", True)):
+            self._last_risk_pen = 0.0
+            return 0.0
+
+        r = float(risk_mean_01)
+        if r < 0.0:
+            r = 0.0
+        clip_max = float(getattr(self.cfg, "risk_clip_max", 1.0))
+        if r > clip_max:
+            r = clip_max
+
+        k = float(getattr(self.cfg, "risk_mean_pen_k", 0.0))
+        pen = -k * r
+        self._last_risk_pen = float(pen)
+        return float(pen)
 
     # -------------------------
     # UI lives handling

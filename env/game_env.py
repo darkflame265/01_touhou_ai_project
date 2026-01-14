@@ -1,5 +1,7 @@
 # env/game_env.py
 import time
+import numpy as np
+
 
 from env.screen import Screen
 from env.controller import release_all, set_attack_hold, set_always_slow
@@ -318,19 +320,28 @@ class GameEnv:
             state = self.obs.make_state(img)
             state_chw = self.packer.as_chw(state)
 
-            # remask / key update
-            r1 = self.act.remask_if_needed(masked_idx, img)
-            masked_idx = int(r1.masked_idx)
-
-            # base reward
+            # base reward (먼저 정의!)
             reward = float(self.reward_engine.alive_reward)
             now = time.time()
+
+            # ✅ risk_heatmap shaping: 위험할수록 reward 조금 깎기
+            risk = getattr(self.obs, "risk_heatmap", None)
+            if risk is not None:
+                try:
+                    risk_mean = float(np.mean(risk, dtype=np.float32))
+                    reward += float(self.reward_engine.risk_penalty(risk_mean))
+                except Exception:
+                    pass
 
             # position penalties
             x_n, y_n = getattr(self.obs, "last_xy_norm", (None, None))
             if x_n is not None and y_n is not None:
                 conf = float(getattr(self.obs, "last_conf", 0.0))
                 reward += float(self.reward_engine.position_penalties(float(x_n), float(y_n), conf))
+
+            # remask / key update  (이건 reward와 무관하니 위/아래 어디든 OK)
+            r1 = self.act.remask_if_needed(masked_idx, img)
+            masked_idx = int(r1.masked_idx)
 
             # death FX
             _, gameover_fx = self.screen.detect_death(img, gray=g)

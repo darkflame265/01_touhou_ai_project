@@ -308,6 +308,10 @@ class ObsBuilder:
             bullet_mask_u8 = self._zeros_small_u8
             risk_01 = self._zeros_small_f32
 
+        # (추가) 외부(ActionMasker/Reward shaping)가 참조할 수 있게 속성으로 노출
+        self.bullet_candidate_mask = (bullet_mask_u8 > 0).astype(np.uint8)   # 0/1
+        self.risk_heatmap = risk_01.astype(np.float32)
+
         # 5) float32 채널 구성 (0..1)
         self._obs_buf[0, :, :] = gray_small_u8.astype(np.float32) * (1.0 / 255.0)
 
