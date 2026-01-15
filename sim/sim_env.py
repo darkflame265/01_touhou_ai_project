@@ -7,12 +7,19 @@ from typing import Dict, Tuple, Optional, List, Any
 import numpy as np
 import cv2
 
-
 # ---- Action compatibility layer (prefer project actions) ----
 try:
     from env.actions import ACTIONS as PROJECT_ACTIONS
 except Exception:
     PROJECT_ACTIONS = None
+
+
+# -----------------------------
+# STOP action placeholder
+# -----------------------------
+@dataclass(frozen=True)
+class _StopAction:
+    name: str = "STOP"
 
 
 # -----------------------------
@@ -68,13 +75,14 @@ class SimConfig:
     seed: int = 0
 
     # render (debug)
+    # ※ 실제 ON/OFF는 runner의 --no-render에서 cfg.render를 꺼주는 구조를 권장
     render: bool = True
     render_upscale: int = 2
     render_wait: int = 1
     render_window: str = "SIM"
 
     # -----------------------------
-    # ✅ episode-wise speed randomization (sim2real robustness)
+    # episode-wise speed randomization (sim2real robustness)
     # -----------------------------
     speed_randomize: bool = True
 
@@ -86,7 +94,7 @@ class SimConfig:
     bullet_speed_scale_min: float = 0.80
     bullet_speed_scale_max: float = 1.25
 
-    # optional: keep sampled values fixed for N episodes (0 = every episode)
+    # keep sampled values fixed for N episodes (1 = every episode)
     speed_resample_every_episodes: int = 1
 
 
@@ -101,7 +109,7 @@ class PatternEmitter:
         self.hold_left = 0
 
     def reset(self, hold_steps: int):
-        # ✅ 너가 선택한 2패턴만
+        # ✅ 2패턴만
         self.pattern_id = int(self.rng.integers(0, 2))  # {0,1}
         self.phase = float(self.rng.uniform(0, 2 * np.pi))
         self.hold_left = int(hold_steps)
@@ -126,7 +134,7 @@ class PatternEmitter:
         if (t % max(1, base_rate)) != 0:
             return
 
-        # ✅ episode-wise bullet speed scale
+        # episode-wise bullet speed scale
         spd_scale = float(getattr(env, "_bullet_speed_scale_ep", 1.0))
 
         if pid == 0:
@@ -138,7 +146,6 @@ class PatternEmitter:
                 ang = a0 + 2 * np.pi * (k / n)
                 env._spawn_bullet_xyv(bx, by, spd * np.cos(ang), spd * np.sin(ang))
             self.phase += 0.08
-
         else:
             # rotating ring
             n = base_n + 6
@@ -165,6 +172,7 @@ class SimEnv:
         self.cfg = cfg or SimConfig()
         self.rng = np.random.default_rng(self.cfg.seed)
 
+        # ✅ actions: 8-dir + STOP = 9
         self._actions = self._build_actions()
 
         # playfield
@@ -177,7 +185,7 @@ class SimEnv:
         self._pw = self._x1 - self._x0
         self._ph = self._y1 - self._y0
 
-        # meta/marker (same behavior)
+        # meta/marker
         self.meta_patch = 4
         self.mark_player_on_ch0 = True
         self.marker_half = 2
@@ -216,14 +224,17 @@ class SimEnv:
         self._z_u8 = np.zeros((self.s, self.s), np.uint8)
         self._obs = np.empty((4, self.s, self.s), np.float32)
 
+        # ✅ A방법: world는 GRAY로 직접 그린다 (BGR 제거)
+        self._world_gray = np.zeros((self.H, self.W), np.uint8)
+
         # emitter
         self.emitter = PatternEmitter(self.rng)
 
-        # background
-        self._bg0 = None
+        # background (uint8 gray)
+        self._bg0: Optional[np.ndarray] = None
         self._bg_phase = float(self.rng.uniform(0, 2 * np.pi))
 
-        # ✅ episode-wise randomized speeds (stored here)
+        # episode-wise randomized speeds
         self._player_speed_ep = float(self.cfg.player_speed)
         self._bullet_speed_scale_ep = 1.0
 
@@ -238,7 +249,7 @@ class SimEnv:
         self.player_xy[:] = (self.W * 0.5, self.H * 0.80)
         self._clear_bullets()
 
-        # ✅ sample episode speeds (domain randomization)
+        # sample episode speeds
         self._maybe_resample_episode_speeds()
 
         self._set_boss_xy()
@@ -308,7 +319,6 @@ class SimEnv:
             "hit": bool(hit),
             "dmin": float(dmin) if np.isfinite(dmin) else 1e9,
             "pattern": int(self.emitter.pattern_id),
-            # ✅ expose sampled speeds (debug / logging)
             "player_speed_ep": float(self._player_speed_ep),
             "bullet_speed_scale_ep": float(self._bullet_speed_scale_ep),
         }
@@ -395,11 +405,12 @@ class SimEnv:
 
     # ---------- obs ----------
     def _build_obs(self) -> np.ndarray:
-        img_bgr = self._render_world_bgr()
+        # world gray
+        world_gray_u8 = self._render_world_gray_u8()
 
         # optional debug render (world)
         if self.cfg.render:
-            vis = img_bgr.copy()
+            vis = cv2.cvtColor(world_gray_u8, cv2.COLOR_GRAY2BGR)
             up = max(1, int(self.cfg.render_upscale))
             if up != 1:
                 vis = cv2.resize(
@@ -407,36 +418,19 @@ class SimEnv:
                     (vis.shape[1] * up, vis.shape[0] * up),
                     interpolation=cv2.INTER_NEAREST,
                 )
-            # speed overlay
-            cv2.putText(
-                vis,
-                f"ep{self.episode} pspd={self._player_speed_ep:.2f} bmul={self._bullet_speed_scale_ep:.2f}",
-                (10, 22),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (255, 255, 255),
-                2,
-                cv2.LINE_AA,
-            )
-            cv2.putText(
-                vis,
-                f"ep{self.episode} pspd={self._player_speed_ep:.2f} bmul={self._bullet_speed_scale_ep:.2f}",
-                (10, 22),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 0, 0),
-                1,
-                cv2.LINE_AA,
-            )
+
+            txt = f"ep{self.episode} pspd={self._player_speed_ep:.2f} bmul={self._bullet_speed_scale_ep:.2f}"
+            cv2.putText(vis, txt, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(vis, txt, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+
             cv2.imshow(self.cfg.render_window, vis)
             cv2.waitKey(int(self.cfg.render_wait))
 
-        pf = img_bgr[self._y0:self._y1, self._x0:self._x1]
+        pf = world_gray_u8[self._y0:self._y1, self._x0:self._x1]
         interp = cv2.INTER_AREA if max(pf.shape[:2]) >= self.s else cv2.INTER_LINEAR
-        bgr_small = cv2.resize(pf, (self.s, self.s), interpolation=interp)
+        gray_u8 = cv2.resize(pf, (self.s, self.s), interpolation=interp)
 
-        gray_u8 = cv2.cvtColor(bgr_small, cv2.COLOR_BGR2GRAY)
-
+        # prev/diff
         if self._prev_gray_u8 is None or self._prev_gray_u8.shape != gray_u8.shape:
             prev_u8 = self._z_u8
             diff_u8 = self._z_u8
@@ -446,6 +440,7 @@ class SimEnv:
 
         hint = self._player_hint_map()
 
+        # assemble (float32 0..1)
         self._obs[0] = gray_u8.astype(np.float32) * (1.0 / 255.0)
         self._stamp_marker(self._obs[0])
         self._inject_meta(self._obs[0])
@@ -469,36 +464,38 @@ class SimEnv:
         base = base / denom
         self._bg0 = (base * float(self.cfg.bg_noise_amp)).astype(np.uint8)
 
-    def _render_world_bgr(self) -> np.ndarray:
-        img = np.zeros((self.H, self.W, 3), dtype=np.uint8)
+    def _render_world_gray_u8(self) -> np.ndarray:
+        img = self._world_gray
+        img.fill(0)
 
+        # background
         if self._bg0 is not None:
             flick = float(self.cfg.bg_flicker_amp) * (0.5 + 0.5 * np.sin(0.03 * self.t + self._bg_phase))
             bg = self._bg0.astype(np.float32) + flick
-            bg = np.clip(bg, 0, 255).astype(np.uint8)
-            img[..., 0] = bg
-            img[..., 1] = bg
-            img[..., 2] = bg
+            np.clip(bg, 0, 255, out=bg)
+            img[:] = bg.astype(np.uint8)
 
-        cv2.circle(img, (int(self.boss_xy[0]), int(self.boss_xy[1])), 5, (60, 60, 60), -1, lineType=cv2.LINE_AA)
+        # boss (faint)
+        cv2.circle(img, (int(self.boss_xy[0]), int(self.boss_xy[1])), 5, 60, -1, lineType=cv2.LINE_AA)
 
+        # bullets
         n = int(self._b_n)
         if n > 0:
             pos = self._b_pos[:n]
             alive = self._b_alive[:n]
             for x, y in pos[alive]:
                 c = int(120 + 60 * self.rng.uniform(0.0, 1.0))
-                cv2.circle(img, (int(x), int(y)), int(self.cfg.bullet_radius), (c, c, c), -1, lineType=cv2.LINE_AA)
+                cv2.circle(img, (int(x), int(y)), int(self.cfg.bullet_radius), c, -1, lineType=cv2.LINE_AA)
 
+        # player
         cv2.circle(
             img,
             (int(self.player_xy[0]), int(self.player_xy[1])),
             int(self.cfg.player_radius),
-            (220, 220, 220),
+            220,
             -1,
             lineType=cv2.LINE_AA,
         )
-
         return img
 
     # ---------- boss ----------
@@ -583,46 +580,59 @@ class SimEnv:
 
     # ---------- actions ----------
     def _build_actions(self) -> List[Any]:
+        """
+        ✅ 9 actions: 8-dir + STOP
+        - 프로젝트 ACTIONS가 있어도 STOP은 우리가 추가(이름이 STOP으로 찍히게)
+        """
+        # base 8 moves
         if PROJECT_ACTIONS is None:
-            return list(range(8))
+            moves8: List[Any] = list(range(8))
+        else:
+            want = [
+                "SLOW_LEFT",
+                "SLOW_RIGHT",
+                "SLOW_UP",
+                "SLOW_DOWN",
+                "SLOW_UP_LEFT",
+                "SLOW_UP_RIGHT",
+                "SLOW_DOWN_LEFT",
+                "SLOW_DOWN_RIGHT",
+            ]
+            by_name = {getattr(a, "name", ""): a for a in PROJECT_ACTIONS}
+            picked = [by_name[n] for n in want if n in by_name]
+            if len(picked) == 8:
+                moves8 = picked
+            else:
+                tmp = []
+                for a in PROJECT_ACTIONS:
+                    name = getattr(a, "name", str(a)).upper()
+                    if "BOMB" in name:
+                        continue
+                    tmp.append(a)
+                moves8 = tmp[:8] if len(tmp) >= 8 else list(range(8))
 
-        want = [
-            "SLOW_LEFT",
-            "SLOW_RIGHT",
-            "SLOW_UP",
-            "SLOW_DOWN",
-            "SLOW_UP_LEFT",
-            "SLOW_UP_RIGHT",
-            "SLOW_DOWN_LEFT",
-            "SLOW_DOWN_RIGHT",
-        ]
-        by_name = {getattr(a, "name", ""): a for a in PROJECT_ACTIONS}
-        picked = [by_name[n] for n in want if n in by_name]
-        if len(picked) == 8:
-            return picked
-
-        moves = []
-        for a in PROJECT_ACTIONS:
-            name = getattr(a, "name", str(a)).upper()
-            if "BOMB" in name:
-                continue
-            moves.append(a)
-        if len(moves) >= 8:
-            return moves[:8]
-        return list(range(8))
+        # append STOP as 9th
+        return list(moves8) + [_StopAction()]
 
     def _action_to_delta(self, action_idx: Any) -> Tuple[float, float]:
-        # ✅ episode-wise randomized player speed
+        # episode-wise randomized player speed
         spd = float(getattr(self, "_player_speed_ep", self.cfg.player_speed))
 
+        # accept: int index, or Action-like object
         if isinstance(action_idx, (int, np.integer)):
-            i = int(action_idx) % 8
-            act = self._actions[i] if len(self._actions) >= 8 else i
+            i = int(action_idx) % len(self._actions)  # ✅ 9 actions
+            act = self._actions[i]
         else:
             act = action_idx
 
         name = getattr(act, "name", "")
         n = name.upper()
+
+        # ✅ STOP action
+        if n == "STOP":
+            self.last_conf = 1.0
+            self._update_last_xy_norm_and_uv()
+            return 0.0, 0.0
 
         dx, dy = 0.0, 0.0
         if "UP" in n:
@@ -634,6 +644,7 @@ class SimEnv:
         if "RIGHT" in n:
             dx += spd
 
+        # fallback for int-only (0..7)
         if name == "" and isinstance(act, (int, np.integer)):
             mapping = {
                 0: (-spd, 0.0),
