@@ -13,6 +13,33 @@ except Exception:  # pragma: no cover
     ActionMasker = object  # type: ignore
 
 
+# 이동 관련 키만 안전하게 해제하기 위한 고정 목록
+_MOVE_KEYS = ("LEFT", "RIGHT", "UP", "DOWN")
+
+
+def _release_move_keys_safely() -> None:
+    """
+    프로젝트 컨트롤러가 release_keys()를 제공하면 그걸 쓰고,
+    없으면 최후수단으로 release_all()로 폴백.
+    """
+    try:
+        # lazy import: 컨트롤러에 release_keys가 있을 수도/없을 수도 있으니 런타임 확인
+        from env import controller as _ctl  # type: ignore
+
+        rel = getattr(_ctl, "release_keys", None)
+        if callable(rel):
+            rel(list(_MOVE_KEYS))
+            return
+    except Exception:
+        pass
+
+    # release_keys가 없으면 최후수단
+    try:
+        release_all()
+    except Exception:
+        pass
+
+
 @dataclass
 class ActionExecResult:
     masked_idx: int
@@ -94,6 +121,16 @@ class ActionExecutor:
 
         return False
 
+    def _is_stop_action(self, action_enum) -> bool:
+        """
+        STOP 판별:
+        - value가 비어있으면 STOP(이동키 입력 없음)으로 간주
+        """
+        try:
+            return len(list(action_enum.value)) == 0
+        except Exception:
+            return False
+
     def _apply_inputs_frozen_once(self, until_ts: float) -> None:
         """
         폭탄 락 동안: 이동 입력을 완전 정지.
@@ -101,6 +138,8 @@ class ActionExecutor:
         """
         self._freeze_active = True
         self._freeze_until = float(until_ts)
+
+        # 폭탄 락은 "완전 정지"가 목적이므로 여기서는 기존대로 release_all 사용
         try:
             release_all()
         except Exception:
@@ -113,7 +152,7 @@ class ActionExecutor:
     def _maybe_clear_freeze_flag(self, now: float) -> None:
         """
         락이 끝났으면 내부 플래그만 해제.
-        (키 입력은 다음 begin()에서 정상 액션으로 갱신됨)
+        (키 입력은 다음 begin()/remask에서 정상 액션으로 갱신됨)
         """
         if self._freeze_active and now >= self._freeze_until:
             self._freeze_active = False
@@ -156,6 +195,8 @@ class ActionExecutor:
                 self.s.exec_action_idx = int(fb)
                 self.s.exec_was_masked = True
                 self.masked_count += 1
+
+                # 이동만 갱신하면 충분하지만, 기존 동작 유지(안전)
                 release_all()
                 press_keys(ACTIONS[int(fb)].value)
                 return ActionExecResult(masked_idx=int(fb), was_masked=True)
@@ -167,6 +208,7 @@ class ActionExecutor:
                 self.s.exec_action_idx = int(fb)
                 self.s.exec_was_masked = True
                 self.masked_count += 1
+
                 release_all()
                 press_keys(ACTIONS[int(fb)].value)
                 return ActionExecResult(masked_idx=int(fb), was_masked=True)
@@ -191,8 +233,17 @@ class ActionExecutor:
             self._apply_inputs_frozen_once(self.s.bomb_lock_until)
             return ActionExecResult(masked_idx=int(masked_idx), was_masked=bool(was_masked))
 
-        # 일반 액션
-        release_all()
+        # ✅ STOP 처리: 이동키만 확실히 해제 (SHIFT/공격 홀드까지 풀 필요 없음)
+        if self._is_stop_action(action_enum):
+            _release_move_keys_safely()
+            try:
+                press_keys([])  # 컨트롤러 구현에 따라 no-op일 수도 있으니 같이 호출
+            except Exception:
+                pass
+            return ActionExecResult(masked_idx=int(masked_idx), was_masked=bool(was_masked))
+
+        # 일반 이동 액션: 이동키만 갱신 (release_all()로 홀드 키까지 풀지 않기)
+        _release_move_keys_safely()
         press_keys(action_enum.value)
         return ActionExecResult(masked_idx=int(masked_idx), was_masked=bool(was_masked))
 
@@ -217,7 +268,30 @@ class ActionExecutor:
         changed = (int(new_idx) != int(cur_masked_idx))
         if changed:
             action_enum = ACTIONS[int(new_idx)]
-            release_all()
+
+            # 폭탄이면 기존 방식 유지
+            if self._is_bomb_action(action_enum):
+                release_all()
+                press_keys(action_enum.value)
+                self.s.exec_action_idx = int(new_idx)
+                self.s.exec_was_masked = True
+                self.masked_count += 1
+                return ActionExecResult(masked_idx=int(new_idx), was_masked=True)
+
+            # STOP이면 이동키만 해제
+            if self._is_stop_action(action_enum):
+                _release_move_keys_safely()
+                try:
+                    press_keys([])
+                except Exception:
+                    pass
+                self.s.exec_action_idx = int(new_idx)
+                self.s.exec_was_masked = True
+                self.masked_count += 1
+                return ActionExecResult(masked_idx=int(new_idx), was_masked=True)
+
+            # 일반 이동: 이동키만 갱신
+            _release_move_keys_safely()
             press_keys(action_enum.value)
             self.s.exec_action_idx = int(new_idx)
             self.s.exec_was_masked = True

@@ -8,7 +8,6 @@ from collections import Counter, deque
 
 import cv2
 import numpy as np
-import platform
 import torch
 import subprocess
 
@@ -123,6 +122,17 @@ def _find_bomb_index() -> int | None:
     return None
 
 
+def _find_stop_index() -> int | None:
+    for i, a in enumerate(ACTIONS):
+        if getattr(a, "name", "") == "SLOW_STOP":
+            return i
+    return None
+
+
+def _find_stop_name() -> str | None:
+    return "SLOW_STOP" if _find_stop_index() is not None else None
+
+
 def _build_action_mask_from_img(env: GameEnv, img: np.ndarray | None) -> np.ndarray:
     """
     GameEnv용 마스크:
@@ -155,12 +165,17 @@ def _build_action_mask_from_img(env: GameEnv, img: np.ndarray | None) -> np.ndar
 def _build_action_mask_for_sim() -> np.ndarray:
     """
     SimEnv용 마스크:
-    - "8방향 이동만 허용"
-    - ACTIONS가 더 많아도 첫 8개만 True, 나머지 False
+    - ✅ 8방향 이동 + SLOW_STOP 허용
+    - ❌ BOMB는 항상 금지
     """
     mask = np.zeros((len(ACTIONS),), dtype=np.bool_)
+
     n = min(8, len(ACTIONS))
     mask[:n] = True
+
+    sidx = _find_stop_index()
+    if sidx is not None:
+        mask[int(sidx)] = True
 
     bidx = _find_bomb_index()
     if bidx is not None:
@@ -168,9 +183,79 @@ def _build_action_mask_for_sim() -> np.ndarray:
 
     if not bool(mask.any()):
         mask[:n] = True
+        if sidx is not None:
+            mask[int(sidx)] = True
         if bidx is not None:
             mask[int(bidx)] = False
+
     return mask
+
+
+def _clamp_action_idx(i: int) -> int:
+    try:
+        x = int(i)
+    except Exception:
+        return 0
+    if x < 0:
+        return 0
+    if x >= len(ACTIONS):
+        return len(ACTIONS) - 1
+    return x
+
+
+def _agent_set_eval_mode(agent) -> None:
+    """
+    PPOAgent 내부가 torch 모듈을 들고 있으면 eval()로 전환.
+    (드롭아웃/배치정규화 등이 있으면 eval에서 안정적)
+    """
+    for attr in ("actor_critic", "net", "model", "policy", "policy_net"):
+        m = getattr(agent, attr, None)
+        if m is not None and hasattr(m, "eval"):
+            try:
+                m.eval()
+            except Exception:
+                pass
+
+
+def _select_action_best_effort(agent, state, action_mask: np.ndarray | None):
+    """
+    ✅ eval에서 '최고 퍼포먼스'를 보기 위한 deterministic 선택.
+    agent 구현이 제각각일 수 있어, 가능한 경로를 순서대로 시도한다.
+
+    반환: (action_idx, log_prob, value)
+    - log_prob/value는 eval 출력용이 아니라서 없으면 0.0으로 둠.
+    """
+    # 1) select_action에 deterministic 인자가 있는 경우
+    try:
+        return agent.select_action(state, action_mask=action_mask, deterministic=True)
+    except TypeError:
+        pass
+    except Exception:
+        pass
+
+    # 2) act_deterministic 류가 있는 경우
+    for name in ("select_action_deterministic", "act_deterministic", "select_action_eval"):
+        fn = getattr(agent, name, None)
+        if callable(fn):
+            try:
+                out = fn(state, action_mask=action_mask)
+                # out이 action만 주는 경우 대응
+                if isinstance(out, (int, np.integer)):
+                    return int(out), 0.0, 0.0
+                if isinstance(out, (tuple, list)) and len(out) >= 1:
+                    a = out[0]
+                    lp = out[1] if len(out) > 1 else 0.0
+                    v = out[2] if len(out) > 2 else 0.0
+                    return int(a), lp, v
+            except Exception:
+                pass
+
+    # 3) 최후: 그냥 기존 select_action(확률 샘플) 사용
+    #    (eval이라도 최악의 경우 실행은 되게)
+    try:
+        return agent.select_action(state, action_mask=action_mask)
+    except Exception:
+        return 0, 0.0, 0.0
 
 
 # ----------------------------
@@ -209,28 +294,19 @@ class _SimFrameStacker:
 # ----------------------------
 def _load_agent_and_env(ckpt_path: str, no_render: bool, use_sim: bool):
     if use_sim:
-        # ✅ SimConfig 기본 render=True는 유지
         cfg = SimConfig(seed=0)
-
-        # ✅ CLI가 최종 결정: --no-render면 cfg.render만 꺼준다
         if no_render:
             cfg.render = False
-
         env = SimEnv(cfg)
-
-        # sim은 GameEnv처럼 env.obs/env.s가 없으니 여기서 고정
         obs_channels = 4
         stack_size = 4
-
     else:
         env = GameEnv(screen_mode="low")
         if no_render:
             apply_no_render(env)
-
         obs_channels = int(getattr(env.obs, "obs_channels", 1))
         stack_size = int(getattr(env.s, "frame_stack_size", 4))
 
-    # ✅ input_channels 계산은 공통
     input_channels = obs_channels * stack_size
 
     agent = PPOAgent(
@@ -245,7 +321,7 @@ def _load_agent_and_env(ckpt_path: str, no_render: bool, use_sim: bool):
     else:
         print("[PPO] no checkpoint found, training from scratch")
 
-    # 하이퍼파라미터 override (네 기존 유지)
+    # overrides (네 기존 유지)
     agent.ent_coef = 0.04
     agent.ent_min = 0.005
     agent.ent_decay = 0.9995
@@ -268,7 +344,6 @@ def _load_agent_and_env(ckpt_path: str, no_render: bool, use_sim: bool):
     return env, agent
 
 
-
 # ----------------------------
 # Main loop
 # ----------------------------
@@ -284,14 +359,14 @@ def run(
     monitor_every_steps: int = 400,
     monitor_every_sec: float = 0.0,
 
-    # ✅ episode-boundary I/O throttles
-    save_every_episodes: int = 50,
-    stats_every_episodes: int = 20,
+    # training I/O (eval에서는 무시됨)
+    save_every_episodes: int = 1,
+    stats_every_episodes: int = 1,
 
-    # ✅ smooth update knobs (step-based)
-    update_every_steps: int = 8,          # 업데이트 트리거 주기(너무 작으면 잦게, 너무 크면 뭉침)
-    update_max_per_trigger: int = 1,      # 한 번 트리거에 몇 번 update()까지 허용 (끊김 방지용)
-    update_time_budget_ms: float = 6.0,   # 추가 안전장치: 트리거 1회당 시간 예산(ms)
+    # smooth update knobs (step-based)
+    update_every_steps: int = 8,
+    update_max_per_trigger: int = 1,
+    update_time_budget_ms: float = 6.0,
 
     # survival prints
     print_survival_every: int = 10,
@@ -309,12 +384,17 @@ def run(
 
     env, agent = _load_agent_and_env(ckpt_path, no_render=no_render, use_sim=use_sim)
 
-    # sim stacker + sim action mask
+    # ✅ eval에서 최고 성능 확인용: 모델 eval 모드로 전환
+    if eval_mode:
+        _agent_set_eval_mode(agent)
+
     sim_stacker = _SimFrameStacker(obs_channels=4, stack=4) if use_sim else None
     sim_action_mask = _build_action_mask_for_sim() if use_sim else None
 
     # survival tracking
-    best_surv = 0.0
+    best_wall = 0.0
+    best_game = 0.0
+    best_reward = -1e9
     surv_hist = deque(maxlen=int(max(1, survival_window)))
 
     if monitor_gpu:
@@ -329,6 +409,10 @@ def run(
     time.sleep(0.05)
 
     stop_requested = False
+    stop_name = _find_stop_name()
+
+    # eval에서는 저장/통계 업데이트를 아예 하지 않음(락/병목 제거)
+    do_io = (not eval_mode)
 
     try:
         for ep in range(1, int(episodes) + 1):
@@ -353,7 +437,6 @@ def run(
                 safe_release_inputs()
                 time.sleep(0.05)
 
-            # reset
             raw = env.reset()
             if use_sim:
                 state = sim_stacker.reset(raw)
@@ -374,8 +457,7 @@ def run(
             last_mon_t = time.time()
             last_mon_step = 0
 
-            # smooth-update counters
-            local_updates = 0  # per-episode updates
+            local_updates = 0  # per-episode updates (train only)
 
             while not done:
                 if esc_pressed():
@@ -394,13 +476,19 @@ def run(
                     img_for_mask = getattr(env.s, "last_action_mask_img", None)
                     action_mask = _build_action_mask_from_img(env, img_for_mask)
 
-                action_idx, log_prob, value = agent.select_action(state, action_mask=action_mask)
+                # ✅ eval_mode면 deterministic(최고 성능) 선택
+                if eval_mode:
+                    action_idx, log_prob, value = _select_action_best_effort(agent, state, action_mask)
+                else:
+                    action_idx, log_prob, value = agent.select_action(state, action_mask=action_mask)
+
+                action_idx = _clamp_action_idx(action_idx)
 
                 if use_sim:
                     raw_next, reward, done, _info = env.step(action_idx)
                     next_state = sim_stacker.step(raw_next)
-                    exec_idx = int(action_idx) % 8
-                    exec_name = ACTIONS[int(exec_idx)].name if int(exec_idx) < len(ACTIONS) else f"SIM_{exec_idx}"
+                    exec_idx = int(action_idx)
+                    exec_name = ACTIONS[int(exec_idx)].name
                 else:
                     next_state, reward, done = env.step(action_idx)
                     exec_idx = getattr(env.s, "exec_action_idx", action_idx)
@@ -410,21 +498,17 @@ def run(
                 if exec_name.startswith("SLOW"):
                     slow_count += 1
 
-                # store transition
-                if not eval_mode:
+                # store transition (train only)
+                if do_io:
                     agent.store(state, int(action_idx), reward, done, log_prob, value, action_mask=action_mask)
 
                 state = next_state
                 total_reward += float(reward)
                 steps += 1
 
-                # -----------------------
-                # ✅ Smooth PPO update (step-based)
-                # -----------------------
-                if not eval_mode:
-                    # 트리거 간격
+                # PPO update (train only)
+                if do_io:
                     if int(update_every_steps) > 0 and (steps % int(update_every_steps)) == 0:
-                        # 시간 예산 내에서, 최대 N번 update
                         t_budget_end = time.perf_counter() + (float(update_time_budget_ms) / 1000.0)
                         k = 0
                         while agent.should_update():
@@ -451,85 +535,94 @@ def run(
                     if do_print:
                         _print_runtime_gpu_stats(agent, prefix=f"[GPU][ep{ep} step{steps}]")
 
-                # GameEnv only: cv pump
                 if (not no_render) and (not use_sim):
                     pump_cv_events_once()
 
-            survival_sec = time.time() - ep_t0
-            best_surv = max(best_surv, float(survival_sec))
-            surv_hist.append(float(survival_sec))
+            wall_sec = time.time() - ep_t0
+            game_sec = float(steps) / 60.0
+
+            surv_hist.append(float(wall_sec))
+
+            # best tracking (eval에서 특히 중요)
+            if float(game_sec) > float(best_game):
+                best_game = float(game_sec)
+            if float(wall_sec) > float(best_wall):
+                best_wall = float(wall_sec)
+            if float(total_reward) > float(best_reward):
+                best_reward = float(total_reward)
 
             # sim speed info
             if use_sim:
-                sps = steps / max(survival_sec, 1e-9)
-                print(f"[SIM] wall={survival_sec:.3f}s steps={steps} SPS={sps:.0f} (~{sps/60.0:.1f}x vs 60fps)")
+                sps = steps / max(wall_sec, 1e-9)
+                speed_x = sps / 60.0
+                print(
+                    f"[SIM] wall={wall_sec:.3f}s game={game_sec:.3f}s "
+                    f"steps={steps} SPS={sps:.0f} (~{speed_x:.1f}x vs 60fps)"
+                )
 
             if (ep % int(max(1, print_survival_every))) == 0 or ep == 1:
                 avg_surv = float(np.mean(surv_hist)) if len(surv_hist) else 0.0
-                print(f"[SURV] best={best_surv:.2f}s | avg(last {len(surv_hist)})={avg_surv:.2f}s")
+                print(f"[SURV] best_wall={best_wall:.2f}s best_game={best_game:.2f}s | avg_wall(last {len(surv_hist)})={avg_surv:.2f}s")
 
             slow_ratio = slow_count / max(1, steps)
+            stop_count = int(action_counter.get(stop_name, 0)) if stop_name else 0
+            stop_ratio = (stop_count / max(1, steps)) if stop_name else 0.0
+
             top_actions = action_counter.most_common(5)
             top_actions_str = ";".join(f"{k}:{v}" for k, v in top_actions)
+            if stop_name:
+                in_top = any(k == stop_name for k, _ in top_actions)
+                if not in_top:
+                    top_actions_str = f"{top_actions_str};{stop_name}:{stop_count}"
 
             note_parts = []
             if eval_mode:
-                note_parts.append("EVAL")
+                note_parts.append("EVAL_BEST")
             if aborted:
                 note_parts.append("ABORTED")
             note = ",".join(note_parts)
 
             print(
                 f"[PPO] episode end | steps={steps} total_reward={total_reward:.1f} "
-                f"survival_sec={survival_sec:.2f} slow_ratio={slow_ratio:.3f} "
-                f"updates(ep)={local_updates} top_actions={top_actions_str} {note}"
+                f"wall_sec={wall_sec:.2f} game_sec={game_sec:.2f} slow_ratio={slow_ratio:.3f} "
+                f"stop_ratio={stop_ratio:.3f} updates(ep)={local_updates} top_actions={top_actions_str} {note}"
             )
 
-            # per-episode lightweight append
+            # eval이면 파일 I/O/저장/통계 업데이트 모두 스킵
+            if not do_io:
+                if stop_requested or aborted:
+                    break
+                continue
+
+            # per-episode append
             ep_tag = f"({ep}/{episodes})"
             try:
                 with open(log_path, "a", encoding="utf-8") as f:
-                    f.write(f"{ep_tag}\t{total_reward:.6f}\t{survival_sec:.3f}\t{note}\n")
+                    f.write(f"{ep_tag}\t{total_reward:.6f}\t{wall_sec:.3f}\t{game_sec:.3f}\t{note}\n")
             except Exception as e:
                 print(f"[WARN] episode log append failed (ignored): {e}")
 
             if aborted:
-                if not eval_mode:
-                    _try_clear_agent_rollout(agent)
+                _try_clear_agent_rollout(agent)
                 print("[STOP] Episode aborted -> stopping.")
                 break
 
-            # -----------------------
-            # ✅ No end-of-episode update
-            # -----------------------
-            # (끊김 줄이기 목적) 필요하면 여기서 0~1회만 돌리는 정도로만 추가 가능.
+            # stats update (per-episode)
+            maybe_update_records(stats, total_reward, wall_sec, run_ts, ep_tag)
+            update_stats_in_file(log_path, stats)
+            print(stats_one_line(stats))
 
-            if not eval_mode:
-                # stats update (throttled)
-                do_stats = (int(stats_every_episodes) > 0) and ((ep % int(stats_every_episodes)) == 0 or ep == int(episodes))
-                if do_stats:
-                    maybe_update_records(stats, total_reward, survival_sec, run_ts, ep_tag)
-                    update_stats_in_file(log_path, stats)
-                print(stats_one_line(stats))
-
-                # checkpoint save (throttled)
-                do_save = (int(save_every_episodes) > 0) and ((ep % int(save_every_episodes)) == 0 or ep == int(episodes))
-                if do_save:
-                    ok_save = _safe_save_checkpoint(agent, ckpt_path)
-                    if ok_save:
-                        print("[PPO] checkpoint saved")
-                    else:
-                        print("[WARN] checkpoint save failed -> continue training without stopping")
-                else:
-                    print("[PPO] checkpoint skipped")
+            # checkpoint save (per-episode)
+            ok_save = _safe_save_checkpoint(agent, ckpt_path)
+            if ok_save:
+                print("[PPO] checkpoint saved")
             else:
-                print(stats_one_line(stats))
+                print("[WARN] checkpoint save failed -> continue training without stopping")
 
             if stop_requested:
                 print("[STOP] Training stopped by ESC.")
                 break
 
-            # ✅ episode boundary sleep 최소화
             if (not use_sim) and (ep < int(episodes)):
                 time.sleep(0.02)
 
@@ -540,5 +633,9 @@ def run(
                 cv2.destroyAllWindows()
             except Exception:
                 pass
+
+    # eval summary
+    if eval_mode:
+        print(f"\n[EVAL_SUMMARY] best_game_sec={best_game:.2f}s | best_wall_sec={best_wall:.2f}s | best_reward={best_reward:.3f}")
 
     print("\n[PPO] Finished.")

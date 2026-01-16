@@ -33,7 +33,11 @@ def _read_text(path: str) -> str:
     except Exception:
         return ""
 
-def _atomic_write(path: str, text: str):
+def _atomic_write(path: str, text: str) -> None:
+    import os
+    import time
+    import tempfile
+
     d = os.path.dirname(path) or "."
     os.makedirs(d, exist_ok=True)
 
@@ -41,13 +45,35 @@ def _atomic_write(path: str, text: str):
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
+            f.flush()
+            try:
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+
+        # Windows에서 대상 파일이 잠깐 잠기는 경우가 있어서 replace 재시도
+        last_err = None
+        for _ in range(40):  # 40 * 0.05 = 2초
+            try:
+                os.replace(tmp_path, path)
+                return
+            except PermissionError as e:
+                last_err = e
+                time.sleep(0.05)
+
+        # 그래도 실패하면 마지막 에러 다시 발생
+        if last_err is not None:
+            raise last_err
         os.replace(tmp_path, path)
+
     finally:
+        # replace 성공하면 tmp_path는 없어짐. 실패했으면 정리 시도.
         try:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)
         except Exception:
             pass
+
 
 def _extract_stats_block(text: str):
     if (STATS_BEGIN not in text) or (STATS_END not in text):
