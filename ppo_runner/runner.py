@@ -4,18 +4,18 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime
-from collections import Counter, deque
+from collections import deque
 
 import cv2
 import numpy as np
 import torch
-import subprocess
 
 from env.game_env import GameEnv
 from env.controller import release_all, set_attack_hold, cleanup_inputs_on_exit
 from env.menu import boot_into_practice
 from env.actions import ACTIONS
-from agents.ppo_agent import PPOAgent
+
+from agents.dqn_agent import DQNAgent
 
 from sim.sim_env import SimEnv, SimConfig
 
@@ -43,56 +43,6 @@ def safe_release_inputs():
         release_all()
     except Exception:
         pass
-
-
-def _torch_mem_str(device: str = "cuda") -> str:
-    if (not torch.cuda.is_available()) or (device != "cuda"):
-        return "CUDA: N/A"
-    try:
-        alloc = torch.cuda.memory_allocated() / (1024**2)
-        reserv = torch.cuda.memory_reserved() / (1024**2)
-        max_alloc = torch.cuda.max_memory_allocated() / (1024**2)
-        max_reserv = torch.cuda.max_memory_reserved() / (1024**2)
-        return (
-            f"VRAM alloc={alloc:.0f}MiB reserv={reserv:.0f}MiB "
-            f"(max alloc={max_alloc:.0f}MiB max reserv={max_reserv:.0f}MiB)"
-        )
-    except Exception as e:
-        return f"VRAM: ERROR({e})"
-
-
-def _nvidia_smi_query() -> str | None:
-    try:
-        cmd = [
-            "nvidia-smi",
-            "--query-gpu=utilization.gpu,utilization.memory,memory.used,memory.total,temperature.gpu",
-            "--format=csv,noheader,nounits",
-        ]
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
-        if not out:
-            return None
-        lines = [x.strip() for x in out.splitlines() if x.strip()]
-        parts = [p.strip() for p in lines[0].split(",")]
-        if len(parts) >= 5:
-            util_gpu, util_mem, mem_used, mem_total, temp = parts[:5]
-            return f"nvidia-smi util={util_gpu}% memUtil={util_mem}% mem={mem_used}/{mem_total}MiB temp={temp}C"
-        return f"nvidia-smi raw={lines[0]}"
-    except Exception:
-        return None
-
-
-def _print_runtime_gpu_stats(agent, prefix: str = "[GPU]"):
-    dev = getattr(agent, "device", "cpu")
-    if isinstance(dev, str) and dev.startswith("cuda") and torch.cuda.is_available():
-        print(f"{prefix} {_torch_mem_str('cuda')}")
-    else:
-        print(f"{prefix} CUDA: OFF (agent.device={dev})")
-
-    smi = _nvidia_smi_query()
-    if smi is not None:
-        print(f"{prefix} {smi}")
-    else:
-        print(f"{prefix} nvidia-smi: N/A (not found or failed)")
 
 
 def _safe_save_checkpoint(agent, ckpt_path: str) -> bool:
@@ -134,10 +84,6 @@ def _find_stop_name() -> str | None:
 
 
 def _build_action_mask_from_img(env: GameEnv, img: np.ndarray | None) -> np.ndarray:
-    """
-    GameEnv용 마스크:
-    - runner는 캡처하지 않고 env가 저장한 last_action_mask_img 사용
-    """
     mask = np.ones((len(ACTIONS),), dtype=np.bool_)
 
     try:
@@ -148,12 +94,10 @@ def _build_action_mask_from_img(env: GameEnv, img: np.ndarray | None) -> np.ndar
     except Exception:
         pass
 
-    # BOMB는 무조건 금지
     bidx = _find_bomb_index()
     if bidx is not None:
         mask[int(bidx)] = False
 
-    # 전부 False면 복구
     if not bool(mask.any()):
         mask[:] = True
         if bidx is not None:
@@ -163,11 +107,6 @@ def _build_action_mask_from_img(env: GameEnv, img: np.ndarray | None) -> np.ndar
 
 
 def _build_action_mask_for_sim() -> np.ndarray:
-    """
-    SimEnv용 마스크:
-    - ✅ 8방향 이동 + SLOW_STOP 허용
-    - ❌ BOMB는 항상 금지
-    """
     mask = np.zeros((len(ACTIONS),), dtype=np.bool_)
 
     n = min(8, len(ACTIONS))
@@ -204,11 +143,7 @@ def _clamp_action_idx(i: int) -> int:
 
 
 def _agent_set_eval_mode(agent) -> None:
-    """
-    PPOAgent 내부가 torch 모듈을 들고 있으면 eval()로 전환.
-    (드롭아웃/배치정규화 등이 있으면 eval에서 안정적)
-    """
-    for attr in ("actor_critic", "net", "model", "policy", "policy_net"):
+    for attr in ("actor_critic", "net", "model", "policy", "policy_net", "q", "q_net"):
         m = getattr(agent, attr, None)
         if m is not None and hasattr(m, "eval"):
             try:
@@ -217,55 +152,10 @@ def _agent_set_eval_mode(agent) -> None:
                 pass
 
 
-def _select_action_best_effort(agent, state, action_mask: np.ndarray | None):
-    """
-    ✅ eval에서 '최고 퍼포먼스'를 보기 위한 deterministic 선택.
-    agent 구현이 제각각일 수 있어, 가능한 경로를 순서대로 시도한다.
-
-    반환: (action_idx, log_prob, value)
-    - log_prob/value는 eval 출력용이 아니라서 없으면 0.0으로 둠.
-    """
-    # 1) select_action에 deterministic 인자가 있는 경우
-    try:
-        return agent.select_action(state, action_mask=action_mask, deterministic=True)
-    except TypeError:
-        pass
-    except Exception:
-        pass
-
-    # 2) act_deterministic 류가 있는 경우
-    for name in ("select_action_deterministic", "act_deterministic", "select_action_eval"):
-        fn = getattr(agent, name, None)
-        if callable(fn):
-            try:
-                out = fn(state, action_mask=action_mask)
-                # out이 action만 주는 경우 대응
-                if isinstance(out, (int, np.integer)):
-                    return int(out), 0.0, 0.0
-                if isinstance(out, (tuple, list)) and len(out) >= 1:
-                    a = out[0]
-                    lp = out[1] if len(out) > 1 else 0.0
-                    v = out[2] if len(out) > 2 else 0.0
-                    return int(a), lp, v
-            except Exception:
-                pass
-
-    # 3) 최후: 그냥 기존 select_action(확률 샘플) 사용
-    #    (eval이라도 최악의 경우 실행은 되게)
-    try:
-        return agent.select_action(state, action_mask=action_mask)
-    except Exception:
-        return 0, 0.0, 0.0
-
-
 # ----------------------------
 # Sim frame stacker (runner-side)
 # ----------------------------
 class _SimFrameStacker:
-    """
-    SimEnv raw obs: (4,128,128)
-    PPO input: (16,128,128) = 4ch * stack4
-    """
     def __init__(self, obs_channels: int = 4, stack: int = 4):
         self.c = int(obs_channels)
         self.k = int(stack)
@@ -292,11 +182,26 @@ class _SimFrameStacker:
 # ----------------------------
 # Load agent/env
 # ----------------------------
-def _load_agent_and_env(ckpt_path: str, no_render: bool, use_sim: bool):
+def _load_agent_and_env(ckpt_path: str, no_render: bool, use_sim: bool, eval_mode: bool):
+    # TF32 (CUDA일 때만)
+    try:
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            try:
+                torch.set_float32_matmul_precision("high")
+            except Exception:
+                pass
+    except Exception:
+        pass
+
     if use_sim:
         cfg = SimConfig(seed=0)
-        if no_render:
-            cfg.render = False
+
+        # ✅ SIM 학습에서는 렌더가 CPU를 크게 잡아먹어서 기본 OFF
+        # 사용자가 --no-render를 줬으면 당연히 OFF, 안 줘도 OFF가 기본값.
+        cfg.render = False
+
         env = SimEnv(cfg)
         obs_channels = 4
         stack_size = 4
@@ -309,33 +214,45 @@ def _load_agent_and_env(ckpt_path: str, no_render: bool, use_sim: bool):
 
     input_channels = obs_channels * stack_size
 
-    agent = PPOAgent(
+    # ✅ Replay: SIM에서도 20k로 키움 (uint8 저장 기준)
+    replay_size = 20_000
+
+    # ✅ 추천 튜닝: batch↑, train 빈도↑, eps decay↑
+    agent = DQNAgent(
         input_channels=input_channels,
         num_actions=len(ACTIONS),
         obs_channels_per_frame=obs_channels,
+
+        lr=2e-4,
+        gamma=0.99,
+        batch_size=256,            # 64 -> 128
+        grad_accum_steps=4,   # ✅ 추가
+
+
+        replay_size=replay_size,   # 20k
+        learning_starts=4000,      # 2000 -> 4000 (초기 분포 조금 더 모으기)
+
+        train_every_steps=16,       # 16 -> 8 (학습 더 자주)
+        target_update_every_steps=2000,
+        double_dqn=True,
+
+        eps_start=1.0,
+        eps_end=0.05,
+        eps_decay_steps=300_000,   # 200k -> 300k (커리큘럼 후반 적응 여지)
     )
 
     if os.path.exists(ckpt_path):
         agent.load(ckpt_path, load_optimizer=False)
-        print(f"[PPO] checkpoint loaded: {ckpt_path}")
+        print(f"[DQN] checkpoint loaded: {ckpt_path}")
     else:
-        print("[PPO] no checkpoint found, training from scratch")
+        print("[DQN] no checkpoint found, training from scratch")
 
-    # overrides (네 기존 유지)
-    agent.ent_coef = 0.04
-    agent.ent_min = 0.005
-    agent.ent_decay = 0.9995
-    agent.ent_warmup_updates = 30
-    agent.clip_eps = 0.15
-    agent.rollout_steps = 128
-    agent.update_epochs = 5
+    if eval_mode:
+        agent.eps_start = 0.0
+        agent.eps_end = 0.0
 
-    print(f"[PPO] input_channels={input_channels} (obs_channels={obs_channels} * stack={stack_size})")
-    print(
-        "[PPO][OVERRIDE] "
-        f"ent_coef={agent.ent_coef:.3f}, ent_min={agent.ent_min:.3f}, "
-        f"clip_eps={agent.clip_eps:.2f}, rollout_steps={agent.rollout_steps}, update_epochs={agent.update_epochs}"
-    )
+    print(f"[DQN] input_channels={input_channels} (obs_channels={obs_channels} * stack={stack_size})")
+    print(f"[DQN] replay_size={replay_size}")
     try:
         print(f"[HW] Agent device={agent.device} | AMP={getattr(agent, 'use_amp', False)}")
     except Exception:
@@ -351,67 +268,47 @@ def run(
     episodes: int = 1,
     no_render: bool = False,
     eval_mode: bool = False,
-    ckpt_path: str = "checkpoints/lunatic_v1_ch4.pth",
+    ckpt_path: str = "checkpoints/dqn_v1.pth",
     use_sim: bool = False,
-
-    # monitoring
-    monitor_gpu: bool = False,
-    monitor_every_steps: int = 400,
-    monitor_every_sec: float = 0.0,
-
-    # training I/O (eval에서는 무시됨)
     save_every_episodes: int = 1,
     stats_every_episodes: int = 1,
-
-    # smooth update knobs (step-based)
-    update_every_steps: int = 8,
-    update_max_per_trigger: int = 1,
-    update_time_budget_ms: float = 6.0,
-
-    # survival prints
     print_survival_every: int = 10,
     survival_window: int = 50,
 ):
-    os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
+    ckpt_dir = os.path.dirname(ckpt_path)
+    if ckpt_dir:
+        os.makedirs(ckpt_dir, exist_ok=True)
 
     pth_name = os.path.splitext(os.path.basename(ckpt_path))[0]
-    log_path = os.path.join(os.path.dirname(ckpt_path), f"{pth_name}_episode_log.txt")
+    log_path = os.path.join(os.path.dirname(ckpt_path) if ckpt_dir else ".", f"{pth_name}_episode_log.txt")
 
     stats = ensure_stats_header(log_path)
     run_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     append_run_header(log_path, run_ts, int(episodes), bool(eval_mode), stats)
     print(stats_one_line(stats))
 
-    env, agent = _load_agent_and_env(ckpt_path, no_render=no_render, use_sim=use_sim)
+    env, agent = _load_agent_and_env(ckpt_path, no_render=no_render, use_sim=use_sim, eval_mode=eval_mode)
 
-    # ✅ eval에서 최고 성능 확인용: 모델 eval 모드로 전환
     if eval_mode:
         _agent_set_eval_mode(agent)
 
     sim_stacker = _SimFrameStacker(obs_channels=4, stack=4) if use_sim else None
     sim_action_mask = _build_action_mask_for_sim() if use_sim else None
 
-    # survival tracking
+    # ✅ GPU 점유율 올리기: update 트리거 1번에 여러 번 학습
+    # - SIM: CPU가 env에 묶이기 쉬워서, 학습을 덩어리로 돌려 GPU를 더 활용
+    updates_per_trigger = 1
+
     best_wall = 0.0
     best_game = 0.0
     best_reward = -1e9
     surv_hist = deque(maxlen=int(max(1, survival_window)))
-
-    if monitor_gpu:
-        if torch.cuda.is_available() and str(getattr(agent, "device", "")).startswith("cuda"):
-            try:
-                torch.cuda.reset_peak_memory_stats()
-            except Exception:
-                pass
-        _print_runtime_gpu_stats(agent, prefix="[GPU][INIT]")
 
     print("\n[INFO] ESC 중단: Windows 전역 감지(GetAsyncKeyState)")
     time.sleep(0.05)
 
     stop_requested = False
     stop_name = _find_stop_name()
-
-    # eval에서는 저장/통계 업데이트를 아예 하지 않음(락/병목 제거)
     do_io = (not eval_mode)
 
     try:
@@ -423,7 +320,6 @@ def run(
 
             print(f"\n========== EPISODE {ep}/{episodes} ==========")
 
-            # GameEnv only: 메뉴/입력 처리
             if not use_sim:
                 safe_release_inputs()
                 time.sleep(0.05)
@@ -438,10 +334,7 @@ def run(
                 time.sleep(0.05)
 
             raw = env.reset()
-            if use_sim:
-                state = sim_stacker.reset(raw)
-            else:
-                state = raw
+            state = sim_stacker.reset(raw) if use_sim else raw
 
             if (not no_render) and (not use_sim):
                 pump_cv_events_once()
@@ -451,13 +344,9 @@ def run(
             total_reward = 0.0
             steps = 0
             slow_count = 0
-            action_counter = Counter()
+            stop_count = 0
             aborted = False
-
-            last_mon_t = time.time()
-            last_mon_step = 0
-
-            local_updates = 0  # per-episode updates (train only)
+            local_updates = 0
 
             while not done:
                 if esc_pressed():
@@ -469,89 +358,75 @@ def run(
                     done = True
                     break
 
-                # action mask
+                # -------- current-state mask (for action selection)
                 if use_sim:
                     action_mask = sim_action_mask
                 else:
                     img_for_mask = getattr(env.s, "last_action_mask_img", None)
                     action_mask = _build_action_mask_from_img(env, img_for_mask)
 
-                # ✅ eval_mode면 deterministic(최고 성능) 선택
-                if eval_mode:
-                    action_idx, log_prob, value = _select_action_best_effort(agent, state, action_mask)
-                else:
-                    action_idx, log_prob, value = agent.select_action(state, action_mask=action_mask)
-
+                action_idx, log_prob, value = agent.select_action(state, action_mask=action_mask)
                 action_idx = _clamp_action_idx(action_idx)
 
+                # -------- step
                 if use_sim:
                     raw_next, reward, done, _info = env.step(action_idx)
                     next_state = sim_stacker.step(raw_next)
                     exec_idx = int(action_idx)
-                    exec_name = ACTIONS[int(exec_idx)].name
                 else:
                     next_state, reward, done = env.step(action_idx)
                     exec_idx = getattr(env.s, "exec_action_idx", action_idx)
-                    exec_name = ACTIONS[int(exec_idx)].name
 
-                action_counter[exec_name] += 1
+                exec_name = ACTIONS[int(exec_idx)].name
+
                 if exec_name.startswith("SLOW"):
                     slow_count += 1
+                if stop_name and exec_name == stop_name:
+                    stop_count += 1
 
-                # store transition (train only)
+                # -------- next-state mask (for masked DQN target)
+                if use_sim:
+                    next_action_mask = sim_action_mask
+                else:
+                    img_for_next_mask = getattr(env.s, "last_action_mask_img", None)
+                    next_action_mask = _build_action_mask_from_img(env, img_for_next_mask)
+
                 if do_io:
-                    agent.store(state, int(action_idx), reward, done, log_prob, value, action_mask=action_mask)
+                    agent.store(
+                        state,
+                        int(action_idx),
+                        reward,
+                        done,
+                        log_prob,
+                        value,
+                        action_mask=action_mask,
+                        next_state=next_state,
+                        next_action_mask=next_action_mask,
+                    )
 
                 state = next_state
                 total_reward += float(reward)
                 steps += 1
 
-                # PPO update (train only)
-                if do_io:
-                    if int(update_every_steps) > 0 and (steps % int(update_every_steps)) == 0:
-                        t_budget_end = time.perf_counter() + (float(update_time_budget_ms) / 1000.0)
-                        k = 0
-                        while agent.should_update():
-                            agent.update(last_state=state, last_done=False)
-                            local_updates += 1
-                            k += 1
-                            if k >= int(max(1, update_max_per_trigger)):
-                                break
-                            if time.perf_counter() >= t_budget_end:
-                                break
-
-                # GPU monitor
-                if monitor_gpu:
-                    do_print = False
-                    if monitor_every_steps and monitor_every_steps > 0:
-                        if (steps - last_mon_step) >= int(monitor_every_steps):
-                            do_print = True
-                            last_mon_step = steps
-                    if monitor_every_sec and monitor_every_sec > 0:
-                        now_t = time.time()
-                        if (now_t - last_mon_t) >= float(monitor_every_sec):
-                            do_print = True
-                            last_mon_t = now_t
-                    if do_print:
-                        _print_runtime_gpu_stats(agent, prefix=f"[GPU][ep{ep} step{steps}]")
+                # ✅ 학습 덩어리로 실행
+                if do_io and agent.should_update():
+                    for _ in range(int(max(1, updates_per_trigger))):
+                        out = agent.update(last_state=state, last_done=False)
+                        if out is None:
+                            break
+                        local_updates += 1
 
                 if (not no_render) and (not use_sim):
                     pump_cv_events_once()
 
             wall_sec = time.time() - ep_t0
             game_sec = float(steps) / 60.0
-
             surv_hist.append(float(wall_sec))
 
-            # best tracking (eval에서 특히 중요)
-            if float(game_sec) > float(best_game):
-                best_game = float(game_sec)
-            if float(wall_sec) > float(best_wall):
-                best_wall = float(wall_sec)
-            if float(total_reward) > float(best_reward):
-                best_reward = float(total_reward)
+            best_game = max(best_game, float(game_sec))
+            best_wall = max(best_wall, float(wall_sec))
+            best_reward = max(best_reward, float(total_reward))
 
-            # sim speed info
             if use_sim:
                 sps = steps / max(wall_sec, 1e-9)
                 speed_x = sps / 60.0
@@ -562,18 +437,13 @@ def run(
 
             if (ep % int(max(1, print_survival_every))) == 0 or ep == 1:
                 avg_surv = float(np.mean(surv_hist)) if len(surv_hist) else 0.0
-                print(f"[SURV] best_wall={best_wall:.2f}s best_game={best_game:.2f}s | avg_wall(last {len(surv_hist)})={avg_surv:.2f}s")
+                print(
+                    f"[SURV] best_wall={best_wall:.2f}s best_game={best_game:.2f}s | "
+                    f"avg_wall(last {len(surv_hist)})={avg_surv:.2f}s"
+                )
 
             slow_ratio = slow_count / max(1, steps)
-            stop_count = int(action_counter.get(stop_name, 0)) if stop_name else 0
             stop_ratio = (stop_count / max(1, steps)) if stop_name else 0.0
-
-            top_actions = action_counter.most_common(5)
-            top_actions_str = ";".join(f"{k}:{v}" for k, v in top_actions)
-            if stop_name:
-                in_top = any(k == stop_name for k, _ in top_actions)
-                if not in_top:
-                    top_actions_str = f"{top_actions_str};{stop_name}:{stop_count}"
 
             note_parts = []
             if eval_mode:
@@ -583,18 +453,16 @@ def run(
             note = ",".join(note_parts)
 
             print(
-                f"[PPO] episode end | steps={steps} total_reward={total_reward:.1f} "
+                f"[DQN] episode end | steps={steps} total_reward={total_reward:.1f} "
                 f"wall_sec={wall_sec:.2f} game_sec={game_sec:.2f} slow_ratio={slow_ratio:.3f} "
-                f"stop_ratio={stop_ratio:.3f} updates(ep)={local_updates} top_actions={top_actions_str} {note}"
+                f"stop_ratio={stop_ratio:.3f} updates(ep)={local_updates} {note}"
             )
 
-            # eval이면 파일 I/O/저장/통계 업데이트 모두 스킵
             if not do_io:
                 if stop_requested or aborted:
                     break
                 continue
 
-            # per-episode append
             ep_tag = f"({ep}/{episodes})"
             try:
                 with open(log_path, "a", encoding="utf-8") as f:
@@ -607,21 +475,23 @@ def run(
                 print("[STOP] Episode aborted -> stopping.")
                 break
 
-            # stats update (per-episode)
-            maybe_update_records(stats, total_reward, wall_sec, run_ts, ep_tag)
-            update_stats_in_file(log_path, stats)
+            if (ep % int(max(1, stats_every_episodes))) == 0 or ep == int(episodes):
+                maybe_update_records(stats, total_reward, wall_sec, run_ts, ep_tag)
+                update_stats_in_file(log_path, stats)
             print(stats_one_line(stats))
 
-            # checkpoint save (per-episode)
-            ok_save = _safe_save_checkpoint(agent, ckpt_path)
-            if ok_save:
-                print("[PPO] checkpoint saved")
-            else:
-                print("[WARN] checkpoint save failed -> continue training without stopping")
+            if (ep % int(max(1, save_every_episodes))) == 0 or ep == int(episodes):
+                ok_save = _safe_save_checkpoint(agent, ckpt_path)
+                if ok_save:
+                    print("[DQN] checkpoint saved")
+                else:
+                    print("[WARN] checkpoint save failed -> continue training without stopping")
 
             if stop_requested:
                 print("[STOP] Training stopped by ESC.")
                 break
+
+            print(f"[DBG] global_step={agent.global_step} replay={len(agent.replay)} updates_per_trigger={updates_per_trigger}")
 
             if (not use_sim) and (ep < int(episodes)):
                 time.sleep(0.02)
@@ -634,8 +504,10 @@ def run(
             except Exception:
                 pass
 
-    # eval summary
     if eval_mode:
-        print(f"\n[EVAL_SUMMARY] best_game_sec={best_game:.2f}s | best_wall_sec={best_wall:.2f}s | best_reward={best_reward:.3f}")
+        print(
+            f"\n[EVAL_SUMMARY] best_game_sec={best_game:.2f}s | "
+            f"best_wall_sec={best_wall:.2f}s | best_reward={best_reward:.3f}"
+        )
 
-    print("\n[PPO] Finished.")
+    print("\n[DQN] Finished.")

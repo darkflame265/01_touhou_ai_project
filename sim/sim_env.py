@@ -26,7 +26,7 @@ class SimConfig:
 
     # player
     player_speed: float = 4.0
-    player_radius: float = 3.0  # visual radius (smaller than before)
+    player_radius: float = 3.0  # visual radius
 
     # bullets
     max_bullets: int = 512
@@ -40,13 +40,13 @@ class SimConfig:
     boss_y: float = 0.18
     boss_x_jitter: float = 0.12
     pattern_hold_steps: int = 240
-    difficulty: int = 0  # 0..3
+    difficulty: int = 0  # 0..3 (자동 커리큘럼이 덮어씀)
 
     # reward
     alive_reward: float = 0.02
     hit_penalty: float = 1.0
 
-    # ✅ STOP 제외한 액션 패널티 (강제 차분 유도)
+    # STOP 제외한 액션 패널티
     move_penalty: float = 0.001
 
     # background randomization
@@ -70,6 +70,130 @@ class SimConfig:
     bullet_speed_scale_min: float = 0.80
     bullet_speed_scale_max: float = 1.25
     speed_resample_every_episodes: int = 1
+
+
+# ----------------------------
+# Auto Curriculum
+# ----------------------------
+@dataclass
+class CurriculumConfig:
+    enable: bool = True
+
+    # performance metric: EMA of survived steps
+    ema_alpha: float = 0.05
+
+    # thresholds in "steps survived" (EMA 기준)
+    # (256x256 월드, max_steps=3000 기준)
+    up_thresholds: Tuple[int, int, int] = (220, 520, 950)   # 0->1, 1->2, 2->3
+    down_thresholds: Tuple[int, int, int] = (140, 380, 760) # 1->0, 2->1, 3->2
+
+    # apply every N episodes
+    update_every_episodes: int = 1
+
+    # episode-level knobs (per difficulty level 0..3)
+    # max bullets used in _spawn_bullet cap (not array cap)
+    max_bullets_levels: Tuple[int, int, int, int] = (120, 220, 340, 480)
+
+    # pattern hold steps (짧을수록 패턴이 자주 바뀜)
+    pattern_hold_levels: Tuple[int, int, int, int] = (320, 260, 220, 180)
+
+    # boss x jitter scale
+    boss_x_jitter_levels: Tuple[float, float, float, float] = (0.05, 0.09, 0.12, 0.16)
+
+    # speed randomization ranges (player speed)
+    player_speed_min_levels: Tuple[float, float, float, float] = (2.8, 2.6, 2.3, 2.0)
+    player_speed_max_levels: Tuple[float, float, float, float] = (3.0, 3.0, 3.1, 3.2)
+
+    # speed randomization ranges (bullet speed scale)
+    bullet_scale_min_levels: Tuple[float, float, float, float] = (0.75, 0.80, 0.85, 0.90)
+    bullet_scale_max_levels: Tuple[float, float, float, float] = (1.05, 1.15, 1.25, 1.35)
+
+
+class CurriculumManager:
+    """
+    EMA(생존 steps)를 보고 difficulty(0..3)을 자동 조절.
+    - up/down threshold로 히스테리시스 적용.
+    """
+
+    def __init__(self, ccfg: CurriculumConfig):
+        self.ccfg = ccfg
+        self.level = 0
+        self.ema_steps: Optional[float] = None
+        self._last_update_episode = 0
+
+    def update(self, episode: int, steps_survived: int) -> None:
+        cc = self.ccfg
+        if not cc.enable:
+            return
+
+        every = int(max(1, cc.update_every_episodes))
+        if (episode % every) != 0:
+            return
+
+        x = float(max(0, int(steps_survived)))
+        if self.ema_steps is None:
+            self.ema_steps = x
+        else:
+            a = float(np.clip(cc.ema_alpha, 1e-6, 1.0))
+            self.ema_steps = (1.0 - a) * float(self.ema_steps) + a * x
+
+        # hysteresis
+        lvl = int(self.level)
+        ema = float(self.ema_steps)
+
+        up0, up1, up2 = cc.up_thresholds
+        dn0, dn1, dn2 = cc.down_thresholds
+
+        if lvl == 0 and ema >= up0:
+            lvl = 1
+        elif lvl == 1:
+            if ema >= up1:
+                lvl = 2
+            elif ema <= dn0:
+                lvl = 0
+        elif lvl == 2:
+            if ema >= up2:
+                lvl = 3
+            elif ema <= dn1:
+                lvl = 1
+        elif lvl == 3:
+            if ema <= dn2:
+                lvl = 2
+
+        self.level = int(np.clip(lvl, 0, 3))
+
+    def get_episode_params(self, cfg: SimConfig) -> Dict[str, Any]:
+        """
+        difficulty 레벨별로 episode 파라미터 리턴.
+        """
+        cc = self.ccfg
+        lvl = int(self.level)
+
+        max_b = int(cc.max_bullets_levels[lvl])
+        hold = int(cc.pattern_hold_levels[lvl])
+        jitter = float(cc.boss_x_jitter_levels[lvl])
+
+        pmin = float(cc.player_speed_min_levels[lvl])
+        pmax = float(cc.player_speed_max_levels[lvl])
+        if pmax < pmin:
+            pmin, pmax = pmax, pmin
+
+        bmin = float(cc.bullet_scale_min_levels[lvl])
+        bmax = float(cc.bullet_scale_max_levels[lvl])
+        if bmax < bmin:
+            bmin, bmax = bmax, bmin
+
+        return {
+            "difficulty": lvl,
+            "max_bullets_ep": int(np.clip(max_b, 16, int(cfg.max_bullets))),
+            "pattern_hold_steps_ep": int(np.clip(hold, 60, 2000)),
+            "boss_x_jitter_ep": float(np.clip(jitter, 0.0, 0.35)),
+            "player_speed_min_ep": pmin,
+            "player_speed_max_ep": pmax,
+            "bullet_scale_min_ep": bmin,
+            "bullet_scale_max_ep": bmax,
+            "ema_steps": float(self.ema_steps) if self.ema_steps is not None else None,
+        }
 
 
 class PatternEmitter:
@@ -139,6 +263,20 @@ class SimEnv:
 
         self._actions = self._build_actions()  # 8-dir + STOP
 
+        # -------- curriculum --------
+        self.curr_cfg = CurriculumConfig(enable=True)
+        self.curr = CurriculumManager(self.curr_cfg)
+
+        # per-episode curriculum-applied knobs (defaults)
+        self._max_bullets_ep = int(min(self.cfg.max_bullets, 220))
+        self._pattern_hold_steps_ep = int(self.cfg.pattern_hold_steps)
+        self._boss_x_jitter_ep = float(self.cfg.boss_x_jitter)
+        self._player_speed_min_ep = float(self.cfg.player_speed_min)
+        self._player_speed_max_ep = float(self.cfg.player_speed_max)
+        self._bullet_scale_min_ep = float(self.cfg.bullet_speed_scale_min)
+        self._bullet_scale_max_ep = float(self.cfg.bullet_speed_scale_max)
+        self._ema_steps_dbg: Optional[float] = None
+
         # state
         self.t = 0
         self.episode = 0
@@ -183,21 +321,32 @@ class SimEnv:
         self._player_speed_ep = float(self.cfg.player_speed)
         self._bullet_speed_scale_ep = 1.0
 
+        # previous episode outcome (for curriculum update)
+        self._prev_episode_steps = 0
+
     # ----------------- public -----------------
     def reset(self, seed: Optional[int] = None) -> np.ndarray:
         if seed is not None:
             self.rng = np.random.default_rng(seed)
             self.emitter = PatternEmitter(self.rng)
 
+        # curriculum update using previous episode survival steps
+        # (episode=0인 첫 reset은 prev=0이라 그냥 시작)
+        if self.episode > 0:
+            self.curr.update(self.episode, int(self._prev_episode_steps))
+
         self.episode += 1
         self.t = 0
         self.player_xy[:] = (self.W * 0.5, self.H * 0.80)
+
+        # apply curriculum parameters for THIS episode
+        self._apply_curriculum_for_episode()
 
         self._clear_bullets()
         self._maybe_resample_episode_speeds()
 
         self._set_boss_xy()
-        self.emitter.reset(self.cfg.pattern_hold_steps)
+        self.emitter.reset(self._pattern_hold_steps_ep)
 
         self.last_conf = 1.0
         self._update_xy_norm_and_uv()
@@ -216,26 +365,30 @@ class SimEnv:
         self._set_boss_xy()
 
         self.emitter.spawn(self)
-        self.emitter.maybe_switch(self.cfg.pattern_hold_steps)
+        self.emitter.maybe_switch(self._pattern_hold_steps_ep)
 
         self._move_bullets()
 
         hit, dmin = self._check_hit_and_dmin()
         done = bool(hit or (self.t >= int(self.cfg.max_steps)))
 
-        # -------- reward (near-miss 제거) --------
+        # -------- reward --------
         reward = float(self.cfg.alive_reward)
         if not is_stop:
             reward -= float(self.cfg.move_penalty)
         if hit:
             reward -= float(self.cfg.hit_penalty)
 
+        # store steps for next reset curriculum update
+        if done:
+            self._prev_episode_steps = int(self.t)
+
         obs = self._build_obs()
         info = {
             "t": int(self.t),
             "episode": int(self.episode),
             "hit": bool(hit),
-            "dmin": float(dmin) if np.isfinite(dmin) else 1e9,  # debug only (no penalty)
+            "dmin": float(dmin) if np.isfinite(dmin) else 1e9,
             "bullet_n": int(self._b_n),
             "pattern": int(self.emitter.pattern_id),
             "player_xy": self.player_xy.copy(),
@@ -243,8 +396,30 @@ class SimEnv:
             "is_stop": bool(is_stop),
             "player_speed_ep": float(self._player_speed_ep),
             "bullet_speed_scale_ep": float(self._bullet_speed_scale_ep),
+
+            # curriculum debug
+            "curr_level": int(self.curr.level),
+            "curr_ema_steps": float(self._ema_steps_dbg) if self._ema_steps_dbg is not None else None,
+            "max_bullets_ep": int(self._max_bullets_ep),
+            "pattern_hold_steps_ep": int(self._pattern_hold_steps_ep),
         }
         return obs, reward, done, info
+
+    # ----------------- curriculum apply -----------------
+    def _apply_curriculum_for_episode(self) -> None:
+        p = self.curr.get_episode_params(self.cfg)
+        self.cfg.difficulty = int(p["difficulty"])
+
+        self._max_bullets_ep = int(p["max_bullets_ep"])
+        self._pattern_hold_steps_ep = int(p["pattern_hold_steps_ep"])
+        self._boss_x_jitter_ep = float(p["boss_x_jitter_ep"])
+
+        self._player_speed_min_ep = float(p["player_speed_min_ep"])
+        self._player_speed_max_ep = float(p["player_speed_max_ep"])
+        self._bullet_scale_min_ep = float(p["bullet_scale_min_ep"])
+        self._bullet_scale_max_ep = float(p["bullet_scale_max_ep"])
+
+        self._ema_steps_dbg = p["ema_steps"]
 
     # ----------------- speed randomize -----------------
     def _maybe_resample_episode_speeds(self) -> None:
@@ -258,12 +433,13 @@ class SimEnv:
         if (self.episode % every) != 0:
             return
 
-        pmin, pmax = float(cfg.player_speed_min), float(cfg.player_speed_max)
+        # curriculum-aware ranges
+        pmin, pmax = float(self._player_speed_min_ep), float(self._player_speed_max_ep)
         if pmax < pmin:
             pmin, pmax = pmax, pmin
         self._player_speed_ep = float(self.rng.uniform(pmin, pmax))
 
-        bmin, bmax = float(cfg.bullet_speed_scale_min), float(cfg.bullet_speed_scale_max)
+        bmin, bmax = float(self._bullet_scale_min_ep), float(self._bullet_scale_max_ep)
         if bmax < bmin:
             bmin, bmax = bmax, bmin
         self._bullet_speed_scale_ep = float(self.rng.uniform(bmin, bmax))
@@ -274,6 +450,9 @@ class SimEnv:
         self._b_n = 0
 
     def _spawn_bullet(self, x: float, y: float, vx: float, vy: float) -> None:
+        # curriculum per-episode cap (keeps early episodes easy)
+        if self._b_n >= int(self._max_bullets_ep):
+            return
         if self._b_n >= self._cap:
             return
         i = self._b_n
@@ -352,7 +531,6 @@ class SimEnv:
             if len(picked) == 8:
                 moves8 = picked
             else:
-                # fallback: take first 8 non-bomb
                 tmp = []
                 for a in PROJECT_ACTIONS:
                     n = str(getattr(a, "name", "")).upper()
@@ -381,7 +559,6 @@ class SimEnv:
         dx = (-spd if "LEFT" in name else (spd if "RIGHT" in name else 0.0))
         dy = (-spd if "UP" in name else (spd if "DOWN" in name else 0.0))
 
-        # int-only fallback (0..7)
         if name == "" and isinstance(act, (int, np.integer)):
             m = {
                 0: (-spd, 0.0), 1: (spd, 0.0), 2: (0.0, -spd), 3: (0.0, spd),
@@ -400,7 +577,9 @@ class SimEnv:
 
     # ----------------- boss -----------------
     def _set_boss_xy(self) -> None:
-        bx0 = 0.5 + float(self.cfg.boss_x_jitter) * np.sin(0.01 * self.t + 0.7)
+        # curriculum-aware jitter
+        j = float(self._boss_x_jitter_ep)
+        bx0 = 0.5 + j * np.sin(0.01 * self.t + 0.7)
         by0 = float(self.cfg.boss_y)
         self.boss_xy[0] = float(np.clip(bx0, 0.1, 0.9) * (self.W - 1))
         self.boss_xy[1] = float(np.clip(by0, 0.05, 0.35) * (self.H - 1))
@@ -426,10 +605,8 @@ class SimEnv:
             np.clip(bg, 0, 255, out=bg)
             img[:] = bg.astype(np.uint8)
 
-        # boss
         cv2.circle(img, (int(self.boss_xy[0]), int(self.boss_xy[1])), 5, 60, -1, lineType=cv2.LINE_AA)
 
-        # bullets
         n = int(self._b_n)
         if n > 0:
             pos = self._b_pos[:n]
@@ -438,7 +615,6 @@ class SimEnv:
                 c = int(120 + 60 * float(self.rng.uniform(0.0, 1.0)))
                 cv2.circle(img, (int(x), int(y)), int(self.cfg.bullet_radius), c, -1, lineType=cv2.LINE_AA)
 
-        # player
         cv2.circle(img, (int(self.player_xy[0]), int(self.player_xy[1])), int(self.cfg.player_radius), 220, -1, lineType=cv2.LINE_AA)
         return img
 
@@ -450,9 +626,14 @@ class SimEnv:
             up = int(max(1, self.cfg.render_upscale))
             if up != 1:
                 vis = cv2.resize(vis, (vis.shape[1] * up, vis.shape[0] * up), interpolation=cv2.INTER_NEAREST)
-            txt = f"ep{self.episode} pspd={self._player_speed_ep:.2f} bmul={self._bullet_speed_scale_ep:.2f}"
-            cv2.putText(vis, txt, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(vis, txt, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+
+            txt = (
+                f"ep{self.episode} lvl={self.curr.level} ema={self._ema_steps_dbg if self._ema_steps_dbg is not None else -1:.0f} "
+                f"pspd={self._player_speed_ep:.2f} bmul={self._bullet_speed_scale_ep:.2f} "
+                f"mb={self._max_bullets_ep} hold={self._pattern_hold_steps_ep} diff={self.cfg.difficulty}"
+            )
+            cv2.putText(vis, txt, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
+            cv2.putText(vis, txt, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 1, cv2.LINE_AA)
             cv2.imshow(self.cfg.render_window, vis)
             cv2.waitKey(int(self.cfg.render_wait))
 
@@ -475,7 +656,6 @@ class SimEnv:
         return self._obs.copy()
 
     def _stamp_marker_and_meta(self, ch0: np.ndarray) -> None:
-        # marker cross
         u, v = self._uv
         r = int(self.marker_half)
         if r > 0:
@@ -485,7 +665,6 @@ class SimEnv:
             ch0[v, x1:x2] = val
             ch0[y1:y2, u] = val
 
-        # meta patch: (x,y,conf)
         p = int(self.meta_patch)
         if p > 0 and ch0.shape[0] >= p and ch0.shape[1] >= (p * 3):
             x_n, y_n = self.last_xy_norm
