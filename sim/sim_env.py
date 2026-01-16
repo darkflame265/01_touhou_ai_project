@@ -24,9 +24,12 @@ class SimConfig:
     obs_out_size: int = 128
     world_size: int = 256
 
+    # time base (for "60 seconds" curriculum)
+    fps: float = 60.0
+
     # player
-    player_speed: float = 4.0
-    player_radius: float = 3.0  # visual radius (smaller than before)
+    player_speed: float = 3.0
+    player_radius: float = 3.0  # visual radius
 
     # bullets
     max_bullets: int = 512
@@ -40,7 +43,12 @@ class SimConfig:
     boss_y: float = 0.18
     boss_x_jitter: float = 0.12
     pattern_hold_steps: int = 240
-    difficulty: int = 0  # 0..3
+
+    # ✅ single knob difficulty (curriculum uses this)
+    difficulty: float = 0.5  # start difficulty
+    difficulty_min: float = 0.5
+    difficulty_step: float = 0.1
+    curriculum_target_survival_sec: float = 60.0
 
     # reward
     alive_reward: float = 0.02
@@ -91,33 +99,56 @@ class PatternEmitter:
 
     def spawn(self, env: "SimEnv"):
         cfg = env.cfg
-        d = int(cfg.difficulty)
 
-        base_speed = 2.6 + 0.6 * d
-        base_n = 10 + 4 * d
-        base_rate = 6 - min(3, d)
+        # ✅ single knob difficulty
+        d = float(getattr(cfg, "difficulty", 1.0))
+        d = float(np.clip(d, 0.0, 5.0))
 
-        if (env.t % max(1, base_rate)) != 0:
-            return
+        # d=0.1 같은 낮은 값이 "매우 쉬움"이 되도록 강하게 눌러줌
+        gamma = 2.4
+        intensity = float(np.clip(d ** gamma, 0.0, 10.0))  # d=0.1 -> ~0.004
 
         bx, by = env.boss_xy
-        spd_scale = float(env._bullet_speed_scale_ep)
+        spd_scale_ep = float(env._bullet_speed_scale_ep)
+
+        # baseline (difficulty=1.0 기준)
+        base_rate = 6          # 낮을수록 더 자주 발사
+        base_n0 = 14
+        base_n1 = 20
+        base_spd0 = 3.2
+        base_spd1 = 2.3
+
+        # 발사 주기: intensity 낮으면 매우 드물게
+        rate = int(round(base_rate / max(1e-6, (0.15 + 0.85 * intensity))))
+        rate = int(np.clip(rate, 4, 60))
+
+        if (env.t % rate) != 0:
+            return
+
+        # 탄수: intensity에 비례 (랜덤 가산도 같이 감소)
+        n0 = int(round(1 + (base_n0 - 1) * intensity))
+        n1 = int(round(1 + (base_n1 - 1) * intensity))
+        extra = int(self.rng.integers(0, 1 + int(round(6 * intensity))))
+        n0 = int(np.clip(n0 + extra, 1, 96))
+        n1 = int(np.clip(n1 + extra, 1, 110))
+
+        # 탄속: intensity 낮으면 느리게
+        spd0 = base_spd0 * (0.35 + 0.65 * intensity) * float(self.rng.uniform(0.9, 1.15)) * spd_scale_ep
+        spd1 = base_spd1 * (0.35 + 0.65 * intensity) * float(self.rng.uniform(0.95, 1.15)) * spd_scale_ep
 
         if int(self.pattern_id) == 0:
-            n = base_n + int(self.rng.integers(0, 6))
-            spd = base_speed * float(self.rng.uniform(0.9, 1.15)) * spd_scale
+            n = n0
             a0 = self.phase + 0.25 * np.sin(0.03 * env.t)
             for k in range(n):
                 ang = a0 + 2.0 * np.pi * (k / n)
-                env._spawn_bullet(bx, by, spd * np.cos(ang), spd * np.sin(ang))
+                env._spawn_bullet(bx, by, spd0 * np.cos(ang), spd0 * np.sin(ang))
             self.phase += 0.08
         else:
-            n = base_n + 6
-            spd = (1.9 + 0.35 * d) * float(self.rng.uniform(0.95, 1.15)) * spd_scale
+            n = n1
             a0 = self.phase + 0.12 * env.t
             for k in range(n):
                 ang = a0 + 2.0 * np.pi * (k / n)
-                env._spawn_bullet(bx, by, spd * np.cos(ang), spd * np.sin(ang))
+                env._spawn_bullet(bx, by, spd1 * np.cos(ang), spd1 * np.sin(ang))
 
 
 class SimEnv:
@@ -183,8 +214,18 @@ class SimEnv:
         self._player_speed_ep = float(self.cfg.player_speed)
         self._bullet_speed_scale_ep = 1.0
 
+        # curriculum bookkeeping (episode end -> next reset에서 적용)
+        self._last_episode_done = False
+        self._last_episode_success = False
+        self._last_survival_sec = 0.0
+
     # ----------------- public -----------------
     def reset(self, seed: Optional[int] = None) -> np.ndarray:
+        # ✅ apply curriculum based on previous episode outcome
+        if self._last_episode_done:
+            self._apply_curriculum()
+            self._last_episode_done = False
+
         if seed is not None:
             self.rng = np.random.default_rng(seed)
             self.emitter = PatternEmitter(self.rng)
@@ -221,21 +262,34 @@ class SimEnv:
         self._move_bullets()
 
         hit, dmin = self._check_hit_and_dmin()
-        done = bool(hit or (self.t >= int(self.cfg.max_steps)))
+        time_limit = (self.t >= int(self.cfg.max_steps))
+        done = bool(hit or time_limit)
 
-        # -------- reward (near-miss 제거) --------
+        # -------- reward --------
         reward = float(self.cfg.alive_reward)
         if not is_stop:
             reward -= float(self.cfg.move_penalty)
         if hit:
             reward -= float(self.cfg.hit_penalty)
 
+        # curriculum success 판단용: "60초 버팀" 또는 "max_steps까지 버팀"
+        survival_sec = float(self.t) / float(max(1e-6, self.cfg.fps))
+        success = bool((survival_sec >= float(self.cfg.curriculum_target_survival_sec)) or time_limit)
+
+        if done:
+            self._last_episode_done = True
+            self._last_episode_success = bool(success)
+            self._last_survival_sec = float(survival_sec)
+
         obs = self._build_obs()
         info = {
             "t": int(self.t),
             "episode": int(self.episode),
             "hit": bool(hit),
-            "dmin": float(dmin) if np.isfinite(dmin) else 1e9,  # debug only (no penalty)
+            "time_limit": bool(time_limit),
+            "success": bool(success),
+            "survival_sec": float(survival_sec),
+            "dmin": float(dmin) if np.isfinite(dmin) else 1e9,  # debug only
             "bullet_n": int(self._b_n),
             "pattern": int(self.emitter.pattern_id),
             "player_xy": self.player_xy.copy(),
@@ -243,8 +297,27 @@ class SimEnv:
             "is_stop": bool(is_stop),
             "player_speed_ep": float(self._player_speed_ep),
             "bullet_speed_scale_ep": float(self._bullet_speed_scale_ep),
+            "difficulty": float(self.cfg.difficulty),
         }
         return obs, reward, done, info
+
+    # ----------------- curriculum -----------------
+    def _apply_curriculum(self) -> None:
+        cfg = self.cfg
+        d = float(cfg.difficulty)
+        step = float(getattr(cfg, "difficulty_step", 0.1))
+
+        # ✅ 성공하면 올라가고, 실패하면 그대로(절대 내려가지 않음)
+        if bool(self._last_episode_success):
+            d += step
+
+        # (원하면 상한도 둘 수 있음)
+        # dmax = float(getattr(cfg, "difficulty_max", 5.0))
+        # if d > dmax:
+        #     d = dmax
+
+        cfg.difficulty = float(d)
+
 
     # ----------------- speed randomize -----------------
     def _maybe_resample_episode_speeds(self) -> None:
@@ -439,7 +512,14 @@ class SimEnv:
                 cv2.circle(img, (int(x), int(y)), int(self.cfg.bullet_radius), c, -1, lineType=cv2.LINE_AA)
 
         # player
-        cv2.circle(img, (int(self.player_xy[0]), int(self.player_xy[1])), int(self.cfg.player_radius), 220, -1, lineType=cv2.LINE_AA)
+        cv2.circle(
+            img,
+            (int(self.player_xy[0]), int(self.player_xy[1])),
+            int(self.cfg.player_radius),
+            220,
+            -1,
+            lineType=cv2.LINE_AA,
+        )
         return img
 
     def _build_obs(self) -> np.ndarray:
@@ -450,7 +530,11 @@ class SimEnv:
             up = int(max(1, self.cfg.render_upscale))
             if up != 1:
                 vis = cv2.resize(vis, (vis.shape[1] * up, vis.shape[0] * up), interpolation=cv2.INTER_NEAREST)
-            txt = f"ep{self.episode} pspd={self._player_speed_ep:.2f} bmul={self._bullet_speed_scale_ep:.2f}"
+            txt = (
+                f"ep{self.episode} diff={self.cfg.difficulty:.2f} "
+                f"pspd={self._player_speed_ep:.2f} bmul={self._bullet_speed_scale_ep:.2f} "
+                f"last_sec={self._last_survival_sec:.1f} last_ok={int(self._last_episode_success)}"
+            )
             cv2.putText(vis, txt, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
             cv2.putText(vis, txt, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
             cv2.imshow(self.cfg.render_window, vis)

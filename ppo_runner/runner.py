@@ -395,7 +395,9 @@ def run(
     best_wall = 0.0
     best_game = 0.0
     best_reward = -1e9
+    best_steps = 0  # ✅ 추가
     surv_hist = deque(maxlen=int(max(1, survival_window)))
+
 
     if monitor_gpu:
         if torch.cuda.is_available() and str(getattr(agent, "device", "")).startswith("cuda"):
@@ -550,15 +552,23 @@ def run(
                 best_wall = float(wall_sec)
             if float(total_reward) > float(best_reward):
                 best_reward = float(total_reward)
+            if int(steps) > int(best_steps):          # ✅ 추가
+                best_steps = int(steps)               # ✅ 추가
+
 
             # sim speed info
             if use_sim:
                 sps = steps / max(wall_sec, 1e-9)
                 speed_x = sps / 60.0
+                cur_diff = float(getattr(getattr(env, "cfg", None), "difficulty", -1.0))
+
                 print(
-                    f"[SIM] wall={wall_sec:.3f}s game={game_sec:.3f}s "
-                    f"steps={steps} SPS={sps:.0f} (~{speed_x:.1f}x vs 60fps)"
+                    f"[SIM] game={game_sec:.3f}s "
+                    f"steps={steps} wall={wall_sec:.3f}s SPS={sps:.0f} (~{speed_x:.1f}x vs 60fps)"
                 )
+                # ✅ 추가: best_game / best_steps
+                print(f"[BIM] game={best_game:.3f}s steps={best_steps}")
+                print(f"[SIM] diff={cur_diff:.1f}")
 
             if (ep % int(max(1, print_survival_every))) == 0 or ep == 1:
                 avg_surv = float(np.mean(surv_hist)) if len(surv_hist) else 0.0
