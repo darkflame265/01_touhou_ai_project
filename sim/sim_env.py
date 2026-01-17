@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import cv2
 import numpy as np
 
-# Prefer project actions if available
+# Prefer project actions if available (env.actions.ACTIONS)
 try:
     from env.actions import ACTIONS as PROJECT_ACTIONS
 except Exception:
@@ -37,14 +37,14 @@ class SimConfig:
 
     # termination (hitbox)
     hit_radius: float = 4.0
-    max_steps: int = 3000
+    max_steps: int = 3600  # 60s @60fps
 
     # boss/emitter
     boss_y: float = 0.18
     boss_x_jitter: float = 0.12
     pattern_hold_steps: int = 240
 
-    # ✅ single knob difficulty (curriculum uses this)
+    # single knob difficulty (curriculum uses this)
     difficulty: float = 0.5  # start difficulty
     difficulty_min: float = 0.5
     difficulty_step: float = 0.1
@@ -54,11 +54,18 @@ class SimConfig:
     alive_reward: float = 0.02
     hit_penalty: float = 1.0
 
-    # ✅ STOP 제외한 액션 패널티 (강제 차분 유도)
-    move_penalty: float = 0.001
+    # ✅ move penalty 제거(0으로 고정)
+    move_penalty: float = 0.0
+
+    # ✅ 위험도 shaping (dmin 기반)
+    # - 위험 반경(risk_radius_px) 안으로 탄이 들어오면 risk가 0..1로 증가
+    # - reward에서 risk_coef * risk 만큼 깎음 (너무 크면 학습이 망가짐)
+    risk_shaping_enable: bool = True
+    risk_radius_px: float = 40.0
+    risk_coef: float = 0.01  # alive_reward(0.02) 대비 "약하게" 시작
 
     # background randomization
-    bg_enable: bool = True
+    bg_enable: bool = False
     bg_noise_amp: float = 18.0
     bg_flicker_amp: float = 22.0
 
@@ -72,7 +79,7 @@ class SimConfig:
     render_window: str = "SIM"
 
     # episode-wise speed randomization
-    speed_randomize: bool = True
+    speed_randomize: bool = False
     player_speed_min: float = 2.0
     player_speed_max: float = 3.0
     bullet_speed_scale_min: float = 0.80
@@ -100,39 +107,33 @@ class PatternEmitter:
     def spawn(self, env: "SimEnv"):
         cfg = env.cfg
 
-        # ✅ single knob difficulty
         d = float(getattr(cfg, "difficulty", 1.0))
         d = float(np.clip(d, 0.0, 5.0))
 
-        # d=0.1 같은 낮은 값이 "매우 쉬움"이 되도록 강하게 눌러줌
         gamma = 2.4
-        intensity = float(np.clip(d ** gamma, 0.0, 10.0))  # d=0.1 -> ~0.004
+        intensity = float(np.clip(d ** gamma, 0.0, 10.0))
 
         bx, by = env.boss_xy
         spd_scale_ep = float(env._bullet_speed_scale_ep)
 
-        # baseline (difficulty=1.0 기준)
-        base_rate = 6          # 낮을수록 더 자주 발사
+        base_rate = 6
         base_n0 = 14
         base_n1 = 20
         base_spd0 = 3.2
         base_spd1 = 2.3
 
-        # 발사 주기: intensity 낮으면 매우 드물게
         rate = int(round(base_rate / max(1e-6, (0.15 + 0.85 * intensity))))
         rate = int(np.clip(rate, 4, 60))
 
         if (env.t % rate) != 0:
             return
 
-        # 탄수: intensity에 비례 (랜덤 가산도 같이 감소)
         n0 = int(round(1 + (base_n0 - 1) * intensity))
         n1 = int(round(1 + (base_n1 - 1) * intensity))
         extra = int(self.rng.integers(0, 1 + int(round(6 * intensity))))
         n0 = int(np.clip(n0 + extra, 1, 96))
         n1 = int(np.clip(n1 + extra, 1, 110))
 
-        # 탄속: intensity 낮으면 느리게
         spd0 = base_spd0 * (0.35 + 0.65 * intensity) * float(self.rng.uniform(0.9, 1.15)) * spd_scale_ep
         spd1 = base_spd1 * (0.35 + 0.65 * intensity) * float(self.rng.uniform(0.95, 1.15)) * spd_scale_ep
 
@@ -168,7 +169,8 @@ class SimEnv:
         self.W = int(self.cfg.world_size)
         self.H = int(self.cfg.world_size)
 
-        self._actions = self._build_actions()  # 8-dir + STOP
+        # fallback-only action list (PROJECT_ACTIONS가 없을 때만 사용)
+        self._fallback_actions = self._build_fallback_actions()  # 8-dir + STOP
 
         # state
         self.t = 0
@@ -214,14 +216,13 @@ class SimEnv:
         self._player_speed_ep = float(self.cfg.player_speed)
         self._bullet_speed_scale_ep = 1.0
 
-        # curriculum bookkeeping (episode end -> next reset에서 적용)
+        # curriculum bookkeeping
         self._last_episode_done = False
         self._last_episode_success = False
         self._last_survival_sec = 0.0
 
     # ----------------- public -----------------
     def reset(self, seed: Optional[int] = None) -> np.ndarray:
-        # ✅ apply curriculum based on previous episode outcome
         if self._last_episode_done:
             self._apply_curriculum()
             self._last_episode_done = False
@@ -267,14 +268,29 @@ class SimEnv:
 
         # -------- reward --------
         reward = float(self.cfg.alive_reward)
-        if not is_stop:
+
+        # ✅ risk shaping (dmin 기반)
+        risk = 0.0
+        if bool(getattr(self.cfg, "risk_shaping_enable", True)):
+            R = float(max(1e-6, getattr(self.cfg, "risk_radius_px", 40.0)))
+            # dmin이 R보다 작아질수록 0..1로 증가
+            if np.isfinite(dmin):
+                risk = float(np.clip((R - float(dmin)) / R, 0.0, 1.0))
+            coef = float(getattr(self.cfg, "risk_coef", 0.01))
+            if coef != 0.0:
+                reward -= coef * risk
+
+        # move_penalty는 0.0이라 사실상 제거, 남겨도 무방
+        if (not is_stop) and float(self.cfg.move_penalty) != 0.0:
             reward -= float(self.cfg.move_penalty)
+
         if hit:
             reward -= float(self.cfg.hit_penalty)
 
-        # curriculum success 판단용: "60초 버팀" 또는 "max_steps까지 버팀"
         survival_sec = float(self.t) / float(max(1e-6, self.cfg.fps))
-        success = bool((survival_sec >= float(self.cfg.curriculum_target_survival_sec)) or time_limit)
+        max_possible_sec = float(self.cfg.max_steps) / float(max(1e-6, self.cfg.fps))
+        target = float(min(float(self.cfg.curriculum_target_survival_sec), max_possible_sec))
+        success = bool((survival_sec >= target) or time_limit)
 
         if done:
             self._last_episode_done = True
@@ -289,7 +305,8 @@ class SimEnv:
             "time_limit": bool(time_limit),
             "success": bool(success),
             "survival_sec": float(survival_sec),
-            "dmin": float(dmin) if np.isfinite(dmin) else 1e9,  # debug only
+            "dmin": float(dmin) if np.isfinite(dmin) else 1e9,
+            "risk": float(risk),  # ✅ 추가
             "bullet_n": int(self._b_n),
             "pattern": int(self.emitter.pattern_id),
             "player_xy": self.player_xy.copy(),
@@ -306,18 +323,19 @@ class SimEnv:
         cfg = self.cfg
         d = float(cfg.difficulty)
         step = float(getattr(cfg, "difficulty_step", 0.1))
+        dmin = float(getattr(cfg, "difficulty_min", 0.5))
 
-        # ✅ 성공하면 올라가고, 실패하면 그대로(절대 내려가지 않음)
+        # ✅ 성공: +step / 실패(게임오버): -step
         if bool(self._last_episode_success):
             d += step
+        else:
+            d -= step
 
-        # (원하면 상한도 둘 수 있음)
-        # dmax = float(getattr(cfg, "difficulty_max", 5.0))
-        # if d > dmax:
-        #     d = dmax
+        # ✅ 최소 난이도 고정
+        if d < dmin:
+            d = dmin
 
         cfg.difficulty = float(d)
-
 
     # ----------------- speed randomize -----------------
     def _maybe_resample_episode_speeds(self) -> None:
@@ -412,55 +430,33 @@ class SimEnv:
         return hit, dmin
 
     # ----------------- actions -----------------
-    def _build_actions(self) -> List[Any]:
-        if PROJECT_ACTIONS is None:
-            moves8: List[Any] = list(range(8))
-        else:
-            want = [
-                "SLOW_LEFT", "SLOW_RIGHT", "SLOW_UP", "SLOW_DOWN",
-                "SLOW_UP_LEFT", "SLOW_UP_RIGHT", "SLOW_DOWN_LEFT", "SLOW_DOWN_RIGHT",
-            ]
-            by_name = {getattr(a, "name", ""): a for a in PROJECT_ACTIONS}
-            picked = [by_name[n] for n in want if n in by_name]
-            if len(picked) == 8:
-                moves8 = picked
-            else:
-                # fallback: take first 8 non-bomb
-                tmp = []
-                for a in PROJECT_ACTIONS:
-                    n = str(getattr(a, "name", "")).upper()
-                    if "BOMB" in n:
-                        continue
-                    tmp.append(a)
-                moves8 = tmp[:8] if len(tmp) >= 8 else list(range(8))
-
+    def _build_fallback_actions(self) -> List[Any]:
+        moves8: List[Any] = list(range(8))
         return list(moves8) + [_StopAction()]
+
+    def _action_name_from_index(self, idx: int) -> str:
+        if PROJECT_ACTIONS is not None and 0 <= int(idx) < len(PROJECT_ACTIONS):
+            a = PROJECT_ACTIONS[int(idx)]
+            return str(getattr(a, "name", "")).upper()
+
+        act = self._fallback_actions[int(idx) % len(self._fallback_actions)]
+        return str(getattr(act, "name", "")).upper()
 
     def _action_to_delta(self, action_idx: Any) -> Tuple[float, float, bool]:
         spd = float(self._player_speed_ep)
 
         if isinstance(action_idx, (int, np.integer)):
-            act = self._actions[int(action_idx) % len(self._actions)]
+            name = self._action_name_from_index(int(action_idx))
         else:
-            act = action_idx
+            name = str(getattr(action_idx, "name", "")).upper()
 
-        name = str(getattr(act, "name", "")).upper()
-
-        if name == "STOP":
+        if name in ("STOP", "SLOW_STOP"):
             self.last_conf = 1.0
             self._update_xy_norm_and_uv()
             return 0.0, 0.0, True
 
         dx = (-spd if "LEFT" in name else (spd if "RIGHT" in name else 0.0))
         dy = (-spd if "UP" in name else (spd if "DOWN" in name else 0.0))
-
-        # int-only fallback (0..7)
-        if name == "" and isinstance(act, (int, np.integer)):
-            m = {
-                0: (-spd, 0.0), 1: (spd, 0.0), 2: (0.0, -spd), 3: (0.0, spd),
-                4: (-spd, -spd), 5: (spd, -spd), 6: (-spd, spd), 7: (spd, spd),
-            }
-            dx, dy = m[int(act) % 8]
 
         if dx and dy:
             s = 1.0 / np.sqrt(2.0)
@@ -499,10 +495,8 @@ class SimEnv:
             np.clip(bg, 0, 255, out=bg)
             img[:] = bg.astype(np.uint8)
 
-        # boss
         cv2.circle(img, (int(self.boss_xy[0]), int(self.boss_xy[1])), 5, 60, -1, lineType=cv2.LINE_AA)
 
-        # bullets
         n = int(self._b_n)
         if n > 0:
             pos = self._b_pos[:n]
@@ -511,7 +505,6 @@ class SimEnv:
                 c = int(120 + 60 * float(self.rng.uniform(0.0, 1.0)))
                 cv2.circle(img, (int(x), int(y)), int(self.cfg.bullet_radius), c, -1, lineType=cv2.LINE_AA)
 
-        # player
         cv2.circle(
             img,
             (int(self.player_xy[0]), int(self.player_xy[1])),
@@ -559,7 +552,6 @@ class SimEnv:
         return self._obs.copy()
 
     def _stamp_marker_and_meta(self, ch0: np.ndarray) -> None:
-        # marker cross
         u, v = self._uv
         r = int(self.marker_half)
         if r > 0:
@@ -569,7 +561,6 @@ class SimEnv:
             ch0[v, x1:x2] = val
             ch0[y1:y2, u] = val
 
-        # meta patch: (x,y,conf)
         p = int(self.meta_patch)
         if p > 0 and ch0.shape[0] >= p and ch0.shape[1] >= (p * 3):
             x_n, y_n = self.last_xy_norm
@@ -598,4 +589,7 @@ class SimEnv:
         y_n = float(np.clip(self.player_xy[1] / max(1.0, (self.H - 1)), 0.0, 1.0))
         self.last_xy_norm = (x_n, y_n)
         self._uv = (int(round(x_n * (self.s - 1))), int(round(y_n * (self.s - 1))))
-        self._uv = (int(np.clip(self._uv[0], 0, self.s - 1)), int(np.clip(self._uv[1], 0, self.s - 1)))
+        self._uv = (
+            int(np.clip(self._uv[0], 0, self.s - 1)),
+            int(np.clip(self._uv[1], 0, self.s - 1)),
+        )
