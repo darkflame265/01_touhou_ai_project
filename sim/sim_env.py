@@ -1,3 +1,4 @@
+# sim/sim_env.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -54,10 +55,10 @@ class SimConfig:
     alive_reward: float = 0.02
     hit_penalty: float = 1.0
 
-    # ✅ move penalty 제거(0으로 고정)
+    # move penalty 제거(0으로 고정)
     move_penalty: float = 0.0
 
-    # ✅ 위험도 shaping (dmin 기반)
+    # 위험도 shaping (dmin 기반)
     # - 위험 반경(risk_radius_px) 안으로 탄이 들어오면 risk가 0..1로 증가
     # - reward에서 risk_coef * risk 만큼 깎음 (너무 크면 학습이 망가짐)
     risk_shaping_enable: bool = True
@@ -110,30 +111,34 @@ class PatternEmitter:
         d = float(getattr(cfg, "difficulty", 1.0))
         d = float(np.clip(d, 0.0, 5.0))
 
+        # d=0.1 같은 낮은 값이 매우 쉬움이 되도록 눌러줌
         gamma = 2.4
         intensity = float(np.clip(d ** gamma, 0.0, 10.0))
 
         bx, by = env.boss_xy
         spd_scale_ep = float(env._bullet_speed_scale_ep)
 
+        # baseline (difficulty=1.0 기준)
         base_rate = 6
         base_n0 = 14
         base_n1 = 20
         base_spd0 = 3.2
         base_spd1 = 2.3
 
+        # 발사 주기: intensity 낮으면 매우 드물게
         rate = int(round(base_rate / max(1e-6, (0.15 + 0.85 * intensity))))
         rate = int(np.clip(rate, 4, 60))
-
         if (env.t % rate) != 0:
             return
 
+        # 탄수: intensity에 비례
         n0 = int(round(1 + (base_n0 - 1) * intensity))
         n1 = int(round(1 + (base_n1 - 1) * intensity))
         extra = int(self.rng.integers(0, 1 + int(round(6 * intensity))))
         n0 = int(np.clip(n0 + extra, 1, 96))
         n1 = int(np.clip(n1 + extra, 1, 110))
 
+        # 탄속: intensity 낮으면 느리게
         spd0 = base_spd0 * (0.35 + 0.65 * intensity) * float(self.rng.uniform(0.9, 1.15)) * spd_scale_ep
         spd1 = base_spd1 * (0.35 + 0.65 * intensity) * float(self.rng.uniform(0.95, 1.15)) * spd_scale_ep
 
@@ -269,18 +274,20 @@ class SimEnv:
         # -------- reward --------
         reward = float(self.cfg.alive_reward)
 
-        # ✅ risk shaping (dmin 기반)
+        # risk shaping (dmin 기반)
         risk = 0.0
         if bool(getattr(self.cfg, "risk_shaping_enable", True)):
             R = float(max(1e-6, getattr(self.cfg, "risk_radius_px", 40.0)))
-            # dmin이 R보다 작아질수록 0..1로 증가
             if np.isfinite(dmin):
+                # dmin < R 이면 위험도 증가 (0..1)
                 risk = float(np.clip((R - float(dmin)) / R, 0.0, 1.0))
+            else:
+                risk = 0.0
             coef = float(getattr(self.cfg, "risk_coef", 0.01))
             if coef != 0.0:
                 reward -= coef * risk
 
-        # move_penalty는 0.0이라 사실상 제거, 남겨도 무방
+        # move_penalty는 0.0이라 사실상 제거
         if (not is_stop) and float(self.cfg.move_penalty) != 0.0:
             reward -= float(self.cfg.move_penalty)
 
@@ -306,7 +313,7 @@ class SimEnv:
             "success": bool(success),
             "survival_sec": float(survival_sec),
             "dmin": float(dmin) if np.isfinite(dmin) else 1e9,
-            "risk": float(risk),  # ✅ 추가
+            "risk": float(risk),
             "bullet_n": int(self._b_n),
             "pattern": int(self.emitter.pattern_id),
             "player_xy": self.player_xy.copy(),
@@ -325,13 +332,13 @@ class SimEnv:
         step = float(getattr(cfg, "difficulty_step", 0.1))
         dmin = float(getattr(cfg, "difficulty_min", 0.5))
 
-        # ✅ 성공: +step / 실패(게임오버): -step
+        # 성공: +step / 실패(게임오버): -step
         if bool(self._last_episode_success):
             d += step
         else:
             d -= step
 
-        # ✅ 최소 난이도 고정
+        # 최소 난이도 고정
         if d < dmin:
             d = dmin
 
@@ -450,6 +457,7 @@ class SimEnv:
         else:
             name = str(getattr(action_idx, "name", "")).upper()
 
+        # STOP 계열 처리
         if name in ("STOP", "SLOW_STOP"):
             self.last_conf = 1.0
             self._update_xy_norm_and_uv()
@@ -495,8 +503,10 @@ class SimEnv:
             np.clip(bg, 0, 255, out=bg)
             img[:] = bg.astype(np.uint8)
 
+        # boss
         cv2.circle(img, (int(self.boss_xy[0]), int(self.boss_xy[1])), 5, 60, -1, lineType=cv2.LINE_AA)
 
+        # bullets
         n = int(self._b_n)
         if n > 0:
             pos = self._b_pos[:n]
@@ -505,6 +515,7 @@ class SimEnv:
                 c = int(120 + 60 * float(self.rng.uniform(0.0, 1.0)))
                 cv2.circle(img, (int(x), int(y)), int(self.cfg.bullet_radius), c, -1, lineType=cv2.LINE_AA)
 
+        # player
         cv2.circle(
             img,
             (int(self.player_xy[0]), int(self.player_xy[1])),
@@ -522,14 +533,55 @@ class SimEnv:
             vis = cv2.cvtColor(world, cv2.COLOR_GRAY2BGR)
             up = int(max(1, self.cfg.render_upscale))
             if up != 1:
-                vis = cv2.resize(vis, (vis.shape[1] * up, vis.shape[0] * up), interpolation=cv2.INTER_NEAREST)
-            txt = (
-                f"ep{self.episode} diff={self.cfg.difficulty:.2f} "
-                f"pspd={self._player_speed_ep:.2f} bmul={self._bullet_speed_scale_ep:.2f} "
-                f"last_sec={self._last_survival_sec:.1f} last_ok={int(self._last_episode_success)}"
-            )
-            cv2.putText(vis, txt, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2, cv2.LINE_AA)
-            cv2.putText(vis, txt, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 0, 0), 1, cv2.LINE_AA)
+                vis = cv2.resize(
+                    vis,
+                    (vis.shape[1] * up, vis.shape[0] * up),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+
+            # 디버그 텍스트 (dmin/risk/bullets 포함)
+            _, dmin = self._check_hit_and_dmin()
+            R = float(max(1e-6, getattr(self.cfg, "risk_radius_px", 40.0)))
+            risk = 0.0
+            if np.isfinite(dmin):
+                risk = float(np.clip((R - float(dmin)) / R, 0.0, 1.0))
+
+            # ✅ 경과시간 추가
+            t_sec = float(self.t) / float(max(1e-6, self.cfg.fps))
+
+            # ✅ 여러 줄로 출력 (한 화면에 다 들어가게)
+            lines = [
+                f"ep{self.episode} diff={self.cfg.difficulty:.2f} t={t_sec:.1f}s",
+                f"bul={self._b_n:3d} dmin={dmin:3.1f} risk={risk:.2f}",
+                f"last_sec={self._last_survival_sec:.1f} last_ok={int(self._last_episode_success)}",
+            ]
+
+            x0, y0 = 10, 22
+            dy = 18  # 줄 간격 (픽셀)
+
+            for i, line in enumerate(lines):
+                y = y0 + i * dy
+                cv2.putText(
+                    vis,
+                    line,
+                    (x0, y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52,
+                    (255, 255, 255),
+                    2,
+                    cv2.LINE_AA,
+                )
+                cv2.putText(
+                    vis,
+                    line,
+                    (x0, y),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.52,
+                    (0, 0, 0),
+                    1,
+                    cv2.LINE_AA,
+                )
+
             cv2.imshow(self.cfg.render_window, vis)
             cv2.waitKey(int(self.cfg.render_wait))
 
@@ -550,6 +602,7 @@ class SimEnv:
 
         self._prev_gray_u8 = gray_u8
         return self._obs.copy()
+
 
     def _stamp_marker_and_meta(self, ch0: np.ndarray) -> None:
         u, v = self._uv
