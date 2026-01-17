@@ -25,6 +25,10 @@ class SimConfig:
     obs_out_size: int = 128
     world_size: int = 256
 
+    render_view: int = 99
+    # 99: world(기존)
+    # 0~3: obs 채널 표시
+
     # time base (for "60 seconds" curriculum)
     fps: float = 60.0
 
@@ -176,6 +180,8 @@ class SimEnv:
 
         # fallback-only action list (PROJECT_ACTIONS가 없을 때만 사용)
         self._fallback_actions = self._build_fallback_actions()  # 8-dir + STOP
+
+
 
         # state
         self.t = 0
@@ -529,62 +535,7 @@ class SimEnv:
     def _build_obs(self) -> np.ndarray:
         world = self._render_world_gray_u8()
 
-        if bool(self.cfg.render):
-            vis = cv2.cvtColor(world, cv2.COLOR_GRAY2BGR)
-            up = int(max(1, self.cfg.render_upscale))
-            if up != 1:
-                vis = cv2.resize(
-                    vis,
-                    (vis.shape[1] * up, vis.shape[0] * up),
-                    interpolation=cv2.INTER_NEAREST,
-                )
-
-            # 디버그 텍스트 (dmin/risk/bullets 포함)
-            _, dmin = self._check_hit_and_dmin()
-            R = float(max(1e-6, getattr(self.cfg, "risk_radius_px", 40.0)))
-            risk = 0.0
-            if np.isfinite(dmin):
-                risk = float(np.clip((R - float(dmin)) / R, 0.0, 1.0))
-
-            # ✅ 경과시간 추가
-            t_sec = float(self.t) / float(max(1e-6, self.cfg.fps))
-
-            # ✅ 여러 줄로 출력 (한 화면에 다 들어가게)
-            lines = [
-                f"ep{self.episode} diff={self.cfg.difficulty:.2f} t={t_sec:.1f}s",
-                f"bul={self._b_n:3d} dmin={dmin:3.1f} risk={risk:.2f}",
-                f"last_sec={self._last_survival_sec:.1f} last_ok={int(self._last_episode_success)}",
-            ]
-
-            x0, y0 = 10, 22
-            dy = 18  # 줄 간격 (픽셀)
-
-            for i, line in enumerate(lines):
-                y = y0 + i * dy
-                cv2.putText(
-                    vis,
-                    line,
-                    (x0, y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.52,
-                    (255, 255, 255),
-                    2,
-                    cv2.LINE_AA,
-                )
-                cv2.putText(
-                    vis,
-                    line,
-                    (x0, y),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.52,
-                    (0, 0, 0),
-                    1,
-                    cv2.LINE_AA,
-                )
-
-            cv2.imshow(self.cfg.render_window, vis)
-            cv2.waitKey(int(self.cfg.render_wait))
-
+        # --- downscale to obs size ---
         gray_u8 = cv2.resize(world, (self.s, self.s), interpolation=cv2.INTER_AREA)
 
         if self._prev_gray_u8 is None or self._prev_gray_u8.shape != gray_u8.shape:
@@ -594,14 +545,63 @@ class SimEnv:
             prev_u8 = self._prev_gray_u8
             diff_u8 = cv2.absdiff(gray_u8, prev_u8)
 
+        # --- build obs (4ch float32) ---
         self._obs[0] = gray_u8.astype(np.float32) / 255.0
         self._stamp_marker_and_meta(self._obs[0])
         self._obs[1] = prev_u8.astype(np.float32) / 255.0
         self._obs[2] = diff_u8.astype(np.float32) / 255.0
         self._obs[3] = self._player_hint_map()
 
+        # --- render (ONLY ONCE) ---
+        if bool(self.cfg.render):
+            view = int(getattr(self.cfg, "render_view", 99))
+
+            if view == 99:
+                # world view (256x256)
+                show_u8 = world
+            else:
+                # obs channel view (128x128)
+                ch = int(np.clip(view, 0, 3))
+                show_u8 = np.clip(self._obs[ch] * 255.0, 0, 255).astype(np.uint8)
+
+            vis = cv2.cvtColor(show_u8, cv2.COLOR_GRAY2BGR)
+
+            up = int(max(1, self.cfg.render_upscale))
+            if up != 1:
+                vis = cv2.resize(
+                    vis,
+                    (vis.shape[1] * up, vis.shape[0] * up),
+                    interpolation=cv2.INTER_NEAREST,
+                )
+
+            # ---- debug text (dmin/risk/bullets + elapsed) ----
+            _, dmin = self._check_hit_and_dmin()
+            R = float(max(1e-6, getattr(self.cfg, "risk_radius_px", 40.0)))
+            risk = 0.0
+            if np.isfinite(dmin):
+                risk = float(np.clip((R - float(dmin)) / R, 0.0, 1.0))
+
+            t_sec = float(self.t) / float(max(1e-6, self.cfg.fps))
+
+            lines = [
+                f"view={view} ep{self.episode} diff={self.cfg.difficulty:.2f} t={t_sec:.1f}s",
+                f"bul={self._b_n:3d} dmin={dmin:3.1f} risk={risk:.2f}",
+                f"last_sec={self._last_survival_sec:.1f} last_ok={int(self._last_episode_success)}",
+            ]
+
+            x0, y0 = 10, 22
+            dy = 18
+            for i, line in enumerate(lines):
+                y = y0 + i * dy
+                cv2.putText(vis, line, (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (255, 255, 255), 2, cv2.LINE_AA)
+                cv2.putText(vis, line, (x0, y), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (0, 0, 0), 1, cv2.LINE_AA)
+
+            cv2.imshow(self.cfg.render_window, vis)
+            cv2.waitKey(int(self.cfg.render_wait))
+
         self._prev_gray_u8 = gray_u8
         return self._obs.copy()
+
 
 
     def _stamp_marker_and_meta(self, ch0: np.ndarray) -> None:
