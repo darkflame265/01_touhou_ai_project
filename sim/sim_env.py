@@ -29,7 +29,7 @@ class SimConfig:
     # 99: world(기존)
     # 0~3: obs 채널 표시
 
-    # time base (for "60 seconds" curriculum)
+    # time base
     fps: float = 60.0
 
     # player
@@ -49,25 +49,27 @@ class SimConfig:
     boss_x_jitter: float = 0.12
     pattern_hold_steps: int = 240
 
+    # ---------------------------
     # single knob difficulty (curriculum uses this)
-    difficulty: float = 0.5  # start difficulty
-    difficulty_min: float = 0.5
-    difficulty_step: float = 0.1
-    curriculum_target_survival_sec: float = 60.0
+    # ---------------------------
+    difficulty: float = 0.3       # start difficulty
+    difficulty_min: float = 0.3   # min difficulty
+    difficulty_step: float = 0.1  # step = +0.1
 
-    # reward
+    # ---------------------------
+    # curriculum: success-rate based (UP ONLY)
+    # ---------------------------
+    curriculum_enable: bool = True
+    curriculum_window: int = 20          # N판 (최근 N판)
+    curriculum_up_success_rate: float = 0.50  # 90% 이상이면 승급
+    curriculum_target_survival_sec: float = 60.0  # "완주" 기준(현재 max_steps와 동일하게 60초)
+
+    # reward: ✅ 생존 보상 + 피격 패널티만 사용
     alive_reward: float = 0.02
-    hit_penalty: float = 1.0
+    hit_penalty: float = 30.0
 
     # move penalty 제거(0으로 고정)
     move_penalty: float = 0.0
-
-    # 위험도 shaping (dmin 기반)
-    # - 위험 반경(risk_radius_px) 안으로 탄이 들어오면 risk가 0..1로 증가
-    # - reward에서 risk_coef * risk 만큼 깎음 (너무 크면 학습이 망가짐)
-    risk_shaping_enable: bool = True
-    risk_radius_px: float = 40.0
-    risk_coef: float = 0.01  # alive_reward(0.02) 대비 "약하게" 시작
 
     # background randomization
     bg_enable: bool = False
@@ -115,7 +117,7 @@ class PatternEmitter:
         d = float(getattr(cfg, "difficulty", 1.0))
         d = float(np.clip(d, 0.0, 5.0))
 
-        # d=0.1 같은 낮은 값이 매우 쉬움이 되도록 눌러줌
+        # d가 낮을수록 매우 쉬움이 되도록
         gamma = 2.4
         intensity = float(np.clip(d ** gamma, 0.0, 10.0))
 
@@ -181,8 +183,6 @@ class SimEnv:
         # fallback-only action list (PROJECT_ACTIONS가 없을 때만 사용)
         self._fallback_actions = self._build_fallback_actions()  # 8-dir + STOP
 
-
-
         # state
         self.t = 0
         self.episode = 0
@@ -229,8 +229,9 @@ class SimEnv:
 
         # curriculum bookkeeping
         self._last_episode_done = False
-        self._last_episode_success = False
         self._last_survival_sec = 0.0
+        self._last_success = False
+        self._success_hist: List[bool] = []
 
     # ----------------- public -----------------
     def reset(self, seed: Optional[int] = None) -> np.ndarray:
@@ -241,6 +242,7 @@ class SimEnv:
         if seed is not None:
             self.rng = np.random.default_rng(seed)
             self.emitter = PatternEmitter(self.rng)
+            self._success_hist = []
 
         self.episode += 1
         self.t = 0
@@ -273,42 +275,25 @@ class SimEnv:
 
         self._move_bullets()
 
-        hit, dmin = self._check_hit_and_dmin()
+        hit = self._check_hit()
         time_limit = (self.t >= int(self.cfg.max_steps))
         done = bool(hit or time_limit)
 
-        # -------- reward --------
+        # -------- reward: ✅ alive + hit only --------
         reward = float(self.cfg.alive_reward)
-
-        # risk shaping (dmin 기반)
-        risk = 0.0
-        if bool(getattr(self.cfg, "risk_shaping_enable", True)):
-            R = float(max(1e-6, getattr(self.cfg, "risk_radius_px", 40.0)))
-            if np.isfinite(dmin):
-                # dmin < R 이면 위험도 증가 (0..1)
-                risk = float(np.clip((R - float(dmin)) / R, 0.0, 1.0))
-            else:
-                risk = 0.0
-            coef = float(getattr(self.cfg, "risk_coef", 0.01))
-            if coef != 0.0:
-                reward -= coef * risk
-
-        # move_penalty는 0.0이라 사실상 제거
-        if (not is_stop) and float(self.cfg.move_penalty) != 0.0:
-            reward -= float(self.cfg.move_penalty)
-
         if hit:
             reward -= float(self.cfg.hit_penalty)
 
         survival_sec = float(self.t) / float(max(1e-6, self.cfg.fps))
-        max_possible_sec = float(self.cfg.max_steps) / float(max(1e-6, self.cfg.fps))
-        target = float(min(float(self.cfg.curriculum_target_survival_sec), max_possible_sec))
-        success = bool((survival_sec >= target) or time_limit)
+
+        # "완주(success)" 판정: time_limit 도달 (즉 max_steps까지 생존)
+        # (curriculum_target_survival_sec는 max_steps/fps와 동일하므로 사실상 같은 기준)
+        success = bool(time_limit)
 
         if done:
             self._last_episode_done = True
-            self._last_episode_success = bool(success)
             self._last_survival_sec = float(survival_sec)
+            self._last_success = bool(success)
 
         obs = self._build_obs()
         info = {
@@ -318,8 +303,6 @@ class SimEnv:
             "time_limit": bool(time_limit),
             "success": bool(success),
             "survival_sec": float(survival_sec),
-            "dmin": float(dmin) if np.isfinite(dmin) else 1e9,
-            "risk": float(risk),
             "bullet_n": int(self._b_n),
             "pattern": int(self.emitter.pattern_id),
             "player_xy": self.player_xy.copy(),
@@ -333,22 +316,46 @@ class SimEnv:
 
     # ----------------- curriculum -----------------
     def _apply_curriculum(self) -> None:
+        """
+        ✅ 성공률 기반 'UP ONLY' 커리큘럼
+
+        - 최근 N판(=curriculum_window) "완주(success)" 성공률을 계산
+        - 성공률 >= curriculum_up_success_rate 이면 difficulty += difficulty_step
+        - difficulty는 difficulty_min 아래로 내려가지 않음 (내리는 로직 없음)
+        """
         cfg = self.cfg
-        d = float(cfg.difficulty)
+        if not bool(getattr(cfg, "curriculum_enable", True)):
+            return
+
+        win = int(max(1, getattr(cfg, "curriculum_window", 20)))
+        up_sr = float(getattr(cfg, "curriculum_up_success_rate", 0.90))
         step = float(getattr(cfg, "difficulty_step", 0.1))
-        dmin = float(getattr(cfg, "difficulty_min", 0.5))
+        dmin = float(getattr(cfg, "difficulty_min", 0.3))
 
-        # 성공: +step / 실패(게임오버): -step
-        if bool(self._last_episode_success):
-            d += step
+        # history update (latest window)
+        self._success_hist.append(bool(self._last_success))
+        if len(self._success_hist) > win:
+            self._success_hist = self._success_hist[-win:]
+
+        # success rate
+        if self._success_hist:
+            sr = float(np.mean(np.asarray(self._success_hist, dtype=np.float32)))
         else:
-            d -= step
+            sr = 0.0
 
-        # 최소 난이도 고정
+        d = float(getattr(cfg, "difficulty", dmin))
         if d < dmin:
             d = dmin
 
+        if sr >= up_sr:
+            d = float(d + step)
+
         cfg.difficulty = float(d)
+
+    def curriculum_success_rate(self) -> float:
+        if not self._success_hist:
+            return 0.0
+        return float(np.mean(np.asarray(self._success_hist, dtype=np.float32)))
 
     # ----------------- speed randomize -----------------
     def _maybe_resample_episode_speeds(self) -> None:
@@ -426,21 +433,19 @@ class SimEnv:
         self._b_n = newn
 
     # ----------------- hit check -----------------
-    def _check_hit_and_dmin(self) -> Tuple[bool, float]:
+    def _check_hit(self) -> bool:
         n = int(self._b_n)
         if n <= 0:
-            return False, float("inf")
+            return False
         alive = self._b_alive[:n]
         if not bool(alive.any()):
-            return False, float("inf")
+            return False
 
         pos = self._b_pos[:n][alive]
         d = pos - self.player_xy[None, :]
-        dist = np.sqrt(np.sum(d * d, axis=1))
-
-        dmin = float(dist.min()) if dist.size else float("inf")
-        hit = bool(np.any(dist <= float(self.cfg.hit_radius)))
-        return hit, dmin
+        dist2 = np.sum(d * d, axis=1)
+        r = float(self.cfg.hit_radius)
+        return bool(np.any(dist2 <= (r * r)))
 
     # ----------------- actions -----------------
     def _build_fallback_actions(self) -> List[Any]:
@@ -535,7 +540,7 @@ class SimEnv:
     def _build_obs(self) -> np.ndarray:
         world = self._render_world_gray_u8()
 
-        # --- downscale to obs size ---
+        # downscale to obs size
         gray_u8 = cv2.resize(world, (self.s, self.s), interpolation=cv2.INTER_AREA)
 
         if self._prev_gray_u8 is None or self._prev_gray_u8.shape != gray_u8.shape:
@@ -545,22 +550,20 @@ class SimEnv:
             prev_u8 = self._prev_gray_u8
             diff_u8 = cv2.absdiff(gray_u8, prev_u8)
 
-        # --- build obs (4ch float32) ---
+        # build obs (4ch float32)
         self._obs[0] = gray_u8.astype(np.float32) / 255.0
         self._stamp_marker_and_meta(self._obs[0])
         self._obs[1] = prev_u8.astype(np.float32) / 255.0
         self._obs[2] = diff_u8.astype(np.float32) / 255.0
         self._obs[3] = self._player_hint_map()
 
-        # --- render (ONLY ONCE) ---
+        # render (debug)
         if bool(self.cfg.render):
             view = int(getattr(self.cfg, "render_view", 99))
 
             if view == 99:
-                # world view (256x256)
                 show_u8 = world
             else:
-                # obs channel view (128x128)
                 ch = int(np.clip(view, 0, 3))
                 show_u8 = np.clip(self._obs[ch] * 255.0, 0, 255).astype(np.uint8)
 
@@ -574,19 +577,16 @@ class SimEnv:
                     interpolation=cv2.INTER_NEAREST,
                 )
 
-            # ---- debug text (dmin/risk/bullets + elapsed) ----
-            _, dmin = self._check_hit_and_dmin()
-            R = float(max(1e-6, getattr(self.cfg, "risk_radius_px", 40.0)))
-            risk = 0.0
-            if np.isfinite(dmin):
-                risk = float(np.clip((R - float(dmin)) / R, 0.0, 1.0))
-
             t_sec = float(self.t) / float(max(1e-6, self.cfg.fps))
+
+            win = int(max(1, getattr(self.cfg, "curriculum_window", 20)))
+            sr = self.curriculum_success_rate()
+            up_sr = float(getattr(self.cfg, "curriculum_up_success_rate", 0.90))
 
             lines = [
                 f"view={view} ep{self.episode} diff={self.cfg.difficulty:.2f} t={t_sec:.1f}s",
-                f"bul={self._b_n:3d} dmin={dmin:3.1f} risk={risk:.2f}",
-                f"last_sec={self._last_survival_sec:.1f} last_ok={int(self._last_episode_success)}",
+                f"bul={self._b_n:3d}",
+                f"last_sec={self._last_survival_sec:.1f} succ{win}={sr*100:.0f}% up>={up_sr*100:.0f}%",
             ]
 
             x0, y0 = 10, 22
@@ -601,8 +601,6 @@ class SimEnv:
 
         self._prev_gray_u8 = gray_u8
         return self._obs.copy()
-
-
 
     def _stamp_marker_and_meta(self, ch0: np.ndarray) -> None:
         u, v = self._uv

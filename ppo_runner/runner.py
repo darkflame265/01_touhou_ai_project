@@ -244,6 +244,51 @@ def _select_action_best_effort(agent, state, action_mask: np.ndarray | None):
 
 
 # ----------------------------
+# PPO debug metrics (best-effort)
+# ----------------------------
+def _fmt_num(x, nd: int = 4) -> str:
+    try:
+        if x is None:
+            return "NA"
+        if isinstance(x, (int, np.integer)):
+            return str(int(x))
+        v = float(x)
+        if not np.isfinite(v):
+            return "NA"
+        return f"{v:.{nd}f}"
+    except Exception:
+        return "NA"
+
+
+def _get_first_attr(obj, names: list[str]):
+    for n in names:
+        if hasattr(obj, n):
+            try:
+                return getattr(obj, n)
+            except Exception:
+                pass
+    return None
+
+
+def _ppo_debug_line(agent) -> str:
+    ent = _get_first_attr(agent, ["last_entropy", "entropy", "ent", "ent_mean"])
+    kl = _get_first_attr(agent, ["last_kl", "approx_kl", "kl", "kl_mean"])
+    clipfrac = _get_first_attr(agent, ["last_clipfrac", "clipfrac", "clip_frac", "clip_fraction"])
+
+    lr = None
+    opt = _get_first_attr(agent, ["optimizer", "opt"])
+    if opt is not None:
+        try:
+            lr = opt.param_groups[0].get("lr", None)
+        except Exception:
+            lr = None
+    if lr is None:
+        lr = _get_first_attr(agent, ["lr", "learning_rate", "last_lr"])
+
+    return f"[PPO] ent={_fmt_num(ent, 4)} kl={_fmt_num(kl, 5)} clipfrac={_fmt_num(clipfrac, 4)} lr={_fmt_num(lr, 6)}"
+
+
+# ----------------------------
 # Sim frame stacker (runner-side)
 # ----------------------------
 class _SimFrameStacker:
@@ -307,13 +352,13 @@ def _load_agent_and_env(ckpt_path: str, no_render: bool, use_sim: bool):
         print("[PPO] no checkpoint found, training from scratch")
 
     # overrides (기존 유지)
-    agent.ent_coef = 0.04
+    agent.ent_coef = 0.02
     agent.ent_min = 0.005
     agent.ent_decay = 0.9995
     agent.ent_warmup_updates = 30
-    agent.clip_eps = 0.15
-    agent.rollout_steps = 128
-    agent.update_epochs = 5
+    agent.clip_eps = 0.12
+    agent.rollout_steps = 256
+    agent.update_epochs = 3
 
     print(f"[PPO] input_channels={input_channels} (obs_channels={obs_channels} * stack={stack_size})")
     print(
@@ -351,7 +396,6 @@ def run(
     # smooth update knobs (step-based)
     update_every_steps: int = 8,
     update_max_per_trigger: int = 1,
-    update_time_budget_ms: float = 6.0,
 
     # survival prints
     print_survival_every: int = 10,
@@ -380,7 +424,15 @@ def run(
     best_game = 0.0
     best_reward = -1e9
     best_steps = 0
+
+    # 기존 wall 기반(유지: SURV 출력용)
     surv_hist = deque(maxlen=int(max(1, survival_window)))
+
+    # 최근 20개 평균(게임시간) 표시용
+    sim_surv_hist20 = deque(maxlen=20)
+
+    # ✅ 최근 20개 "클리어(success)" 개수 표시용
+    sim_clear_hist20 = deque(maxlen=20)
 
     if monitor_gpu:
         if torch.cuda.is_available() and str(getattr(agent, "device", "")).startswith("cuda"):
@@ -471,6 +523,10 @@ def run(
 
                     exec_idx = int(action_idx)
                     exec_name = str(getattr(ACTIONS[int(exec_idx)], "name", ""))
+
+                    # ✅ (선택) 여기서도 쓰고 싶으면 가능하지만,
+                    # 실제 "최근20 clear" 집계는 에피소드 끝에서 기록하는 게 안전함.
+                    # (에피소드 단위로 1개 bool만 넣고 싶으니까)
                 else:
                     next_state, reward, done = env.step(action_idx)
                     exec_idx = getattr(env.s, "exec_action_idx", action_idx)
@@ -488,18 +544,17 @@ def run(
                 total_reward += float(reward)
                 steps += 1
 
-                # PPO update (train only)
+                # -------------------------------------------------
+                # ✅ PPO update: "시간 예산" 제거 -> step/rollout 기준만
+                # -------------------------------------------------
                 if do_io:
                     if int(update_every_steps) > 0 and (steps % int(update_every_steps)) == 0:
-                        t_budget_end = time.perf_counter() + (float(update_time_budget_ms) / 1000.0)
                         k = 0
                         while agent.should_update():
                             agent.update(last_state=state, last_done=False)
                             local_updates += 1
                             k += 1
                             if k >= int(max(1, update_max_per_trigger)):
-                                break
-                            if time.perf_counter() >= t_budget_end:
                                 break
 
                 # GPU monitor
@@ -523,7 +578,28 @@ def run(
             wall_sec = time.time() - ep_t0
             game_sec = float(steps) / 60.0
 
+            # 기존 SURV용(벽시계) 유지
             surv_hist.append(float(wall_sec))
+
+            # 최근 20개 평균(게임시간) 표시 + ✅ 최근20 clear 집계
+            if use_sim:
+                sim_surv_hist20.append(float(game_sec))
+                avg20 = float(np.mean(sim_surv_hist20)) if len(sim_surv_hist20) else 0.0
+
+                # ✅ 에피소드 단위 success 기록
+                # SimEnv.info["success"]는 time_limit 도달 여부(=완주)로 넣어둔 상태
+                try:
+                    ep_success = bool(_info.get("success", False))  # _info는 마지막 step의 info
+                except Exception:
+                    ep_success = False
+                sim_clear_hist20.append(bool(ep_success))
+
+                clear_n = int(np.sum(np.asarray(sim_clear_hist20, dtype=np.int32)))
+                clear_d = int(len(sim_clear_hist20))
+            else:
+                avg20 = 0.0
+                clear_n = 0
+                clear_d = 0
 
             # best tracking
             if float(game_sec) > float(best_game):
@@ -541,8 +617,14 @@ def run(
                 speed_x = sps / 60.0
                 cur_diff = float(getattr(getattr(env, "cfg", None), "difficulty", -1.0))
 
-                print(f"[SIM] game={game_sec:.3f}s steps={steps} wall={wall_sec:.3f}s SPS={sps:.0f} (~{speed_x:.1f}x vs 60fps)")
+                # ✅ avg20 옆에 clear=8/20 출력
+                print(
+                    f"[SIM] game={game_sec:.3f}s steps={steps}  "
+                    f"avg20={avg20:.3f}s clear={clear_n}/{max(1, clear_d)} "
+                    f"SPS={sps:.0f} (~{speed_x:.1f}x vs 60fps)"
+                )
                 print(f"[BST] game={best_game:.3f}s steps={best_steps} diff={cur_diff:.1f}")
+                print(_ppo_debug_line(agent))
 
             if (ep % int(max(1, print_survival_every))) == 0 or ep == 1:
                 avg_surv = float(np.mean(surv_hist)) if len(surv_hist) else 0.0
@@ -551,13 +633,6 @@ def run(
             slow_ratio = slow_count / max(1, steps)
             stop_count = int(action_counter.get(stop_name, 0)) if stop_name else 0
             stop_ratio = (stop_count / max(1, steps)) if stop_name else 0.0
-
-            top_actions = action_counter.most_common(5)
-            top_actions_str = ";".join(f"{k}:{v}" for k, v in top_actions)
-            if stop_name:
-                in_top = any(k == stop_name for k, _ in top_actions)
-                if not in_top:
-                    top_actions_str = f"{top_actions_str};{stop_name}:{stop_count}"
 
             note_parts = []
             if eval_mode:
@@ -569,7 +644,7 @@ def run(
             print(
                 f"[PPO] episode end | steps={steps} total_reward={total_reward:.1f} "
                 f"wall_sec={wall_sec:.2f} game_sec={game_sec:.2f} slow_ratio={slow_ratio:.3f} "
-                f"stop_ratio={stop_ratio:.3f} updates(ep)={local_updates} top_actions={top_actions_str} {note}"
+                f"stop_ratio={stop_ratio:.3f} updates(ep)={local_updates} {note}"
             )
 
             if not do_io:

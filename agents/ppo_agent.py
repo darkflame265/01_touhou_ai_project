@@ -12,11 +12,10 @@ class PPOAgent:
     """
     PPOAgent with action masking support.
 
-    Improvements vs your current version:
-    - Value function clipping (PPO2-style) to stabilize value learning.
-    - Extra PPO diagnostics: approx_kl, clipfrac, explained_variance.
-    - Safer entropy schedule defaults (less "constant shaking" in late training).
-    - Minor perf: avoid re-allocating neg tensor every masking call.
+    This version additionally:
+    - Exposes stable "last_*" debug metrics so runner never prints NA:
+      last_entropy, last_kl, last_clipfrac, last_lr, last_explained_variance
+    - Keeps the return dict from update() unchanged (still returns metrics).
     """
 
     def __init__(
@@ -29,7 +28,7 @@ class PPOAgent:
         gae_lambda=0.95,
         clip_eps=0.15,
         vf_coef=0.5,
-        # ✅ entropy: safer defaults for your task
+        # entropy schedule
         ent_coef=0.01,
         ent_min=0.001,
         ent_decay=0.999,
@@ -38,10 +37,10 @@ class PPOAgent:
         mini_batch_size=128,
         max_grad_norm=0.5,
         ent_warmup_updates=15,
-        # ✅ value clipping
+        # value clipping
         value_clip_eps=0.2,
         device=None,
-        # ---- speed options ----
+        # speed options
         use_amp=True,
         cudnn_benchmark=True,
         compile_model=False,
@@ -106,6 +105,17 @@ class PPOAgent:
         self._neg_large_fp16 = None
         self._neg_large_fp32 = None
 
+        # ---- debug metrics (NEVER NA) ----
+        # runner가 best-effort로 찾는 이름들을 명시적으로 제공
+        self.last_entropy = 0.0
+        self.last_kl = 0.0
+        self.last_clipfrac = 0.0
+        self.last_lr = float(lr)
+        self.last_explained_variance = 0.0
+        self.last_value_loss = 0.0
+        self.last_policy_loss = 0.0
+        self.last_total_loss = 0.0
+
         # ---- prealloc buffers ----
         self._buf_inited = False
         self._buf_ptr = 0
@@ -124,7 +134,6 @@ class PPOAgent:
         A = self.num_actions
 
         self.states = np.zeros((T,) + self._state_shape, dtype=np.float32)
-
         self.actions = np.zeros((T,), dtype=np.int64)
         self.rewards = np.zeros((T,), dtype=np.float32)
         self.dones = np.zeros((T,), dtype=np.float32)       # 1.0 if done else 0.0
@@ -139,11 +148,19 @@ class PPOAgent:
     def _get_neg_large(self, dtype: torch.dtype) -> torch.Tensor:
         # allocate once per dtype/device
         if dtype in (torch.float16, torch.bfloat16):
-            if self._neg_large_fp16 is None or self._neg_large_fp16.dtype != dtype or self._neg_large_fp16.device != torch.device(self.device):
+            if (
+                self._neg_large_fp16 is None
+                or self._neg_large_fp16.dtype != dtype
+                or self._neg_large_fp16.device != torch.device(self.device)
+            ):
                 self._neg_large_fp16 = torch.tensor(-1e4, device=self.device, dtype=dtype)
             return self._neg_large_fp16
         else:
-            if self._neg_large_fp32 is None or self._neg_large_fp32.dtype != dtype or self._neg_large_fp32.device != torch.device(self.device):
+            if (
+                self._neg_large_fp32 is None
+                or self._neg_large_fp32.dtype != dtype
+                or self._neg_large_fp32.device != torch.device(self.device)
+            ):
                 self._neg_large_fp32 = torch.tensor(-1e9, device=self.device, dtype=dtype)
             return self._neg_large_fp32
 
@@ -240,10 +257,18 @@ class PPOAgent:
             return 0.0
         return float((1.0 - torch.var(y_true - y_pred, unbiased=False) / var_y).clamp(-1.0, 1.0).item())
 
+    def _refresh_last_lr(self):
+        try:
+            self.last_lr = float(self.optimizer.param_groups[0].get("lr", self.last_lr))
+        except Exception:
+            pass
+
     def update(self, last_state=None, last_done=False):
         T = self._buf_ptr
         if T < 2:
             self.reset_buffer()
+            # NA 방지: lr은 최신으로 유지
+            self._refresh_last_lr()
             return None
 
         # ---- bootstrap last value ----
@@ -347,6 +372,7 @@ class PPOAgent:
                     loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
 
                     # ---- diagnostics ----
+                    # NOTE: 당신 코드 유지(근사 KL)
                     approx_kl = 0.5 * (log_ratio.pow(2)).mean()
                     clipfrac = (torch.abs(ratio - 1.0) > self.clip_eps).float().mean()
 
@@ -377,23 +403,41 @@ class PPOAgent:
 
         # explained variance (full batch)
         with torch.no_grad():
-            # recompute v on full states for EV
-            logits_all, v_all = self.model(states)
+            _, v_all = self.model(states)
             ev = self._explained_variance(returns, v_all.squeeze(-1))
 
         self.reset_buffer()
 
-        if steps == 0:
+        # ---- persist debug metrics so runner never prints NA ----
+        self._refresh_last_lr()
+
+        if steps <= 0:
+            # 업데이트가 이상하게 0스텝이면 값은 유지(NA 방지)
             return None
 
+        mean_loss = total_loss / steps
+        mean_policy = total_policy / steps
+        mean_value = total_value / steps
+        mean_entropy = total_entropy / steps
+        mean_kl = total_kl / steps
+        mean_clipfrac = total_clipfrac / steps
+
+        self.last_total_loss = float(mean_loss)
+        self.last_policy_loss = float(mean_policy)
+        self.last_value_loss = float(mean_value)
+        self.last_entropy = float(mean_entropy)
+        self.last_kl = float(mean_kl)
+        self.last_clipfrac = float(mean_clipfrac)
+        self.last_explained_variance = float(ev)
+
         return {
-            "loss": total_loss / steps,
-            "policy_loss": total_policy / steps,
-            "value_loss": total_value / steps,
-            "entropy": total_entropy / steps,
+            "loss": mean_loss,
+            "policy_loss": mean_policy,
+            "value_loss": mean_value,
+            "entropy": mean_entropy,
             "entropy_coef": float(self.ent_coef),
-            "approx_kl": total_kl / steps,
-            "clipfrac": total_clipfrac / steps,
+            "approx_kl": mean_kl,
+            "clipfrac": mean_clipfrac,
             "explained_variance": float(ev),
             "rollout_steps": int(n),
             "update_step": int(self.update_step),
@@ -409,6 +453,13 @@ class PPOAgent:
                 "global_step": self.global_step,
                 "update_step": self.update_step,
                 "ent_coef": float(self.ent_coef),
+
+                # (optional) 디버그 값도 저장해두면 재시작 직후에도 숫자 유지
+                "last_entropy": float(self.last_entropy),
+                "last_kl": float(self.last_kl),
+                "last_clipfrac": float(self.last_clipfrac),
+                "last_lr": float(self.last_lr),
+                "last_explained_variance": float(self.last_explained_variance),
             },
             path,
         )
@@ -434,3 +485,13 @@ class PPOAgent:
         self.global_step = int(ckpt.get("global_step", self.global_step))
         self.update_step = int(ckpt.get("update_step", self.update_step))
         self.ent_coef = float(ckpt.get("ent_coef", self.ent_coef))
+
+        # debug metrics restore (없으면 기본값 유지)
+        try:
+            self.last_entropy = float(ckpt.get("last_entropy", self.last_entropy))
+            self.last_kl = float(ckpt.get("last_kl", self.last_kl))
+            self.last_clipfrac = float(ckpt.get("last_clipfrac", self.last_clipfrac))
+            self.last_lr = float(ckpt.get("last_lr", self.last_lr))
+            self.last_explained_variance = float(ckpt.get("last_explained_variance", self.last_explained_variance))
+        except Exception:
+            pass
