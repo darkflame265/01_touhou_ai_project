@@ -60,12 +60,13 @@ class SimConfig:
     # curriculum: success-rate based (UP ONLY)
     # ---------------------------
     curriculum_enable: bool = True
-    curriculum_window: int = 20          # N판 (최근 N판)
-    curriculum_up_success_rate: float = 0.50  # 90% 이상이면 승급
-    curriculum_target_survival_sec: float = 60.0  # "완주" 기준(현재 max_steps와 동일하게 60초)
+    curriculum_window: int = 20               # N판 (최근 N판)
+    curriculum_up_success_rate: float = 0.50  # 성공률 기준
+    # ✅ (강추) success 기준을 time_limit이 아니라 "이 초 이상 생존"으로
+    curriculum_target_survival_sec: float = 12.0  # 10~15초 권장(기본 12초)
 
-    # reward: ✅ 생존 보상 + 피격 패널티만 사용
-    alive_reward: float = 0.02
+    # reward: ✅ 생존 보상 + 피격 패널티만 사용 (+ success bonus 1줄 추가)
+    alive_reward: float = 0.01
     hit_penalty: float = 30.0
 
     # move penalty 제거(0으로 고정)
@@ -117,9 +118,11 @@ class PatternEmitter:
         d = float(getattr(cfg, "difficulty", 1.0))
         d = float(np.clip(d, 0.0, 5.0))
 
-        # d가 낮을수록 매우 쉬움이 되도록
-        gamma = 2.4
-        intensity = float(np.clip(d ** gamma, 0.0, 10.0))
+        # ✅ (필수) d가 낮아도 너무 0에 붙어서 "거의 안 나오는" 구간 방지
+        # - gamma를 낮춰 초반 난이도 기울기를 완만하게
+        # - intensity 최소값을 둬서 탄막이 완전히 죽는 걸 방지
+        gamma = 1.2
+        intensity = float(np.clip(d ** gamma, 0.25, 10.0))
 
         bx, by = env.boss_xy
         spd_scale_ep = float(env._bullet_speed_scale_ep)
@@ -279,16 +282,20 @@ class SimEnv:
         time_limit = (self.t >= int(self.cfg.max_steps))
         done = bool(hit or time_limit)
 
-        # -------- reward: ✅ alive + hit only --------
+        # -------- reward: ✅ alive + hit only (+ success bonus 1줄) --------
         reward = float(self.cfg.alive_reward)
         if hit:
             reward -= float(self.cfg.hit_penalty)
 
         survival_sec = float(self.t) / float(max(1e-6, self.cfg.fps))
 
-        # "완주(success)" 판정: time_limit 도달 (즉 max_steps까지 생존)
-        # (curriculum_target_survival_sec는 max_steps/fps와 동일하므로 사실상 같은 기준)
-        success = bool(time_limit)
+        # ✅ (강추) success 기준: "target_survival_sec 이상 생존"
+        target_sec = float(getattr(self.cfg, "curriculum_target_survival_sec", 10.0))
+        success = bool(survival_sec >= target_sec)
+
+        # ✅ (강추) done+success 보너스 1줄 (+5 정도)
+        if done and success:
+            reward += 5.0
 
         if done:
             self._last_episode_done = True
@@ -303,6 +310,7 @@ class SimEnv:
             "time_limit": bool(time_limit),
             "success": bool(success),
             "survival_sec": float(survival_sec),
+            "target_survival_sec": float(target_sec),
             "bullet_n": int(self._b_n),
             "pattern": int(self.emitter.pattern_id),
             "player_xy": self.player_xy.copy(),
@@ -319,7 +327,7 @@ class SimEnv:
         """
         ✅ 성공률 기반 'UP ONLY' 커리큘럼
 
-        - 최근 N판(=curriculum_window) "완주(success)" 성공률을 계산
+        - 최근 N판(=curriculum_window) "success" 성공률을 계산
         - 성공률 >= curriculum_up_success_rate 이면 difficulty += difficulty_step
         - difficulty는 difficulty_min 아래로 내려가지 않음 (내리는 로직 없음)
         """

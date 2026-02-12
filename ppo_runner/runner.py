@@ -394,7 +394,7 @@ def run(
     stats_every_episodes: int = 1,
 
     # smooth update knobs (step-based)
-    update_every_steps: int = 8,
+    update_every_steps: int = 32,
     update_max_per_trigger: int = 1,
 
     # survival prints

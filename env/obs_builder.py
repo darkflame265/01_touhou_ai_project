@@ -75,7 +75,7 @@ class ObsBuilder:
         self._prev_gray: Optional[np.ndarray] = None
 
         # debug windows
-        self.show_reimu_debug = False
+        self.show_reimu_debug = True
         self.reimu_dbg_view: Optional[ReimuTrackerDebugView] = None  # lazy init
 
         self.show_obs_debug = True
