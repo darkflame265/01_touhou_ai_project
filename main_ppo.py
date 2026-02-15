@@ -14,6 +14,7 @@ def parse_args():
 
     # ✅ 추가: MLP 준비 모드 (학습 안 함)
     p.add_argument("--mlp", action="store_true", help="boot practice and extract vector features only (no training)")
+    p.add_argument("--mlp-max-seconds", type=float, default=60.0, help="safety cap for MLP probe duration per episode")
 
     return p.parse_args()
 
@@ -26,6 +27,7 @@ def main():
         run_mlp_probe(
             episodes=int(args.episodes),
             no_render=bool(args.no_render),
+            max_seconds=float(args.mlp_max_seconds),
         )
         return
 

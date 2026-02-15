@@ -108,6 +108,13 @@ class ObsBuilder:
         self.show_bullet_debug = True
         self.bullet_dbg_view: Optional[BulletTrackerDebugView] = None
 
+        # ✅ MLP용: bullet TOP-K relative + velocity (slot-based)
+        self.bullet_topk_k = int(getattr(self.bullet_tracker.cfg, "topk", 16))
+        self.last_bullets_dxdy: List[Tuple[float, float]] = []     # len<=K
+        self.last_bullets_vdxdy: List[Tuple[float, float]] = []    # len<=K
+        self._prev_bullets_dxdy_pad: List[Tuple[float, float]] = [(0.0, 0.0)] * self.bullet_topk_k
+
+
     # -------------------------
     # public hooks
     # -------------------------
@@ -149,7 +156,11 @@ class ObsBuilder:
                 pass
             self.bullet_dbg_view = None
 
-        # reimu debug window close는 굳이 필수 아님(원하면 닫아도 됨)
+        # ✅ reset bullet rel/vel buffers
+        self.bullet_topk_k = int(getattr(self.bullet_tracker.cfg, "topk", 16))
+        self.last_bullets_dxdy = []
+        self.last_bullets_vdxdy = []
+        self._prev_bullets_dxdy_pad = [(0.0, 0.0)] * self.bullet_topk_k
 
     def on_player_death(self):
         try:
@@ -338,6 +349,30 @@ class ObsBuilder:
             y_n = float(np.clip(by / den_y, 0.0, 1.0))
             bul_norm.append((x_n, y_n))
         self.last_bullets_xy_norm = bul_norm
+
+        # ✅ build relative dxdy + velocity vdxdy (slot-based, padded)
+        px_n, py_n = self.last_xy_norm
+        K = int(self.bullet_topk_k)
+
+        dxdy: List[Tuple[float, float]] = []
+        for (bx, by) in self.last_bullets_xy_norm[:K]:
+            dxdy.append((float(bx) - float(px_n), float(by) - float(py_n)))
+
+        # pad to K for stable velocity computation
+        cur_pad: List[Tuple[float, float]] = dxdy + [(0.0, 0.0)] * max(0, K - len(dxdy))
+
+        prev_pad = self._prev_bullets_dxdy_pad
+        vdxdy_pad: List[Tuple[float, float]] = []
+        for i in range(K):
+            cdx, cdy = cur_pad[i]
+            pdx, pdy = prev_pad[i]
+            vdxdy_pad.append((float(cdx) - float(pdx), float(cdy) - float(pdy)))
+
+        # store (un-padded lists are fine, but we keep padded length for downstream simplicity)
+        self.last_bullets_dxdy = cur_pad
+        self.last_bullets_vdxdy = vdxdy_pad
+        self._prev_bullets_dxdy_pad = cur_pad
+
 
         if self.show_bullet_debug:
             if self.bullet_dbg_view is None:

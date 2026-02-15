@@ -4,7 +4,7 @@ from __future__ import annotations
 import os
 import time
 from datetime import datetime
-from typing import Any, Tuple, Dict, List, Callable
+from typing import Any, Tuple, Dict, List
 
 import numpy as np
 
@@ -25,12 +25,7 @@ def _safe_release_inputs() -> None:
         pass
 
 
-def _build_random_action_sampler(seed: int = 0) -> tuple[Callable[[], int], List[str]]:
-    """
-    ACTIONS 이름을 보고:
-      - STOP/IDLE/NOOP 계열은 낮은 확률
-      - ATTACK/SHOT/FIRE 계열도 낮은 확률
-    """
+def _build_random_action_sampler(seed: int = 0):
     from env.actions import ACTIONS
 
     names = [str(a).upper() for a in ACTIONS]
@@ -38,14 +33,10 @@ def _build_random_action_sampler(seed: int = 0) -> tuple[Callable[[], int], List
 
     w = np.ones(n, dtype=np.float32)
 
-    # STOP/IDLE/NOOP 줄이기
     for i, nm in enumerate(names):
-        if ("STOP" in nm) or ("IDLE" in nm) or ("NOOP" in nm):
+        if "STOP" in nm or "IDLE" in nm or "NOOP" in nm:
             w[i] *= 0.10
-
-    # 발사/공격 줄이기
-    for i, nm in enumerate(names):
-        if ("ATTACK" in nm) or ("SHOT" in nm) or ("FIRE" in nm):
+        if "ATTACK" in nm or "SHOT" in nm or "FIRE" in nm:
             w[i] *= 0.25
 
     if float(w.sum()) <= 0:
@@ -60,67 +51,7 @@ def _build_random_action_sampler(seed: int = 0) -> tuple[Callable[[], int], List
     return sample, names
 
 
-def _vectorize_from_obs(env: GameEnv) -> tuple[np.ndarray, dict]:
-    obs = env.obs
-
-    # 1) player
-    x_n, y_n = getattr(obs, "last_xy_norm", (0.5, 0.78))
-    conf = float(getattr(obs, "last_conf", 0.0))
-
-    # 2) bullet candidate mask (있으면 fill ratio)
-    bcm = getattr(obs, "bullet_candidate_mask", None)
-    if bcm is not None:
-        bcm_arr = np.asarray(bcm)
-        fill = float(np.mean(bcm_arr > 0.5)) if bcm_arr.size > 0 else 0.0
-    else:
-        fill = 0.0
-
-    # 3) risk heatmap (있으면 통계 + COM)
-    rh = getattr(obs, "risk_heatmap", None)
-    if rh is not None:
-        r = np.asarray(rh, dtype=np.float32)
-        if r.size > 0:
-            r = np.clip(r, 0.0, 1.0)
-            r_mean = float(r.mean())
-            r_p90 = float(np.percentile(r, 90.0))
-            r_max = float(r.max())
-
-            s = float(r.sum())
-            if s > 1e-6:
-                h, w = r.shape[:2]
-                ys = np.arange(h, dtype=np.float32)
-                xs = np.arange(w, dtype=np.float32)
-                yy, xx = np.meshgrid(ys, xs, indexing="ij")
-                cx = float((r * xx).sum() / s) / max(1.0, (w - 1))
-                cy = float((r * yy).sum() / s) / max(1.0, (h - 1))
-            else:
-                cx, cy = 0.5, 0.5
-        else:
-            r_mean, r_p90, r_max, cx, cy = 0.0, 0.0, 0.0, 0.5, 0.5
-    else:
-        r_mean, r_p90, r_max, cx, cy = 0.0, 0.0, 0.0, 0.5, 0.5
-
-    vec = np.array([x_n, y_n, conf, fill, r_mean, r_p90, r_max, cx, cy], dtype=np.float32)
-
-    dbg = {
-        "x_n": float(x_n),
-        "y_n": float(y_n),
-        "conf": float(conf),
-        "fill": float(fill),
-        "risk_mean": float(r_mean),
-        "risk_p90": float(r_p90),
-        "risk_max": float(r_max),
-        "risk_com_x": float(cx),
-        "risk_com_y": float(cy),
-    }
-    return vec, dbg
-
-
 def _step_env(env: GameEnv, action: int) -> Tuple[Any, float, bool, Dict[str, Any]]:
-    """
-    env.step 반환 형태(3/4/5 튜플)를 모두 지원.
-    return: (obs_like, reward, done, info)
-    """
     ret = env.step(action)
 
     if isinstance(ret, tuple) and len(ret) == 3:
@@ -134,62 +65,87 @@ def _step_env(env: GameEnv, action: int) -> Tuple[Any, float, bool, Dict[str, An
     if isinstance(ret, tuple) and len(ret) == 5:
         obs, reward, terminated, truncated, info = ret
         done = bool(terminated) or bool(truncated)
-        return obs, float(reward), done, (info or {})
+        return obs, float(reward), bool(done), (info or {})
 
     raise RuntimeError(f"Unexpected env.step return: {ret!r}")
 
-def _vectorize_from_obs(env: GameEnv, k: int = 16) -> tuple[np.ndarray, dict]:
+
+def _vectorize_topk_with_vel(env: GameEnv, K: int = 16) -> tuple[np.ndarray, dict]:
+    """
+    vec = [px, py, conf, n_norm,  (dx,dy,vdx,vdy)*K]
+    dxdy/vdxdy는 obs_builder가 slot-based로 이미 K padding해서 제공.
+    """
     obs = env.obs
 
     px, py = getattr(obs, "last_xy_norm", (0.5, 0.78))
     conf = float(getattr(obs, "last_conf", 0.0))
 
-    bullets = getattr(obs, "last_bullets_xy_norm", []) or []
-    n = int(len(bullets))
-    n_norm = float(np.clip(n / float(max(1, k)), 0.0, 1.0))
+    dxdy = getattr(obs, "last_bullets_dxdy", None)
+    vdxdy = getattr(obs, "last_bullets_vdxdy", None)
+
+    if dxdy is None or vdxdy is None:
+        # obs_builder 패치가 안 들어간 경우를 대비한 fallback
+        bullets = getattr(obs, "last_bullets_xy_norm", []) or []
+        n = int(len(bullets))
+        n_norm = float(np.clip(n / float(max(1, K)), 0.0, 1.0))
+        feats: List[float] = [float(px), float(py), float(conf), float(n_norm)]
+        for i in range(int(K)):
+            if i < n:
+                bx, by = bullets[i]
+                dx = float(bx) - float(px)
+                dy = float(by) - float(py)
+                feats.extend([dx, dy, 0.0, 0.0])
+            else:
+                feats.extend([0.0, 0.0, 0.0, 0.0])
+        vec = np.asarray(feats, dtype=np.float32)
+        return vec, {"vec_dim": int(vec.shape[0]), "fallback": True}
+
+    # dxdy/vdxdy는 K 길이로 padding되어 있다고 가정(ObsBuilder에서 그렇게 만듦)
+    n = 0
+    for (dx, dy) in dxdy[:K]:
+        if abs(float(dx)) > 1e-9 or abs(float(dy)) > 1e-9:
+            n += 1
+    n_norm = float(np.clip(n / float(max(1, K)), 0.0, 1.0))
 
     feats: List[float] = [float(px), float(py), float(conf), float(n_norm)]
 
-    # top-k 상대좌표
-    for i in range(k):
-        if i < n:
-            bx, by = bullets[i]
-            dx = float(bx) - float(px)
-            dy = float(by) - float(py)
-            feats.extend([dx, dy])
-        else:
-            feats.extend([0.0, 0.0])
+    for i in range(int(K)):
+        dx, dy = dxdy[i]
+        vdx, vdy = vdxdy[i]
+        feats.extend([float(dx), float(dy), float(vdx), float(vdy)])
 
     vec = np.asarray(feats, dtype=np.float32)
-
     dbg = {
         "px": float(px),
         "py": float(py),
         "conf": float(conf),
         "n_bullets": int(n),
-        "k": int(k),
-        "first_bullet": bullets[0] if n > 0 else None,
+        "k": int(K),
         "vec_dim": int(vec.shape[0]),
+        "example_dxdy": dxdy[0] if len(dxdy) > 0 else None,
+        "example_vdxdy": vdxdy[0] if len(vdxdy) > 0 else None,
     }
     return vec, dbg
 
 
-
-def run_mlp_probe(episodes: int = 1, no_render: bool = False) -> None:
-    """
-    --mlp 모드:
-      - practice 진입 자동화는 기존 루틴 그대로 사용
-      - 학습/agent 없음
-      - 인게임 프레임에서 벡터만 추출해서 저장
-
-    저장:
-      - runs/mlp_vectors_<timestamp>.npz
-    """
+def run_mlp_probe(
+    episodes: int = 1,
+    no_render: bool = False,
+    max_seconds: float = 60.0,
+) -> None:
     os.makedirs("runs", exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_path = os.path.join("runs", f"mlp_vectors_{ts}.npz")
 
     env = GameEnv(screen_mode="low")
+
+    # MLP probe can pass through brief UI-hide frames (death flash/respawn)
+    # without being treated as an immediate ABORT.
+    try:
+        env.s.ui_absent_needed = max(int(getattr(env.s, "ui_absent_needed", 2)), 12)
+    except Exception:
+        pass
+
     if no_render:
         try:
             from ppo_runner.render import apply_no_render
@@ -200,6 +156,7 @@ def run_mlp_probe(episodes: int = 1, no_render: bool = False) -> None:
     sample_action, action_names = _build_random_action_sampler(seed=0)
     print(f"[MLP] action_space={len(action_names)}")
 
+    K = 16
     all_vecs: List[np.ndarray] = []
     all_meta: List[List[float]] = []
 
@@ -227,41 +184,47 @@ def run_mlp_probe(episodes: int = 1, no_render: bool = False) -> None:
 
             t0 = time.time()
             frames = 0
-            cur_action = sample_action()  # ✅ 초기값
+            cur_action = 0
 
             while True:
                 if esc_pressed():
                     print("[MLP] ESC -> stop")
                     raise KeyboardInterrupt
 
-                # ✅ N프레임마다 새 액션(덜덜거림 완화)
                 if frames % 6 == 0:
                     cur_action = sample_action()
 
-                _, reward, done, info = _step_env(env, cur_action)
+                _, reward, done, _info = _step_env(env, cur_action)
 
-                vec, dbg = _vectorize_from_obs(env)
-
+                vec, dbg = _vectorize_topk_with_vel(env, K=K)
                 all_vecs.append(vec)
                 all_meta.append([time.time(), float(ep)])
 
                 frames += 1
+
                 if frames % 60 == 0:
-                    aname = action_names[cur_action] if 0 <= cur_action < len(action_names) else str(cur_action)
+                    a_name = action_names[cur_action] if 0 <= cur_action < len(action_names) else str(cur_action)
                     print(
                         f"[MLP] t={time.time()-t0:5.1f}s "
-                        f"action={cur_action}:{aname} "
-                        f"done={done} r={reward:.3f} "
-                        f"vec={vec.tolist()} dbg={dbg}"
+                        f"action={cur_action}:{a_name} done={done} r={reward:.3f} "
+                        f"dbg={dbg}"
                     )
 
                 if done:
+                    end_reason = str(getattr(env.s, "episode_end_reason", ""))
+                    end_pen = float(getattr(env.s, "episode_end_pen", 0.0))
+                    print(f"[MLP] done=True reason={end_reason or 'N/A'} pen={end_pen:.3f}")
+                    if end_reason == "DEATH:AFTER_UI_ZERO":
+                        print("[MLP] episode finished by UI lives/gameover condition")
+                        print(f"[MLP] collected frames={frames}")
+                        break
                     try:
                         env.reset()
                     except TypeError:
                         env.reset()
 
-                if (time.time() - t0) >= 10.0:
+                if (time.time() - t0) >= float(max_seconds):
+                    print(f"[MLP] max_seconds reached: {float(max_seconds):.1f}s")
                     print(f"[MLP] collected frames={frames}")
                     break
 
@@ -280,8 +243,8 @@ def run_mlp_probe(episodes: int = 1, no_render: bool = False) -> None:
         print("[MLP] no vectors collected")
         return
 
-    arr = np.stack(all_vecs, axis=0)  # (T, D)
-    meta = np.asarray(all_meta, dtype=np.float64)  # (T,2): [unix_time, episode]
+    arr = np.stack(all_vecs, axis=0)
+    meta = np.asarray(all_meta, dtype=np.float64)
 
     np.savez_compressed(out_path, vec=arr, meta=meta)
     print(f"[MLP] saved: {out_path}  shape={arr.shape}")

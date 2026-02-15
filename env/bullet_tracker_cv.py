@@ -1,3 +1,4 @@
+# env/bullet_tracker_cv.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -5,12 +6,12 @@ from typing import List, Tuple, Dict, Any, Optional
 
 import cv2
 import numpy as np
+import math
 
 Pt = Tuple[float, float]  # (x,y) in ROI pixels
 
 
 def ensure_uint8_bgr(frame: np.ndarray) -> np.ndarray:
-    """DXCam/기타 캡처가 BGRA/float인 경우를 포함해 uint8 BGR로 정규화."""
     if frame is None or frame.size == 0:
         return frame
 
@@ -33,7 +34,7 @@ def ensure_uint8_bgr(frame: np.ndarray) -> np.ndarray:
 
 @dataclass
 class BulletTrackerConfig:
-    # 검출: 밝은 픽셀(탄막) 기반 1차 후보 생성
+    # 1) 후보 마스크
     use_hsv: bool = True
     hsv_v_min: int = 190
     hsv_s_min: int = 15
@@ -41,16 +42,15 @@ class BulletTrackerConfig:
     hsv_h_min: int = 0
     hsv_h_max: int = 179
 
-    # 흰색 계열 보강
     use_white: bool = True
     white_min: int = 210
 
-    # morphology
+    # 2) morph
     open_ks: int = 3
     open_iter: int = 1
     dilate_iter: int = 1
 
-    # 후보 필터 (탄막은 보통 작다)
+    # 3) candidate filter
     area_min: int = 3
     area_max: int = 300
     w_min: int = 1
@@ -58,21 +58,19 @@ class BulletTrackerConfig:
     h_min: int = 1
     h_max: int = 40
 
-    # 출력
+    # 4) outputs
     max_candidates: int = 256
-    topk: int = 16  # player 기준 가까운 순으로 최대 K개 반환
-
-    # 디버그
+    topk: int = 16          # ✅ 여기서 K를 고정
     debug_max_draw: int = 120
 
 
 class BulletTrackerCV:
     """
     입력: playfield ROI(BGR), player_center_roi(optional)
-    출력: topk 탄막 중심점 리스트(ROI 좌표계)
+    출력: TOP-K 탄막 중심점 리스트(ROI 좌표계)
 
-    초기 버전은 "밝기 기반 후보 + size filter"만.
-    정확도는 부족할 수 있지만, MLP 벡터화/파이프라인 구축용으로는 충분함.
+    - step()은 항상 "top-k"만 반환한다.
+    - 내부적으로 전체 후보는 last_points_roi에 저장(디버그용)
     """
 
     def __init__(self, cfg: Optional[BulletTrackerConfig] = None):
@@ -102,7 +100,6 @@ class BulletTrackerCV:
         if self.cfg.use_hsv:
             hsv = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HSV)
             hh, ss, vv = cv2.split(hsv)
-
             m_v = (vv >= int(self.cfg.hsv_v_min))
             m_s = (ss >= int(self.cfg.hsv_s_min)) & (ss <= int(self.cfg.hsv_s_max))
             m_h = (hh >= int(self.cfg.hsv_h_min)) & (hh <= int(self.cfg.hsv_h_max))
@@ -158,13 +155,24 @@ class BulletTrackerCV:
         mask = self._build_mask(roi_bgr)
         pts = self._extract_points(mask)
 
+        K = int(max(1, self.cfg.topk))
+
+        # ✅ TOP-K = (거리, 각도) 정렬 (슬롯 흔들림 완화)
         if player_center_roi is not None and pts:
             px, py = map(float, player_center_roi)
-            d2 = [((x - px) ** 2 + (y - py) ** 2, (x, y)) for (x, y) in pts]
-            d2.sort(key=lambda t: t[0])
-            topk = [p for _, p in d2[: int(self.cfg.topk)]]
+
+            scored = []
+            for (x, y) in pts:
+                dx = x - px
+                dy = y - py
+                d2 = dx * dx + dy * dy
+                ang = math.atan2(dy, dx)  # -pi..pi
+                scored.append((d2, ang, (x, y)))
+
+            scored.sort(key=lambda t: (t[0], t[1]))
+            topk = [p for _, _, p in scored[:K]]
         else:
-            topk = pts[: int(self.cfg.topk)]
+            topk = pts[:K]
 
         self.last_mask_u8 = mask
         self.last_points_roi = pts
@@ -177,6 +185,7 @@ class BulletTrackerCV:
             "points_topk": topk,
             "player_center_roi": player_center_roi,
             "roi_shape": tuple(map(int, roi_bgr.shape[:2])),
+            "K": K,
         }
         return topk
 
