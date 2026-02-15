@@ -13,6 +13,8 @@ from env.menu import boot_into_practice
 from env.controller import release_all, set_attack_hold
 from ppo_runner.hotkeys import esc_pressed
 
+MLP_TOPK = 32
+
 
 def _safe_release_inputs() -> None:
     try:
@@ -70,7 +72,7 @@ def _step_env(env: GameEnv, action: int) -> Tuple[Any, float, bool, Dict[str, An
     raise RuntimeError(f"Unexpected env.step return: {ret!r}")
 
 
-def _vectorize_topk_with_vel(env: GameEnv, K: int = 16) -> tuple[np.ndarray, dict]:
+def _vectorize_topk_with_vel(env: GameEnv, K: int = MLP_TOPK) -> tuple[np.ndarray, dict]:
     """
     vec = [px, py, conf, n_norm,  (dx,dy,vdx,vdy)*K]
     dxdy/vdxdy는 obs_builder가 slot-based로 이미 K padding해서 제공.
@@ -101,6 +103,9 @@ def _vectorize_topk_with_vel(env: GameEnv, K: int = 16) -> tuple[np.ndarray, dic
         return vec, {"vec_dim": int(vec.shape[0]), "fallback": True}
 
     # dxdy/vdxdy는 K 길이로 padding되어 있다고 가정(ObsBuilder에서 그렇게 만듦)
+    dxdy_len = int(len(dxdy))
+    vdxdy_len = int(len(vdxdy))
+
     n = 0
     for (dx, dy) in dxdy[:K]:
         if abs(float(dx)) > 1e-9 or abs(float(dy)) > 1e-9:
@@ -110,8 +115,16 @@ def _vectorize_topk_with_vel(env: GameEnv, K: int = 16) -> tuple[np.ndarray, dic
     feats: List[float] = [float(px), float(py), float(conf), float(n_norm)]
 
     for i in range(int(K)):
-        dx, dy = dxdy[i]
-        vdx, vdy = vdxdy[i]
+        if i < dxdy_len:
+            dx, dy = dxdy[i]
+        else:
+            dx, dy = 0.0, 0.0
+
+        if i < vdxdy_len:
+            vdx, vdy = vdxdy[i]
+        else:
+            vdx, vdy = 0.0, 0.0
+
         feats.extend([float(dx), float(dy), float(vdx), float(vdy)])
 
     vec = np.asarray(feats, dtype=np.float32)
@@ -156,7 +169,7 @@ def run_mlp_probe(
     sample_action, action_names = _build_random_action_sampler(seed=0)
     print(f"[MLP] action_space={len(action_names)}")
 
-    K = 16
+    K = MLP_TOPK
     all_vecs: List[np.ndarray] = []
     all_meta: List[List[float]] = []
 

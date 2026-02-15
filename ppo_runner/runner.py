@@ -15,6 +15,7 @@ from env.controller import release_all, set_attack_hold, cleanup_inputs_on_exit
 from env.menu import boot_into_practice
 from env.actions import ACTIONS
 from agents.ppo_agent import PPOAgent
+from agents.mlp_ppo_agent import MLPPPOAgent
 
 from sim.sim_env import SimEnv, SimConfig
 
@@ -27,6 +28,8 @@ from .stats_log import (
     update_stats_in_file,
     stats_one_line,
 )
+
+MLP_TOPK = 32
 
 
 # ----------------------------
@@ -192,6 +195,58 @@ def _build_action_mask_for_sim() -> np.ndarray:
     return mask
 
 
+def _build_mlp_vector_from_obs(obs, k: int = MLP_TOPK) -> np.ndarray:
+    px, py = getattr(obs, "last_xy_norm", (0.5, 0.78))
+    conf = float(getattr(obs, "last_conf", 0.0))
+
+    dxdy = getattr(obs, "last_bullets_dxdy", None)
+    vdxdy = getattr(obs, "last_bullets_vdxdy", None)
+
+    if dxdy is None or vdxdy is None:
+        bullets = getattr(obs, "last_bullets_xy_norm", []) or []
+        n = int(len(bullets))
+        n_norm = float(np.clip(n / float(max(1, k)), 0.0, 1.0))
+        feats = [float(px), float(py), float(conf), float(n_norm)]
+        for i in range(int(k)):
+            if i < n:
+                bx, by = bullets[i]
+                dx = float(bx) - float(px)
+                dy = float(by) - float(py)
+                feats.extend([dx, dy, 0.0, 0.0])
+            else:
+                feats.extend([0.0, 0.0, 0.0, 0.0])
+        return np.asarray(feats, dtype=np.float32)
+
+    dxdy_len = int(len(dxdy))
+    vdxdy_len = int(len(vdxdy))
+
+    n = 0
+    for (dx, dy) in dxdy[:k]:
+        if abs(float(dx)) > 1e-9 or abs(float(dy)) > 1e-9:
+            n += 1
+    n_norm = float(np.clip(n / float(max(1, k)), 0.0, 1.0))
+
+    feats = [float(px), float(py), float(conf), float(n_norm)]
+    for i in range(int(k)):
+        if i < dxdy_len:
+            dx, dy = dxdy[i]
+        else:
+            dx, dy = 0.0, 0.0
+
+        if i < vdxdy_len:
+            vdx, vdy = vdxdy[i]
+        else:
+            vdx, vdy = 0.0, 0.0
+
+        feats.extend([float(dx), float(dy), float(vdx), float(vdy)])
+
+    return np.asarray(feats, dtype=np.float32)
+
+
+def _build_mlp_state_from_env(env: GameEnv, k: int = MLP_TOPK) -> np.ndarray:
+    return _build_mlp_vector_from_obs(env.obs, k=int(k))
+
+
 def _clamp_action_idx(i: int) -> int:
     try:
         x = int(i)
@@ -322,7 +377,10 @@ class _SimFrameStacker:
 # ----------------------------
 # Load agent/env
 # ----------------------------
-def _load_agent_and_env(ckpt_path: str, no_render: bool, use_sim: bool):
+def _load_agent_and_env(ckpt_path: str, no_render: bool, use_sim: bool, use_mlp_agent: bool = False):
+    if use_sim and use_mlp_agent:
+        raise ValueError("--mlp-agent is currently supported only for real game env (not --sim).")
+
     if use_sim:
         cfg = SimConfig(seed=0)
         if no_render:
@@ -339,11 +397,22 @@ def _load_agent_and_env(ckpt_path: str, no_render: bool, use_sim: bool):
 
     input_channels = obs_channels * stack_size
 
-    agent = PPOAgent(
-        input_channels=input_channels,
-        num_actions=len(ACTIONS),
-        obs_channels_per_frame=obs_channels,
-    )
+    if use_mlp_agent:
+        input_dim = 4 + (4 * MLP_TOPK)
+        agent = MLPPPOAgent(
+            input_dim=int(input_dim),
+            num_actions=len(ACTIONS),
+            lr=1e-4,
+            rollout_steps=256,
+            update_epochs=3,
+            mini_batch_size=128,
+        )
+    else:
+        agent = PPOAgent(
+            input_channels=input_channels,
+            num_actions=len(ACTIONS),
+            obs_channels_per_frame=obs_channels,
+        )
 
     if os.path.exists(ckpt_path):
         agent.load(ckpt_path, load_optimizer=False)
@@ -360,7 +429,10 @@ def _load_agent_and_env(ckpt_path: str, no_render: bool, use_sim: bool):
     agent.rollout_steps = 256
     agent.update_epochs = 3
 
-    print(f"[PPO] input_channels={input_channels} (obs_channels={obs_channels} * stack={stack_size})")
+    if use_mlp_agent:
+        print(f"[PPO-MLP] input_dim={input_dim} (vec=[px,py,conf,n_norm,(dx,dy,vdx,vdy)*{MLP_TOPK}])")
+    else:
+        print(f"[PPO] input_channels={input_channels} (obs_channels={obs_channels} * stack={stack_size})")
     print(
         "[PPO][OVERRIDE] "
         f"ent_coef={agent.ent_coef:.3f}, ent_min={agent.ent_min:.3f}, "
@@ -383,6 +455,7 @@ def run(
     eval_mode: bool = False,
     ckpt_path: str = "checkpoints/lunatic_v1_ch4.pth",
     use_sim: bool = False,
+    use_mlp_agent: bool = False,
 
     # monitoring
     monitor_gpu: bool = False,
@@ -411,7 +484,12 @@ def run(
     append_run_header(log_path, run_ts, int(episodes), bool(eval_mode), stats)
     print(stats_one_line(stats))
 
-    env, agent = _load_agent_and_env(ckpt_path, no_render=no_render, use_sim=use_sim)
+    env, agent = _load_agent_and_env(
+        ckpt_path,
+        no_render=no_render,
+        use_sim=use_sim,
+        use_mlp_agent=use_mlp_agent,
+    )
 
     if eval_mode:
         _agent_set_eval_mode(agent)
@@ -474,6 +552,8 @@ def run(
             raw = env.reset()
             if use_sim:
                 state = sim_stacker.reset(raw)
+            elif use_mlp_agent:
+                state = _build_mlp_state_from_env(env, k=MLP_TOPK)
             else:
                 state = raw
 
@@ -528,7 +608,11 @@ def run(
                     # 실제 "최근20 clear" 집계는 에피소드 끝에서 기록하는 게 안전함.
                     # (에피소드 단위로 1개 bool만 넣고 싶으니까)
                 else:
-                    next_state, reward, done = env.step(action_idx)
+                    _next_obs, reward, done = env.step(action_idx)
+                    if use_mlp_agent:
+                        next_state = _build_mlp_state_from_env(env, k=MLP_TOPK)
+                    else:
+                        next_state = _next_obs
                     exec_idx = getattr(env.s, "exec_action_idx", action_idx)
                     exec_name = str(getattr(ACTIONS[int(exec_idx)], "name", ""))
 
