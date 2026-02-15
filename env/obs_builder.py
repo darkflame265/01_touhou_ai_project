@@ -1,7 +1,8 @@
+# env/obs_builder.py
 from __future__ import annotations
 
 import time
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import cv2
 import numpy as np
@@ -9,19 +10,18 @@ import numpy as np
 from env.reimu_tracker_cv import ReimuTrackerCV
 from env.reimu_tracker_debug_view import ReimuTrackerDebugView, DebugViewConfig
 
+# ✅ 추가: bullet tracker imports
+from env.bullet_tracker_cv import BulletTrackerCV
+from env.bullet_tracker_debug_view import BulletTrackerDebugView, BulletDebugViewConfig
+
 
 class ObsBuilder:
     """
     4ch obs (float32):
       ch0: current gray (0..1) + player marker + meta(x,y,conf)
-      ch1: prev gray (0..1)                # 원본 그대로(이전 프레임)
-      ch2: absdiff(current, prev) (0..1)   # 원본 그대로(차이). threshold/morph/EMA/잔상 없음
-      ch3: player position hint (0..1)     # gaussian coord-map (플레이어 위치를 "채널"로 명확히)
-
-    설계 의도:
-      - ch0: 공간정보(현재 화면)
-      - ch1/ch2: 시간정보(이전 프레임/움직임)
-      - ch3: "내 위치"를 항상 명확히(레이무를 장애물로 오해하는 혼란 감소)
+      ch1: prev gray (0..1)
+      ch2: absdiff(current, prev) (0..1)
+      ch3: player position hint (0..1) gaussian coord-map
     """
 
     def __init__(
@@ -64,11 +64,9 @@ class ObsBuilder:
         self.marker_min_scale = 0.35
 
         # ch3: player position hint (gaussian)
-        # - sigma가 작을수록 "점"에 가까움 (정확 좌표 강조)
-        # - sigma가 크면 완만한 언덕(학습은 편한데, 미세회피엔 과할 수 있음)
         self.player_hint_enable = True
-        self.player_hint_sigma = 2.0     # s좌표 기준. 1.5~3.5 추천
-        self.player_hint_peak = 1.0      # 최대값(0..1)
+        self.player_hint_sigma = 2.0
+        self.player_hint_peak = 1.0
         self._grid_xy: Optional[Tuple[np.ndarray, np.ndarray]] = None
 
         # prev gray (s,s) uint8
@@ -76,9 +74,9 @@ class ObsBuilder:
 
         # debug windows
         self.show_reimu_debug = True
-        self.reimu_dbg_view: Optional[ReimuTrackerDebugView] = None  # lazy init
+        self.reimu_dbg_view: Optional[ReimuTrackerDebugView] = None
 
-        self.show_obs_debug = True
+        self.show_obs_debug = False
         self.win_crop = "OBS_CROP"
         self._obs_win_inited = False
         self.obs_debug_channel = 2
@@ -104,6 +102,12 @@ class ObsBuilder:
         self._z_f32 = np.zeros((self.s, self.s), np.float32)
         self._obs = np.empty((4, self.s, self.s), np.float32)
 
+        # ✅ bullet tracker (playfield crop)
+        self.bullet_tracker = BulletTrackerCV()
+        self.last_bullets_xy_norm: List[Tuple[float, float]] = []  # playfield normalized (0..1)
+        self.show_bullet_debug = True
+        self.bullet_dbg_view: Optional[BulletTrackerDebugView] = None
+
     # -------------------------
     # public hooks
     # -------------------------
@@ -124,12 +128,28 @@ class ObsBuilder:
         self._pause_active = False
         self._pause_reset_pending = False
 
-        # ✅ 디버그 윈도우 상태 리셋(새 게임에서 갱신 꼬임 방지)
+        # debug window
         self._obs_win_inited = False
         try:
             cv2.destroyWindow(self.win_crop)
         except Exception:
             pass
+
+        # ✅ bullet reset
+        try:
+            self.bullet_tracker.reset()
+        except Exception:
+            pass
+        self.last_bullets_xy_norm = []
+
+        if self.bullet_dbg_view is not None:
+            try:
+                self.bullet_dbg_view.close()
+            except Exception:
+                pass
+            self.bullet_dbg_view = None
+
+        # reimu debug window close는 굳이 필수 아님(원하면 닫아도 됨)
 
     def on_player_death(self):
         try:
@@ -221,7 +241,6 @@ class ObsBuilder:
         du = xx - float(u)
         dv = yy - float(v)
         d2 = du * du + dv * dv
-        # gaussian: exp(-d^2 / (2*sigma^2))
         hint = np.exp(-d2 / (2.0 * sigma * sigma)).astype(np.float32)
         if peak != 1.0:
             hint *= peak
@@ -275,7 +294,7 @@ class ObsBuilder:
     # main
     # -------------------------
     def make_state(self, img_bgr: np.ndarray) -> np.ndarray:
-        # 1) tracker
+        # 1) reimu tracker
         now = time.time()
         if self._pause_active and now < float(self._pause_until):
             bbox, conf = None, 0.0
@@ -299,15 +318,42 @@ class ObsBuilder:
         else:
             self.last_conf = float(np.clip(conf, 0.0, 1.0))
 
-        # 2) crop -> small (형태 변화의 유일한 원인: 리사이즈)
+        # 2) crop -> small
         pf = self._crop_pf(img_bgr)
         interp = cv2.INTER_AREA if max(pf.shape[:2]) >= self.s else cv2.INTER_LINEAR
         bgr = cv2.resize(pf, (self.s, self.s), interpolation=interp)
 
-        # 3) gray (원본 그대로)
+        # ✅ bullet tracking on playfield (ROI coords)
+        px, py = self.player_center
+        px_pf = int(np.clip(px - self._x0, 0, self._pw - 1))
+        py_pf = int(np.clip(py - self._y0, 0, self._ph - 1))
+
+        pts_pf = self.bullet_tracker.step(pf, player_center_roi=(px_pf, py_pf))
+
+        bul_norm: List[Tuple[float, float]] = []
+        den_x = max(1, self._pw - 1)
+        den_y = max(1, self._ph - 1)
+        for (bx, by) in pts_pf:
+            x_n = float(np.clip(bx / den_x, 0.0, 1.0))
+            y_n = float(np.clip(by / den_y, 0.0, 1.0))
+            bul_norm.append((x_n, y_n))
+        self.last_bullets_xy_norm = bul_norm
+
+        if self.show_bullet_debug:
+            if self.bullet_dbg_view is None:
+                self.bullet_dbg_view = BulletTrackerDebugView(
+                    self.bullet_tracker,
+                    cfg=BulletDebugViewConfig(window_name="debug_bullets", enable_keys=False, wait_ms=1),
+                )
+            try:
+                self.bullet_dbg_view.render(pf)
+            except Exception as e:
+                print("[bullet_dbg_view.render ERROR]", repr(e))
+
+        # 3) gray
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)  # uint8
 
-        # 4) prev/diff (원본 그대로)
+        # 4) prev/diff
         if self._prev_gray is None or self._prev_gray.shape != gray.shape:
             prev = self._z_u8
             diff = self._z_u8
@@ -327,7 +373,7 @@ class ObsBuilder:
         self._obs[2] = diff.astype(np.float32) * (1.0 / 255.0)
         self._obs[3] = hint
 
-        # 7) debug
+        # 7) obs debug
         if self.show_obs_debug:
             try:
                 self._ensure_obs_window()
@@ -337,7 +383,10 @@ class ObsBuilder:
 
                 up = int(max(1, self.debug_upscale))
                 if up != 1:
-                    vis = cv2.resize(vis, (vis.shape[1] * up, vis.shape[0] * up), interpolation=cv2.INTER_NEAREST)
+                    vis = cv2.resize(
+                        vis, (vis.shape[1] * up, vis.shape[0] * up),
+                        interpolation=cv2.INTER_NEAREST
+                    )
 
                 self._draw_debug_cross(vis, up)
 
@@ -349,8 +398,7 @@ class ObsBuilder:
                     y=28,
                 )
                 cv2.imshow(self.win_crop, vis)
-                cv2.waitKey(1)  # ✅ 창 이벤트/리페인트 강제 처리
-
+                cv2.waitKey(1)
             except Exception:
                 pass
 

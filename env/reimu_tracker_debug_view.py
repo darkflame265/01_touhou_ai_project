@@ -181,12 +181,16 @@ class ReimuTrackerDebugView:
                 int(self.cfg.locked_text_thickness),
             )
 
+       # env/reimu_tracker_debug_view.py  (render() 마지막 부분 교체)
         cv2.imshow(self.cfg.window_name, vis)
 
+        # ✅ enable_keys=False여도 창 리페인트/이벤트 처리를 위해 waitKey는 항상 호출
+        key = cv2.waitKey(int(self.cfg.wait_ms)) & 0xFF
+
+        # 키 입력 기능을 끈 경우: 키 처리는 하지 않고 종료
         if not self.cfg.enable_keys:
             return -1
 
-        key = cv2.waitKey(int(self.cfg.wait_ms)) & 0xFF
         if key != 255:
             self.handle_key(key)
             return key
