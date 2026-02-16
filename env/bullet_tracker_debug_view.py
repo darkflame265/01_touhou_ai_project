@@ -14,6 +14,7 @@ class BulletDebugViewConfig:
     window_name: str = "debug_bullets"
     wait_ms: int = 1
     enable_keys: bool = False
+    window_size: Optional[Tuple[int, int]] = None
 
     # BGR colors
     color_points: Tuple[int, int, int] = (0, 255, 255)  # yellow
@@ -35,6 +36,9 @@ class BulletTrackerDebugView:
             return
         try:
             cv2.namedWindow(self.cfg.window_name, cv2.WINDOW_NORMAL)
+            if self.cfg.window_size is not None:
+                ww, hh = self.cfg.window_size
+                cv2.resizeWindow(self.cfg.window_name, int(max(64, ww)), int(max(64, hh)))
         except Exception:
             pass
         self._window_inited = True
