@@ -20,6 +20,9 @@ class BulletDebugViewConfig:
     grid_draw_lines: bool = True
     grid_line_color: Tuple[int, int, int] = (70, 70, 70)
     grid_line_thickness: int = 1
+    show_player_hitbox: bool = True
+    player_hitbox_radius: int = 4
+    color_player_hitbox: Tuple[int, int, int] = (0, 255, 0)  # green
 
 
 class BulletTrackerDebugView:
@@ -117,6 +120,19 @@ class BulletTrackerDebugView:
         occ = dbg.get("grid_occ", None)
         if occ is not None:
             vis = self._overlay_occ_grid(vis, np.asarray(occ))
+
+        if bool(self.cfg.show_player_hitbox):
+            pc = dbg.get("player_center_roi", None)
+            if pc is not None:
+                px, py = map(int, pc)
+                cv2.circle(
+                    vis,
+                    (px, py),
+                    int(max(1, self.cfg.player_hitbox_radius)),
+                    tuple(map(int, self.cfg.color_player_hitbox)),
+                    2,
+                    cv2.LINE_AA if bool(self.cfg.use_antialias) else cv2.LINE_8,
+                )
 
         cv2.imshow(self.cfg.window_name, vis)
         key = cv2.waitKey(int(self.cfg.wait_ms)) & 0xFF

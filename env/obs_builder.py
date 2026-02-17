@@ -174,16 +174,46 @@ class ObsBuilder:
         px_n: float,
         py_n: float,
         conf: float,
+        bullet_mask_u8: Optional[np.ndarray] = None,
+        player_center_roi: Optional[Tuple[int, int]] = None,
+        player_bbox_roi: Optional[Tuple[int, int, int, int]] = None,
     ) -> np.ndarray:
         g = int(max(2, self.bullet_grid_size))
-        occ = np.zeros((g, g), dtype=np.float32)
-        for (bx, by) in bullets_xy_norm:
-            ix = int(np.clip(int(float(bx) * g), 0, g - 1))
-            iy = int(np.clip(int(float(by) * g), 0, g - 1))
-            occ[iy, ix] += 1.0
-
-        # Soft normalize counts to [0,1] while preserving density differences.
-        occ = np.tanh(occ / 2.0).astype(np.float32)
+        if bullet_mask_u8 is not None and getattr(bullet_mask_u8, "size", 0) > 0:
+            m = bullet_mask_u8.astype(np.uint8)
+            # Keep MLP spatial input consistent with bullet debug grid by removing player core.
+            try:
+                if bool(getattr(self.bullet_tracker.cfg, "debug_grid_suppress_player", False)) and player_center_roi is not None:
+                    h, w = m.shape[:2]
+                    pcore = np.zeros((h, w), dtype=np.uint8)
+                    if player_bbox_roi is not None:
+                        bx, by, bw, bh = map(int, player_bbox_roi)
+                        cx = int(bx + 0.5 * bw)
+                        cy = int(by + 0.5 * bh)
+                        rx = int(max(2, round(float(bw) * float(getattr(self.bullet_tracker.cfg, "debug_grid_player_rx_scale", 0.18)))))
+                        ry = int(max(2, round(float(bh) * float(getattr(self.bullet_tracker.cfg, "debug_grid_player_ry_scale", 0.24)))))
+                        cv2.ellipse(pcore, (cx, cy), (rx, ry), 0.0, 0.0, 360.0, 255, thickness=-1)
+                    else:
+                        px, py = map(int, player_center_roi)
+                        rx = int(max(1, int(getattr(self.bullet_tracker.cfg, "debug_grid_player_fallback_rx", 6))))
+                        ry = int(max(1, int(getattr(self.bullet_tracker.cfg, "debug_grid_player_fallback_ry", 8))))
+                        cv2.ellipse(pcore, (px, py), (rx, ry), 0.0, 0.0, 360.0, 255, thickness=-1)
+                    m = cv2.bitwise_and(m, cv2.bitwise_not(pcore))
+            except Exception:
+                pass
+            occ_raw = cv2.resize(
+                m,
+                (g, g),
+                interpolation=cv2.INTER_AREA,
+            ).astype(np.float32) / 255.0
+        else:
+            occ_raw = np.zeros((g, g), dtype=np.float32)
+            for (bx, by) in bullets_xy_norm:
+                ix = int(np.clip(int(float(bx) * g), 0, g - 1))
+                iy = int(np.clip(int(float(by) * g), 0, g - 1))
+                occ_raw[iy, ix] += 1.0
+        # Soft normalize to [0,1] while preserving local density.
+        occ = np.tanh(occ_raw / 0.8).astype(np.float32)
         delta = np.clip(occ - self._prev_bullet_occ_grid, -1.0, 1.0).astype(np.float32)
         self._prev_bullet_occ_grid = occ.copy()
 
@@ -421,6 +451,9 @@ class ObsBuilder:
             float(px_n),
             float(py_n),
             float(self.last_conf),
+            bullet_mask_u8=getattr(self.bullet_tracker, "last_mask_u8", None),
+            player_center_roi=(px_pf, py_pf),
+            player_bbox_roi=bbox_pf,
         )
 
 

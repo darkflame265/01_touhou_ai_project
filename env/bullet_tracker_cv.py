@@ -128,6 +128,11 @@ class BulletTrackerConfig:
     debug_max_draw: int = 120
     debug_grid_size: int = 64
     debug_grid_gain: float = 0.8
+    debug_grid_suppress_player: bool = True
+    debug_grid_player_rx_scale: float = 0.24
+    debug_grid_player_ry_scale: float = 0.32
+    debug_grid_player_fallback_rx: int = 8
+    debug_grid_player_fallback_ry: int = 10
 
     # 5) item suppression (template + color + ttl)
     use_item_reject: bool = True
@@ -759,6 +764,34 @@ class BulletTrackerCV:
             float(r.get("y", 0.0)),
         ) for r in self._near_hold]
 
+    def _player_core_mask_for_grid(
+        self,
+        roi_shape: Tuple[int, int],
+        player_center_roi: Optional[Tuple[int, int]],
+        player_bbox_roi: Optional[BBox],
+    ) -> np.ndarray:
+        h, w = roi_shape
+        m = np.zeros((h, w), np.uint8)
+        if (not bool(self.cfg.debug_grid_suppress_player)) or (player_center_roi is None):
+            return m
+
+        px, py = map(int, player_center_roi)
+        if not (0 <= px < w and 0 <= py < h):
+            return m
+
+        if player_bbox_roi is not None:
+            bx, by, bw, bh = map(int, player_bbox_roi)
+            cx = int(bx + 0.5 * bw)
+            cy = int(by + 0.5 * bh)
+            rx = int(max(2, round(float(bw) * float(self.cfg.debug_grid_player_rx_scale))))
+            ry = int(max(2, round(float(bh) * float(self.cfg.debug_grid_player_ry_scale))))
+            cv2.ellipse(m, (cx, cy), (rx, ry), 0.0, 0.0, 360.0, 255, thickness=-1)
+        else:
+            rx = int(max(1, self.cfg.debug_grid_player_fallback_rx))
+            ry = int(max(1, self.cfg.debug_grid_player_fallback_ry))
+            cv2.ellipse(m, (px, py), (rx, ry), 0.0, 0.0, 360.0, 255, thickness=-1)
+        return m
+
     def step(
         self,
         roi_bgr: np.ndarray,
@@ -823,12 +856,18 @@ class BulletTrackerCV:
 
         # Debug spatial grids (ID-free): occupancy + temporal delta
         g = int(max(2, self.cfg.debug_grid_size))
-        occ = np.zeros((g, g), dtype=np.float32)
-        for (x, y) in pts:
-            ix = int(np.clip(int(float(x) * g / float(max(1, w))), 0, g - 1))
-            iy = int(np.clip(int(float(y) * g / float(max(1, h))), 0, g - 1))
-            occ[iy, ix] += 1.0
-        occ = np.tanh(occ / float(max(1e-6, self.cfg.debug_grid_gain))).astype(np.float32)
+        # Use mask coverage (not point centers) so all overlapped cells are highlighted.
+        grid_mask = mask
+        if mask is not None and mask.size > 0 and bool(self.cfg.debug_grid_suppress_player):
+            pcore = self._player_core_mask_for_grid((h, w), player_center_roi, player_bbox_roi)
+            if pcore is not None and pcore.size > 0:
+                grid_mask = cv2.bitwise_and(mask, cv2.bitwise_not(pcore))
+
+        if grid_mask is not None and grid_mask.size > 0:
+            occ_small = cv2.resize(grid_mask, (g, g), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+        else:
+            occ_small = np.zeros((g, g), dtype=np.float32)
+        occ = np.tanh(occ_small / float(max(1e-6, self.cfg.debug_grid_gain))).astype(np.float32)
         delta = np.clip(occ - self._prev_dbg_occ, -1.0, 1.0).astype(np.float32)
         self._prev_dbg_occ = occ.copy()
 
