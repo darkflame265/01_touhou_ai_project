@@ -128,11 +128,24 @@ class BulletTrackerConfig:
     debug_max_draw: int = 120
     debug_grid_size: int = 64
     debug_grid_gain: float = 0.8
-    debug_grid_suppress_player: bool = True
-    debug_grid_player_rx_scale: float = 0.24
-    debug_grid_player_ry_scale: float = 0.32
+    debug_grid_suppress_player: bool = False
+    debug_grid_player_rx_scale: float = 0.48
+    debug_grid_player_ry_scale: float = 0.56
     debug_grid_player_fallback_rx: int = 8
     debug_grid_player_fallback_ry: int = 10
+    debug_grid_player_donut_enable: bool = False
+    debug_grid_player_donut_mode: str = "clear"   # "clear" | "gaussian"
+    debug_grid_player_donut_r_inner: float = 1.2
+    debug_grid_player_donut_r_outer: float = 3.2
+    debug_grid_player_donut_sigma: float = 0.9
+    debug_grid_player_donut_strength: float = 1.0
+    # new: reject player sprite from hitbox center (independent of old clear/gaussian)
+    player_sprite_reject_enable: bool = True
+    player_sprite_rx: int = 14
+    player_sprite_ry: int = 20
+    player_sprite_center_y_offset: int = -3
+    player_sprite_extra_top: int = 6
+    player_sprite_extra_bottom: int = 4
 
     # 5) item suppression (template + color + ttl)
     use_item_reject: bool = True
@@ -792,6 +805,76 @@ class BulletTrackerCV:
             cv2.ellipse(m, (px, py), (rx, ry), 0.0, 0.0, 360.0, 255, thickness=-1)
         return m
 
+    def _apply_player_donut_on_grid(
+        self,
+        occ: np.ndarray,
+        player_center_roi: Optional[Tuple[int, int]],
+        roi_shape: Tuple[int, int],
+    ) -> np.ndarray:
+        if (not bool(self.cfg.debug_grid_player_donut_enable)) or (player_center_roi is None):
+            return occ
+        if occ is None or occ.size == 0 or occ.ndim != 2:
+            return occ
+
+        h, w = roi_shape
+        if h <= 1 or w <= 1:
+            return occ
+
+        px, py = map(float, player_center_roi)
+        gh, gw = occ.shape[:2]
+        cx = float(np.clip(px * (gw - 1) / float(max(1, w - 1)), 0.0, float(gw - 1)))
+        cy = float(np.clip(py * (gh - 1) / float(max(1, h - 1)), 0.0, float(gh - 1)))
+
+        yy, xx = np.indices((gh, gw), dtype=np.float32)
+        rr = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+
+        rin = float(max(0.0, self.cfg.debug_grid_player_donut_r_inner))
+        rout = float(max(rin + 1e-6, self.cfg.debug_grid_player_donut_r_outer))
+        donut = (rr >= rin) & (rr <= rout)
+        if not np.any(donut):
+            return occ
+
+        out = occ.astype(np.float32, copy=True)
+        mode = str(self.cfg.debug_grid_player_donut_mode).strip().lower()
+        if mode == "gaussian":
+            sigma = float(max(1e-6, self.cfg.debug_grid_player_donut_sigma))
+            strength = float(np.clip(self.cfg.debug_grid_player_donut_strength, 0.0, 1.0))
+            # Attenuate strongest near inner boundary, weaker toward outer boundary.
+            att = np.exp(-0.5 * ((rr - rin) / sigma) ** 2).astype(np.float32)
+            factor = np.clip(1.0 - strength * att, 0.0, 1.0)
+            out[donut] *= factor[donut]
+        else:
+            out[donut] = 0.0
+        return out
+
+    def _player_sprite_mask_from_hitbox(
+        self,
+        roi_shape: Tuple[int, int],
+        player_center_roi: Optional[Tuple[int, int]],
+    ) -> np.ndarray:
+        h, w = roi_shape
+        m = np.zeros((h, w), np.uint8)
+        if (not bool(self.cfg.player_sprite_reject_enable)) or (player_center_roi is None):
+            return m
+
+        px, py = map(int, player_center_roi)
+        if not (0 <= px < w and 0 <= py < h):
+            return m
+
+        rx = int(max(1, self.cfg.player_sprite_rx))
+        ry = int(max(1, self.cfg.player_sprite_ry))
+        cy = int(py + int(self.cfg.player_sprite_center_y_offset))
+        cv2.ellipse(m, (px, cy), (rx, ry), 0.0, 0.0, 360.0, 255, thickness=-1)
+
+        top = int(max(0, self.cfg.player_sprite_extra_top))
+        bot = int(max(0, self.cfg.player_sprite_extra_bottom))
+        y1 = int(np.clip(cy - ry - top, 0, h - 1))
+        y2 = int(np.clip(cy + ry + bot, y1 + 1, h))
+        x1 = int(np.clip(px - rx, 0, w - 1))
+        x2 = int(np.clip(px + rx + 1, x1 + 1, w))
+        m[y1:y2, x1:x2] = 255
+        return m
+
     def step(
         self,
         roi_bgr: np.ndarray,
@@ -804,6 +887,10 @@ class BulletTrackerCV:
         # 1) raw mask
         raw_mask = self._build_mask(roi_bgr)
         mask = raw_mask.copy()
+        if bool(self.cfg.player_sprite_reject_enable):
+            spm = self._player_sprite_mask_from_hitbox((h, w), player_center_roi)
+            if spm is not None and spm.size > 0:
+                mask = cv2.bitwise_and(mask, cv2.bitwise_not(spm))
 
         # 2) subtract item regions (template + color + ttl)
         item_boxes_det: List[BBox] = []
@@ -867,6 +954,11 @@ class BulletTrackerCV:
             occ_small = cv2.resize(grid_mask, (g, g), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
         else:
             occ_small = np.zeros((g, g), dtype=np.float32)
+        occ_small = self._apply_player_donut_on_grid(
+            occ_small,
+            player_center_roi=player_center_roi,
+            roi_shape=(h, w),
+        )
         occ = np.tanh(occ_small / float(max(1e-6, self.cfg.debug_grid_gain))).astype(np.float32)
         delta = np.clip(occ - self._prev_dbg_occ, -1.0, 1.0).astype(np.float32)
         self._prev_dbg_occ = occ.copy()

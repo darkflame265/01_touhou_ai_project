@@ -212,6 +212,30 @@ class ObsBuilder:
                 ix = int(np.clip(int(float(bx) * g), 0, g - 1))
                 iy = int(np.clip(int(float(by) * g), 0, g - 1))
                 occ_raw[iy, ix] += 1.0
+
+        # Apply the same player-centered donut mask used in debug grid.
+        try:
+            cfg = self.bullet_tracker.cfg
+            if bool(getattr(cfg, "debug_grid_player_donut_enable", False)):
+                cx = float(np.clip(float(px_n) * (g - 1), 0.0, float(g - 1)))
+                cy = float(np.clip(float(py_n) * (g - 1), 0.0, float(g - 1)))
+                yy, xx = np.indices((g, g), dtype=np.float32)
+                rr = np.sqrt((xx - cx) ** 2 + (yy - cy) ** 2)
+                rin = float(max(0.0, getattr(cfg, "debug_grid_player_donut_r_inner", 1.2)))
+                rout = float(max(rin + 1e-6, getattr(cfg, "debug_grid_player_donut_r_outer", 3.2)))
+                donut = (rr >= rin) & (rr <= rout)
+                mode = str(getattr(cfg, "debug_grid_player_donut_mode", "clear")).strip().lower()
+                if mode == "gaussian":
+                    sigma = float(max(1e-6, getattr(cfg, "debug_grid_player_donut_sigma", 0.9)))
+                    strength = float(np.clip(getattr(cfg, "debug_grid_player_donut_strength", 1.0), 0.0, 1.0))
+                    att = np.exp(-0.5 * ((rr - rin) / sigma) ** 2).astype(np.float32)
+                    factor = np.clip(1.0 - strength * att, 0.0, 1.0)
+                    occ_raw[donut] *= factor[donut]
+                else:
+                    occ_raw[donut] = 0.0
+        except Exception:
+            pass
+
         # Soft normalize to [0,1] while preserving local density.
         occ = np.tanh(occ_raw / 0.8).astype(np.float32)
         delta = np.clip(occ - self._prev_bullet_occ_grid, -1.0, 1.0).astype(np.float32)
