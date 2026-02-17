@@ -107,13 +107,16 @@ class ObsBuilder:
         self.last_bullets_xy_norm: List[Tuple[float, float]] = []  # playfield normalized (0..1)
         self.show_bullet_debug = True
         self.bullet_dbg_view: Optional[BulletTrackerDebugView] = None
-        self.bullet_debug_show_player_bbox = True
 
         # ✅ MLP용: bullet TOP-K relative + velocity (slot-based)
         self.bullet_topk_k = int(getattr(self.bullet_tracker.cfg, "topk", 16))
         self.last_bullets_dxdy: List[Tuple[float, float]] = []     # len<=K
         self.last_bullets_vdxdy: List[Tuple[float, float]] = []    # len<=K
         self._prev_bullets_dxdy_pad: List[Tuple[float, float]] = [(0.0, 0.0)] * self.bullet_topk_k
+        # Spatial bullet features for MLP (ID-free): meta4 + occ(64x64) + delta(64x64) = 8196 dims
+        self.bullet_grid_size = 64
+        self.last_bullet_spatial_vec = np.zeros((4 + 2 * self.bullet_grid_size * self.bullet_grid_size,), dtype=np.float32)
+        self._prev_bullet_occ_grid = np.zeros((self.bullet_grid_size, self.bullet_grid_size), dtype=np.float32)
 
 
     # -------------------------
@@ -162,6 +165,32 @@ class ObsBuilder:
         self.last_bullets_dxdy = []
         self.last_bullets_vdxdy = []
         self._prev_bullets_dxdy_pad = [(0.0, 0.0)] * self.bullet_topk_k
+        self.last_bullet_spatial_vec = np.zeros((4 + 2 * self.bullet_grid_size * self.bullet_grid_size,), dtype=np.float32)
+        self._prev_bullet_occ_grid = np.zeros((self.bullet_grid_size, self.bullet_grid_size), dtype=np.float32)
+
+    def _build_bullet_spatial_vec(
+        self,
+        bullets_xy_norm: List[Tuple[float, float]],
+        px_n: float,
+        py_n: float,
+        conf: float,
+    ) -> np.ndarray:
+        g = int(max(2, self.bullet_grid_size))
+        occ = np.zeros((g, g), dtype=np.float32)
+        for (bx, by) in bullets_xy_norm:
+            ix = int(np.clip(int(float(bx) * g), 0, g - 1))
+            iy = int(np.clip(int(float(by) * g), 0, g - 1))
+            occ[iy, ix] += 1.0
+
+        # Soft normalize counts to [0,1] while preserving density differences.
+        occ = np.tanh(occ / 2.0).astype(np.float32)
+        delta = np.clip(occ - self._prev_bullet_occ_grid, -1.0, 1.0).astype(np.float32)
+        self._prev_bullet_occ_grid = occ.copy()
+
+        n = int(len(bullets_xy_norm))
+        n_norm = float(np.clip(n / float(max(1, self.bullet_topk_k)), 0.0, 1.0))
+        meta = np.asarray([float(px_n), float(py_n), float(np.clip(conf, 0.0, 1.0)), float(n_norm)], dtype=np.float32)
+        return np.concatenate([meta, occ.reshape(-1), delta.reshape(-1)], axis=0).astype(np.float32)
 
     def on_player_death(self):
         try:
@@ -387,6 +416,12 @@ class ObsBuilder:
         self.last_bullets_dxdy = cur_pad
         self.last_bullets_vdxdy = vdxdy_pad
         self._prev_bullets_dxdy_pad = cur_pad
+        self.last_bullet_spatial_vec = self._build_bullet_spatial_vec(
+            self.last_bullets_xy_norm,
+            float(px_n),
+            float(py_n),
+            float(self.last_conf),
+        )
 
 
         if self.show_bullet_debug:
@@ -398,7 +433,6 @@ class ObsBuilder:
                         enable_keys=False,
                         wait_ms=1,
                         window_size=(int(self._pw), int(self._ph)),
-                        show_player_bbox=bool(self.bullet_debug_show_player_bbox),
                     ),
                 )
             try:

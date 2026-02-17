@@ -115,11 +115,19 @@ class BulletTrackerConfig:
     merged_peak_min_dt: float = 1.4
     merged_peak_min_dist: int = 5
     merged_peak_max_points: int = 10
+    adaptive_pointcloud: bool = True
+    pointcloud_area_per_point: float = 120.0
+    pointcloud_min_points_complex: int = 2
+    pointcloud_max_points_per_blob: int = 12
+    pointcloud_aspect_complex: float = 1.65
+    pointcloud_contour_area_min: float = 6.0
 
     # 4) outputs
     max_candidates: int = 384
     topk: int = 32
     debug_max_draw: int = 120
+    debug_grid_size: int = 64
+    debug_grid_gain: float = 0.8
 
     # 5) item suppression (template + color + ttl)
     use_item_reject: bool = True
@@ -155,11 +163,22 @@ class BulletTrackerConfig:
     track_upward_vy_thr: float = -0.40
     track_min_age_for_upward_reject: int = 2
     use_near_player_shape_filter: bool = True
-    near_player_radius_px: float = 44.0
-    near_player_min_circularity: float = 0.72
-    near_player_max_aspect: float = 1.35
+    near_player_radius_px: float = 24.0
+    near_player_min_circularity: float = 0.56
+    near_player_max_aspect: float = 2.10
     near_player_min_area: float = 4.0
-    near_player_max_area: float = 260.0
+    near_player_max_area: float = 200.0
+    # simple near-player new-track rejection
+    reject_new_near_player: bool = True
+    new_near_player_radius_px: float = 20.0
+    new_near_player_max_age: int = 2
+    # short near-player hold memory (no vector prediction)
+    hold_near_player_on_miss: bool = True
+    hold_near_player_radius_px: float = 40.0
+    hold_near_player_frames: int = 3
+    hold_match_dist_px: float = 10.0
+    hold_dedup_dist_px: float = 6.0
+
 
 
 class BulletTrackerCV:
@@ -185,6 +204,9 @@ class BulletTrackerCV:
         self._templates_gray: List[np.ndarray] = self._load_item_templates()
         self._tracks: Dict[int, Dict[str, Any]] = {}
         self._next_tid: int = 1
+        self._near_hold: List[Dict[str, Any]] = []
+        g = int(max(2, self.cfg.debug_grid_size))
+        self._prev_dbg_occ = np.zeros((g, g), dtype=np.float32)
 
     def reset(self) -> None:
         self.last_mask_u8 = None
@@ -194,6 +216,9 @@ class BulletTrackerCV:
         self._item_ttl = []
         self._tracks = {}
         self._next_tid = 1
+        self._near_hold = []
+        g = int(max(2, self.cfg.debug_grid_size))
+        self._prev_dbg_occ = np.zeros((g, g), dtype=np.float32)
 
     def _load_gray_templates(self, paths: Tuple[str, ...]) -> List[np.ndarray]:
         out: List[np.ndarray] = []
@@ -381,7 +406,11 @@ class BulletTrackerCV:
             out[y:y + bh, x:x + bw] = 0
         return out
 
-    def _extract_points(self, mask_u8: np.ndarray, player_center_roi: Optional[Tuple[int, int]] = None) -> List[Pt]:
+    def _extract_points(
+        self,
+        mask_u8: np.ndarray,
+        player_center_roi: Optional[Tuple[int, int]] = None,
+    ) -> List[Pt]:
         if mask_u8 is None or mask_u8.size == 0:
             return []
 
@@ -449,22 +478,78 @@ class BulletTrackerCV:
                         break
             return outp
 
+        def _sample_points_from_contour(c: np.ndarray, x: int, y: int, bw: int, bh: int) -> List[Pt]:
+            # Shape-agnostic point cloud:
+            # complex/elongated blobs -> multiple points, compact blobs -> single center.
+            c_area = float(max(0.0, cv2.contourArea(c)))
+            if c_area <= 0.0:
+                return []
+
+            asp = float(max(bw, bh)) / float(max(1, min(bw, bh)))
+            is_complex = (
+                bool(self.cfg.adaptive_pointcloud)
+                and (
+                    asp >= float(self.cfg.pointcloud_aspect_complex)
+                    or c_area >= float(self.cfg.merged_blob_area_min)
+                )
+            )
+            if not is_complex:
+                return [(float(x + 0.5 * bw), float(y + 0.5 * bh))]
+
+            n_area = int(max(1, round(c_area / float(max(1.0, self.cfg.pointcloud_area_per_point)))))
+            n = int(max(int(self.cfg.pointcloud_min_points_complex), n_area))
+            n = int(min(n, max(1, int(self.cfg.pointcloud_max_points_per_blob))))
+
+            comp = np.zeros((bh, bw), np.uint8)
+            c_local = c - np.array([[[x, y]]], dtype=c.dtype)
+            cv2.drawContours(comp, [c_local], -1, 255, thickness=-1)
+            peaks = _peaks_from_big_component(comp, x, y)
+
+            if len(peaks) >= n:
+                return peaks[:n]
+            if len(peaks) > 0:
+                return peaks
+
+            # Fallback: evenly sample along major axis.
+            if len(c) >= 5:
+                (cx, cy), (rw, rh), ang = cv2.minAreaRect(c)
+                theta = math.radians(float(ang))
+                if rw < rh:
+                    theta += math.pi * 0.5
+                ux = math.cos(theta)
+                uy = math.sin(theta)
+                long_side = float(max(rw, rh))
+                half = 0.5 * long_side
+                outp: List[Pt] = []
+                for j in range(max(1, n)):
+                    t = (j + 0.5) / float(max(1, n))
+                    off = -half + t * long_side
+                    outp.append((float(cx + ux * off), float(cy + uy * off)))
+                return outp
+
+            return [(float(x + 0.5 * bw), float(y + 0.5 * bh))]
+
         cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         pts: List[Pt] = []
         for c in cnts:
             x, y, bw, bh = cv2.boundingRect(c)
+            c_area = float(max(0.0, cv2.contourArea(c)))
             area = float(bw * bh)
+            if c_area < float(self.cfg.pointcloud_contour_area_min):
+                continue
             is_normal = (
                 self.cfg.w_min <= bw <= self.cfg.w_max
                 and self.cfg.h_min <= bh <= self.cfg.h_max
                 and float(self.cfg.area_min) <= area <= float(self.cfg.area_max)
             )
             if is_normal:
-                cx = float(x + 0.5 * bw)
-                cy = float(y + 0.5 * bh)
-                if _is_near_player_non_bullet((cx, cy), area, bw, bh, c):
-                    continue
-                pts.append((cx, cy))
+                sampled = _sample_points_from_contour(c, x, y, bw, bh)
+                for sp in sampled:
+                    if _is_near_player_non_bullet(sp, area, bw, bh, c):
+                        continue
+                    pts.append(sp)
+                    if len(pts) >= int(self.cfg.max_candidates):
+                        break
                 if len(pts) >= int(self.cfg.max_candidates):
                     break
                 continue
@@ -476,10 +561,7 @@ class BulletTrackerCV:
             if bw < int(self.cfg.w_min) or bh < int(self.cfg.h_min):
                 continue
 
-            comp = np.zeros((bh, bw), np.uint8)
-            c_local = c - np.array([[[x, y]]], dtype=c.dtype)
-            cv2.drawContours(comp, [c_local], -1, 255, thickness=-1)
-            split_pts = _peaks_from_big_component(comp, x, y)
+            split_pts = _sample_points_from_contour(c, x, y, bw, bh)
             if not split_pts:
                 continue
             if player_center_roi is not None and self.cfg.use_near_player_shape_filter:
@@ -509,7 +591,6 @@ class BulletTrackerCV:
         assigned: Dict[int, int] = {}  # point idx -> track id
         used_tracks: set[int] = set()
         maxd = float(max(1.0, self.cfg.track_match_max_dist))
-
         for i, (x, y) in enumerate(pts):
             best_tid = None
             best_d = 1e9
@@ -558,18 +639,26 @@ class BulletTrackerCV:
         self,
         pts: List[Pt],
         player_center_roi: Optional[Tuple[int, int]] = None,
-    ) -> tuple[List[Pt], int, int]:
-        if (not self.cfg.use_track_filter) or (not pts):
-            return pts, 0, 0
+    ) -> tuple[List[Pt], int, int, int]:
+        if not self.cfg.use_track_filter:
+            return pts, 0, 0, 0
         map_idx_tid = self._update_tracks(pts)
         out: List[Pt] = []
         rej_slow = 0
         rej_up = 0
+        rej_new_near = 0
         sp_thr = float(self.cfg.track_slow_speed_thr)
         age_thr = int(self.cfg.track_min_age_for_slow_reject)
         use_up = bool(self.cfg.reject_upward_motion)
         up_vy_thr = float(self.cfg.track_upward_vy_thr)
         up_age_thr = int(self.cfg.track_min_age_for_upward_reject)
+        use_new_near = bool(self.cfg.reject_new_near_player)
+        near_r = float(max(1.0, self.cfg.new_near_player_radius_px))
+        near_r2 = near_r * near_r
+        near_age = int(max(1, self.cfg.new_near_player_max_age))
+        pcx = pcy = None
+        if player_center_roi is not None:
+            pcx, pcy = map(float, player_center_roi)
 
         for i, p in enumerate(pts):
             tid = map_idx_tid.get(i, None)
@@ -583,6 +672,13 @@ class BulletTrackerCV:
             age = int(tr.get("age", 1))
             speed = float(tr.get("speed", 0.0))
             vy = float(tr.get("vy", 0.0))
+            if pcx is not None and pcy is not None and use_new_near:
+                dxp = float(p[0]) - pcx
+                dyp = float(p[1]) - pcy
+                d2p = dxp * dxp + dyp * dyp
+                if age <= near_age and d2p <= near_r2:
+                    rej_new_near += 1
+                    continue
             if use_up and age >= up_age_thr and vy <= up_vy_thr:
                 rej_up += 1
                 continue
@@ -590,7 +686,78 @@ class BulletTrackerCV:
                 rej_slow += 1
                 continue
             out.append(p)
-        return out, int(rej_slow), int(rej_up)
+        return out, int(rej_slow), int(rej_up), int(rej_new_near)
+
+    def _update_near_hold(
+        self,
+        pts: List[Pt],
+        player_center_roi: Optional[Tuple[int, int]],
+    ) -> List[Pt]:
+        if not bool(self.cfg.hold_near_player_on_miss):
+            self._near_hold = []
+            return []
+        if player_center_roi is None:
+            # No anchor point; decay existing entries only.
+            alive = []
+            for r in self._near_hold:
+                r["ttl"] = int(r.get("ttl", 0)) - 1
+                if int(r["ttl"]) > 0:
+                    alive.append(r)
+            self._near_hold = alive
+            return [(
+                float(r.get("x", 0.0)),
+                float(r.get("y", 0.0)),
+            ) for r in self._near_hold]
+
+        px, py = map(float, player_center_roi)
+        near_r = float(max(1.0, self.cfg.hold_near_player_radius_px))
+        near_r2 = near_r * near_r
+        match_d = float(max(1.0, self.cfg.hold_match_dist_px))
+        match_d2 = match_d * match_d
+        ttl_full = int(max(1, self.cfg.hold_near_player_frames))
+
+        # decay existing entries
+        alive = []
+        for r in self._near_hold:
+            r["ttl"] = int(r.get("ttl", 0)) - 1
+            if int(r["ttl"]) > 0:
+                alive.append(r)
+        self._near_hold = alive
+
+        near_pts: List[Pt] = []
+        for (x, y) in pts:
+            dx = float(x) - px
+            dy = float(y) - py
+            if dx * dx + dy * dy <= near_r2:
+                near_pts.append((float(x), float(y)))
+
+        # match near detected points to hold entries
+        used = set()
+        for (x, y) in near_pts:
+            best_i = -1
+            best_d = 1e18
+            for i, r in enumerate(self._near_hold):
+                if i in used:
+                    continue
+                dx = float(x) - float(r.get("x", 0.0))
+                dy = float(y) - float(r.get("y", 0.0))
+                d2 = dx * dx + dy * dy
+                if d2 <= match_d2 and d2 < best_d:
+                    best_d = d2
+                    best_i = i
+            if best_i >= 0:
+                rr = self._near_hold[best_i]
+                rr["x"] = float(x)
+                rr["y"] = float(y)
+                rr["ttl"] = ttl_full
+                used.add(best_i)
+            else:
+                self._near_hold.append({"x": float(x), "y": float(y), "ttl": ttl_full})
+
+        return [(
+            float(r.get("x", 0.0)),
+            float(r.get("y", 0.0)),
+        ) for r in self._near_hold]
 
     def step(
         self,
@@ -618,10 +785,26 @@ class BulletTrackerCV:
         pts = self._extract_points(mask, player_center_roi=player_center_roi)
 
         # 4) track-based suppression (slow/static artifacts)
-        pts, rej_track_slow, rej_track_up = self._filter_by_tracks(
+        pts, rej_track_slow, rej_track_up, rej_new_near = self._filter_by_tracks(
             pts,
             player_center_roi=player_center_roi,
         )
+        held_pts = self._update_near_hold(pts, player_center_roi=player_center_roi)
+        if held_pts:
+            dd = float(max(1.0, self.cfg.hold_dedup_dist_px))
+            dd2 = dd * dd
+            merged = list(pts)
+            for hx, hy in held_pts:
+                dup = False
+                for x, y in pts:
+                    dx = float(hx) - float(x)
+                    dy = float(hy) - float(y)
+                    if dx * dx + dy * dy <= dd2:
+                        dup = True
+                        break
+                if not dup:
+                    merged.append((float(hx), float(hy)))
+            pts = merged
 
         # 5) top-k nearest to player (fallback: first K)
         K = int(max(1, self.cfg.topk))
@@ -632,12 +815,22 @@ class BulletTrackerCV:
                 dx = x - px
                 dy = y - py
                 d2 = dx * dx + dy * dy
-                ang = math.atan2(dy, dx)
-                scored.append((d2, ang, (x, y)))
-            scored.sort(key=lambda t: (t[0], t[1]))
-            topk = [p for _, _, p in scored[:K]]
+                scored.append((d2, (x, y)))
+            scored.sort(key=lambda t: t[0])
+            topk = [p for _, p in scored[:K]]
         else:
             topk = pts[:K]
+
+        # Debug spatial grids (ID-free): occupancy + temporal delta
+        g = int(max(2, self.cfg.debug_grid_size))
+        occ = np.zeros((g, g), dtype=np.float32)
+        for (x, y) in pts:
+            ix = int(np.clip(int(float(x) * g / float(max(1, w))), 0, g - 1))
+            iy = int(np.clip(int(float(y) * g / float(max(1, h))), 0, g - 1))
+            occ[iy, ix] += 1.0
+        occ = np.tanh(occ / float(max(1e-6, self.cfg.debug_grid_gain))).astype(np.float32)
+        delta = np.clip(occ - self._prev_dbg_occ, -1.0, 1.0).astype(np.float32)
+        self._prev_dbg_occ = occ.copy()
 
         self.last_mask_u8 = mask
         self.last_points_roi = pts
@@ -647,13 +840,12 @@ class BulletTrackerCV:
             "topk": int(len(topk)),
             "points": pts[: int(self.cfg.debug_max_draw)],
             "points_topk": topk,
-            "item_boxes": [tuple(map(int, b)) for b in item_boxes_alive[: int(self.cfg.debug_max_draw)]],
-            "n_item_boxes": int(len(item_boxes_alive)),
-            "reject_track_slow": int(rej_track_slow),
-            "reject_track_upward": int(rej_track_up),
-            "reject_track_total": int(rej_track_slow + rej_track_up),
+            "hold_points": held_pts[: int(self.cfg.debug_max_draw)],
+            "grid_occ": occ,
+            "grid_delta": delta,
+            "near_hold_n": int(len(self._near_hold)),
+            "reject_track_total": int(rej_track_slow + rej_track_up + rej_new_near),
             "player_center_roi": player_center_roi,
-            "roi_shape": tuple(map(int, roi_bgr.shape[:2])),
             "K": K,
         }
         return topk

@@ -78,6 +78,11 @@ def _vectorize_topk_with_vel(env: GameEnv, K: int = MLP_TOPK) -> tuple[np.ndarra
     dxdy/vdxdy는 obs_builder가 slot-based로 이미 K padding해서 제공.
     """
     obs = env.obs
+    spatial = getattr(obs, "last_bullet_spatial_vec", None)
+    if spatial is not None:
+        vec = np.asarray(spatial, dtype=np.float32).reshape(-1)
+        if vec.size > 0:
+            return vec, {"vec_dim": int(vec.shape[0]), "spatial_grid": True}
 
     px, py = getattr(obs, "last_xy_norm", (0.5, 0.78))
     conf = float(getattr(obs, "last_conf", 0.0))

@@ -196,6 +196,12 @@ def _build_action_mask_for_sim() -> np.ndarray:
 
 
 def _build_mlp_vector_from_obs(obs, k: int = MLP_TOPK) -> np.ndarray:
+    spatial = getattr(obs, "last_bullet_spatial_vec", None)
+    if spatial is not None:
+        arr = np.asarray(spatial, dtype=np.float32).reshape(-1)
+        if arr.size > 0:
+            return arr
+
     px, py = getattr(obs, "last_xy_norm", (0.5, 0.78))
     conf = float(getattr(obs, "last_conf", 0.0))
 
@@ -398,7 +404,8 @@ def _load_agent_and_env(ckpt_path: str, no_render: bool, use_sim: bool, use_mlp_
     input_channels = obs_channels * stack_size
 
     if use_mlp_agent:
-        input_dim = 4 + (4 * MLP_TOPK)
+        sample_vec = _build_mlp_state_from_env(env, k=MLP_TOPK)
+        input_dim = int(np.asarray(sample_vec, dtype=np.float32).reshape(-1).shape[0])
         agent = MLPPPOAgent(
             input_dim=int(input_dim),
             num_actions=len(ACTIONS),
@@ -415,8 +422,14 @@ def _load_agent_and_env(ckpt_path: str, no_render: bool, use_sim: bool, use_mlp_
         )
 
     if os.path.exists(ckpt_path):
-        agent.load(ckpt_path, load_optimizer=False)
-        print(f"[PPO] checkpoint loaded: {ckpt_path}")
+        try:
+            agent.load(ckpt_path, load_optimizer=False)
+            print(f"[PPO] checkpoint loaded: {ckpt_path}")
+        except RuntimeError as e:
+            if use_mlp_agent:
+                print(f"[PPO-MLP][WARN] checkpoint shape mismatch -> start from scratch: {e}")
+            else:
+                raise
     else:
         print("[PPO] no checkpoint found, training from scratch")
 
@@ -430,7 +443,7 @@ def _load_agent_and_env(ckpt_path: str, no_render: bool, use_sim: bool, use_mlp_
     agent.update_epochs = 3
 
     if use_mlp_agent:
-        print(f"[PPO-MLP] input_dim={input_dim} (vec=[px,py,conf,n_norm,(dx,dy,vdx,vdy)*{MLP_TOPK}])")
+        print(f"[PPO-MLP] input_dim={input_dim} (spatial-grid vector)")
     else:
         print(f"[PPO] input_channels={input_channels} (obs_channels={obs_channels} * stack={stack_size})")
     print(
