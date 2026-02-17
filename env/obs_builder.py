@@ -107,6 +107,7 @@ class ObsBuilder:
         self.last_bullets_xy_norm: List[Tuple[float, float]] = []  # playfield normalized (0..1)
         self.show_bullet_debug = True
         self.bullet_dbg_view: Optional[BulletTrackerDebugView] = None
+        self.bullet_debug_show_player_bbox = True
 
         # ✅ MLP용: bullet TOP-K relative + velocity (slot-based)
         self.bullet_topk_k = int(getattr(self.bullet_tracker.cfg, "topk", 16))
@@ -396,7 +397,8 @@ class ObsBuilder:
                         window_name="debug_bullets",
                         enable_keys=False,
                         wait_ms=1,
-                        window_size=(int(self.W), int(self.H)),
+                        window_size=(int(self._pw), int(self._ph)),
+                        show_player_bbox=bool(self.bullet_debug_show_player_bbox),
                     ),
                 )
             try:

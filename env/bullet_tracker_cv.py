@@ -7,7 +7,6 @@ from typing import List, Tuple, Dict, Any, Optional
 import cv2
 import numpy as np
 import math
-import os
 
 Pt = Tuple[float, float]  # (x,y) in ROI pixels
 BBox = Tuple[int, int, int, int]  # (x,y,w,h) in ROI pixels
@@ -89,14 +88,14 @@ def _nms_boxes(boxes: List[BBox], max_iou: float = 0.35, max_keep: int = 64) -> 
 class BulletTrackerConfig:
     # 1) pre-mask
     use_hsv: bool = True
-    hsv_v_min: int = 165
+    hsv_v_min: int = 150
     hsv_s_min: int = 10
     hsv_s_max: int = 255
     hsv_h_min: int = 0
     hsv_h_max: int = 179
 
     use_white: bool = True
-    white_min: int = 205
+    white_min: int = 195
 
     # 2) morph
     open_ks: int = 3
@@ -105,31 +104,24 @@ class BulletTrackerConfig:
 
     # 3) candidate filter
     area_min: int = 4
-    area_max: int = 520
+    area_max: int = 900
     w_min: int = 2
-    w_max: int = 30
+    w_max: int = 44
     h_min: int = 2
-    h_max: int = 30
-    split_elongated_blobs: bool = True
-    elongated_aspect_min: float = 1.8
-    elongated_len_min: int = 12
-    elongated_step_px: float = 8.0
-    elongated_max_splits: int = 8
-    elongated_area_max: int = 2200
+    h_max: int = 44
+    split_merged_blobs: bool = True
+    merged_blob_area_min: int = 180
+    merged_blob_area_max: int = 3200
+    merged_peak_min_dt: float = 1.4
+    merged_peak_min_dist: int = 5
+    merged_peak_max_points: int = 10
 
     # 4) outputs
-    max_candidates: int = 256
+    max_candidates: int = 384
     topk: int = 32
     debug_max_draw: int = 120
 
-    # 5) player suppression (hard prior)
-    player_margin_px: int = 4
-    player_keep_ring_in: int = 3
-    player_keep_ring_out: int = 9
-    player_fallback_cut_rx: int = 9
-    player_fallback_cut_ry: int = 13
-
-    # 6) item suppression (template + color + ttl)
+    # 5) item suppression (template + color + ttl)
     use_item_reject: bool = True
     item_template_paths: Tuple[str, ...] = ("assets/item_black_1.png", "assets/item_blue_1.png")
     item_template_scales: Tuple[float, ...] = (0.85, 1.0, 1.15, 1.3)
@@ -153,7 +145,7 @@ class BulletTrackerConfig:
     item_v_min: int = 35
     item_color_ratio_min: float = 0.16
 
-    # 7) tracking-based suppression
+    # 6) tracking-based suppression
     use_track_filter: bool = True
     track_match_max_dist: float = 14.0
     track_ttl_frames: int = 6
@@ -162,16 +154,21 @@ class BulletTrackerConfig:
     reject_upward_motion: bool = True
     track_upward_vy_thr: float = -0.40
     track_min_age_for_upward_reject: int = 2
+    use_near_player_shape_filter: bool = True
+    near_player_radius_px: float = 44.0
+    near_player_min_circularity: float = 0.72
+    near_player_max_aspect: float = 1.35
+    near_player_min_area: float = 4.0
+    near_player_max_area: float = 260.0
 
 
 class BulletTrackerCV:
     """
     Negative-first bullet tracker:
       1) raw candidate mask
-      2) remove player prior region
-      3) remove item regions (template+color, ttl)
-      4) contour candidates
-      5) track-based slow/static suppression
+      2) remove item regions (template+color, ttl)
+      3) contour candidates
+      4) track-based slow/static suppression
     """
 
     def __init__(self, cfg: Optional[BulletTrackerConfig] = None):
@@ -198,9 +195,9 @@ class BulletTrackerCV:
         self._tracks = {}
         self._next_tid = 1
 
-    def _load_item_templates(self) -> List[np.ndarray]:
+    def _load_gray_templates(self, paths: Tuple[str, ...]) -> List[np.ndarray]:
         out: List[np.ndarray] = []
-        for p in self.cfg.item_template_paths:
+        for p in paths:
             try:
                 im = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
                 if im is None:
@@ -216,6 +213,9 @@ class BulletTrackerCV:
             except Exception:
                 continue
         return out
+
+    def _load_item_templates(self) -> List[np.ndarray]:
+        return self._load_gray_templates(self.cfg.item_template_paths)
 
     def _build_mask(self, roi_bgr: np.ndarray) -> np.ndarray:
         roi_bgr = ensure_uint8_bgr(roi_bgr)
@@ -247,43 +247,6 @@ class BulletTrackerCV:
         if int(self.cfg.dilate_iter) > 0:
             mask = cv2.dilate(mask, None, iterations=int(self.cfg.dilate_iter))
         return mask
-
-    def _player_suppress_mask(
-        self,
-        roi_shape: Tuple[int, int],
-        player_center_roi: Optional[Tuple[int, int]],
-        player_bbox_roi: Optional[BBox],
-    ) -> np.ndarray:
-        h, w = roi_shape
-        sup = np.zeros((h, w), np.uint8)
-        keep = np.zeros((h, w), np.uint8)
-
-        if player_center_roi is None:
-            return sup
-
-        px, py = map(int, player_center_roi)
-        if not (0 <= px < w and 0 <= py < h):
-            return sup
-
-        if player_bbox_roi is not None:
-            eb = _expand_box(player_bbox_roi, int(self.cfg.player_margin_px), w, h)
-            if eb is not None:
-                x, y, bw, bh = eb
-                sup[y:y + bh, x:x + bw] = 255
-        else:
-            cv2.ellipse(
-                sup,
-                (px, py),
-                (int(max(1, self.cfg.player_fallback_cut_rx)), int(max(1, self.cfg.player_fallback_cut_ry))),
-                0.0, 0.0, 360.0, 255, thickness=-1,
-            )
-
-        rin = int(max(0, self.cfg.player_keep_ring_in))
-        rout = int(max(rin + 1, self.cfg.player_keep_ring_out))
-        cv2.circle(keep, (px, py), rout, 255, thickness=-1)
-        cv2.circle(keep, (px, py), rin, 0, thickness=-1)
-
-        return cv2.bitwise_and(sup, cv2.bitwise_not(keep))
 
     def _detect_item_boxes_template(self, roi_bgr: np.ndarray) -> List[BBox]:
         if (not self.cfg.use_item_reject) or (len(self._templates_gray) == 0):
@@ -418,64 +381,118 @@ class BulletTrackerCV:
             out[y:y + bh, x:x + bw] = 0
         return out
 
-    def _extract_points(self, mask_u8: np.ndarray) -> List[Pt]:
+    def _extract_points(self, mask_u8: np.ndarray, player_center_roi: Optional[Tuple[int, int]] = None) -> List[Pt]:
         if mask_u8 is None or mask_u8.size == 0:
             return []
+
+        def _is_near_player_non_bullet(
+            center_xy: Pt,
+            area_wh: float,
+            bw: int,
+            bh: int,
+            contour: np.ndarray,
+        ) -> bool:
+            if (not self.cfg.use_near_player_shape_filter) or (player_center_roi is None):
+                return False
+            px, py = map(float, player_center_roi)
+            x, y = center_xy
+            dx = float(x) - px
+            dy = float(y) - py
+            rr = float(max(1.0, self.cfg.near_player_radius_px))
+            if dx * dx + dy * dy > rr * rr:
+                return False
+
+            asp = float(max(bw, bh)) / float(max(1, min(bw, bh)))
+            peri = float(cv2.arcLength(contour, True))
+            c_area = float(max(0.0, cv2.contourArea(contour)))
+            circ = 0.0 if peri <= 1e-6 else float((4.0 * math.pi * c_area) / (peri * peri))
+            amin = float(self.cfg.near_player_min_area)
+            amax = float(self.cfg.near_player_max_area)
+            return (
+                asp > float(self.cfg.near_player_max_aspect)
+                or circ < float(self.cfg.near_player_min_circularity)
+                or area_wh < amin
+                or area_wh > amax
+            )
+
+        def _peaks_from_big_component(comp_mask_u8: np.ndarray, ox: int, oy: int) -> List[Pt]:
+            # Distance-transform peaks approximate individual bullet centers in merged blobs.
+            dt = cv2.distanceTransform((comp_mask_u8 > 0).astype(np.uint8), cv2.DIST_L2, 3)
+            if dt is None or dt.size == 0:
+                return []
+            thr = float(max(0.5, self.cfg.merged_peak_min_dt))
+            peak_mask = (dt >= thr)
+            local_max = (dt >= cv2.dilate(dt, np.ones((3, 3), np.float32)))
+            ys, xs = np.where(peak_mask & local_max)
+            if len(xs) == 0:
+                return []
+
+            cand = sorted(
+                [(float(dt[int(y), int(x)]), int(x), int(y)) for y, x in zip(ys.tolist(), xs.tolist())],
+                key=lambda t: t[0],
+                reverse=True,
+            )
+            outp: List[Pt] = []
+            min_d2 = float(max(1, int(self.cfg.merged_peak_min_dist)) ** 2)
+            max_pts = int(max(1, self.cfg.merged_peak_max_points))
+            for _, x, y in cand:
+                keep = True
+                for px, py in outp:
+                    dx = (float(ox + x) - px)
+                    dy = (float(oy + y) - py)
+                    if dx * dx + dy * dy < min_d2:
+                        keep = False
+                        break
+                if keep:
+                    outp.append((float(ox + x), float(oy + y)))
+                    if len(outp) >= max_pts:
+                        break
+            return outp
 
         cnts, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         pts: List[Pt] = []
         for c in cnts:
             x, y, bw, bh = cv2.boundingRect(c)
             area = float(bw * bh)
-            is_normal_size = (
+            is_normal = (
                 self.cfg.w_min <= bw <= self.cfg.w_max
                 and self.cfg.h_min <= bh <= self.cfg.h_max
                 and float(self.cfg.area_min) <= area <= float(self.cfg.area_max)
             )
-            if is_normal_size:
-                pts.append((float(x + 0.5 * bw), float(y + 0.5 * bh)))
+            if is_normal:
+                cx = float(x + 0.5 * bw)
+                cy = float(y + 0.5 * bh)
+                if _is_near_player_non_bullet((cx, cy), area, bw, bh, c):
+                    continue
+                pts.append((cx, cy))
                 if len(pts) >= int(self.cfg.max_candidates):
                     break
                 continue
 
-            if not bool(self.cfg.split_elongated_blobs):
+            if not bool(self.cfg.split_merged_blobs):
                 continue
-            if area < float(self.cfg.area_min) or area > float(self.cfg.elongated_area_max):
+            if not (float(self.cfg.merged_blob_area_min) <= area <= float(self.cfg.merged_blob_area_max)):
                 continue
-            if len(c) < 5:
-                continue
-
-            (cx, cy), (rw, rh), ang = cv2.minAreaRect(c)
-            long_side = float(max(rw, rh))
-            short_side = float(max(1e-6, min(rw, rh)))
-            aspect = long_side / short_side
-            if aspect < float(self.cfg.elongated_aspect_min):
-                continue
-            if long_side < float(self.cfg.elongated_len_min):
+            if bw < int(self.cfg.w_min) or bh < int(self.cfg.h_min):
                 continue
 
-            # Split one long blob into multiple pseudo-centers along major axis.
-            # This helps when bullets are merged/connected in the binary mask.
-            theta = math.radians(float(ang))
-            if rw < rh:
-                theta += math.pi * 0.5
-            ux = math.cos(theta)
-            uy = math.sin(theta)
-            half = 0.5 * long_side
-            step = float(max(2.0, self.cfg.elongated_step_px))
-            n = int(max(2, round(long_side / step)))
-            n = int(min(n, max(2, int(self.cfg.elongated_max_splits))))
-            if n <= 1:
-                n = 2
-            for j in range(n):
-                t = (j + 0.5) / float(n)
-                off = -half + t * long_side
-                px = float(cx + ux * off)
-                py = float(cy + uy * off)
-                pts.append((px, py))
-                if len(pts) >= int(self.cfg.max_candidates):
-                    break
+            comp = np.zeros((bh, bw), np.uint8)
+            c_local = c - np.array([[[x, y]]], dtype=c.dtype)
+            cv2.drawContours(comp, [c_local], -1, 255, thickness=-1)
+            split_pts = _peaks_from_big_component(comp, x, y)
+            if not split_pts:
+                continue
+            if player_center_roi is not None and self.cfg.use_near_player_shape_filter:
+                kept_split: List[Pt] = []
+                for sp in split_pts:
+                    if not _is_near_player_non_bullet(sp, area, bw, bh, c):
+                        kept_split.append(sp)
+                split_pts = kept_split
+                if not split_pts:
+                    continue
+            pts.extend(split_pts)
             if len(pts) >= int(self.cfg.max_candidates):
+                pts = pts[: int(self.cfg.max_candidates)]
                 break
         return pts
 
@@ -537,7 +554,11 @@ class BulletTrackerCV:
 
         return assigned
 
-    def _filter_by_tracks(self, pts: List[Pt]) -> tuple[List[Pt], int, int]:
+    def _filter_by_tracks(
+        self,
+        pts: List[Pt],
+        player_center_roi: Optional[Tuple[int, int]] = None,
+    ) -> tuple[List[Pt], int, int]:
         if (not self.cfg.use_track_filter) or (not pts):
             return pts, 0, 0
         map_idx_tid = self._update_tracks(pts)
@@ -584,11 +605,7 @@ class BulletTrackerCV:
         raw_mask = self._build_mask(roi_bgr)
         mask = raw_mask.copy()
 
-        # 2) subtract player prior
-        p_sup = self._player_suppress_mask((h, w), player_center_roi, player_bbox_roi)
-        mask = cv2.bitwise_and(mask, cv2.bitwise_not(p_sup))
-
-        # 3) subtract item regions (template + color + ttl)
+        # 2) subtract item regions (template + color + ttl)
         item_boxes_det: List[BBox] = []
         if self.cfg.use_item_reject:
             item_boxes_det.extend(self._detect_item_boxes_template(roi_bgr))
@@ -597,13 +614,16 @@ class BulletTrackerCV:
         item_boxes_alive = self._update_item_ttl(item_boxes_det)
         mask = self._suppress_boxes(mask, item_boxes_alive, expand_px=int(self.cfg.item_box_expand_px))
 
-        # 4) contour candidates
-        pts = self._extract_points(mask)
+        # 3) contour candidates
+        pts = self._extract_points(mask, player_center_roi=player_center_roi)
 
-        # 5) track-based suppression (slow/static artifacts)
-        pts, rej_track_slow, rej_track_up = self._filter_by_tracks(pts)
+        # 4) track-based suppression (slow/static artifacts)
+        pts, rej_track_slow, rej_track_up = self._filter_by_tracks(
+            pts,
+            player_center_roi=player_center_roi,
+        )
 
-        # 6) top-k nearest to player (fallback: first K)
+        # 5) top-k nearest to player (fallback: first K)
         K = int(max(1, self.cfg.topk))
         if player_center_roi is not None and pts:
             px, py = map(float, player_center_roi)
@@ -633,7 +653,6 @@ class BulletTrackerCV:
             "reject_track_upward": int(rej_track_up),
             "reject_track_total": int(rej_track_slow + rej_track_up),
             "player_center_roi": player_center_roi,
-            "player_bbox_roi": player_bbox_roi,
             "roi_shape": tuple(map(int, roi_bgr.shape[:2])),
             "K": K,
         }

@@ -20,9 +20,18 @@ class BulletDebugViewConfig:
     color_points: Tuple[int, int, int] = (0, 255, 255)  # yellow
     color_topk: Tuple[int, int, int] = (0, 0, 255)      # red
     color_player: Tuple[int, int, int] = (0, 255, 0)    # green
+    color_player_bbox: Tuple[int, int, int] = (255, 200, 0)  # cyan-ish
+    color_player_ring: Tuple[int, int, int] = (120, 255, 120)
+    color_reimu_boxes: Tuple[int, int, int] = (255, 120, 255)
 
     r_points: int = 2
     r_topk: int = 3
+    show_player_bbox: bool = True
+    player_bbox_thickness: int = 2
+    show_reimu_boxes: bool = True
+    reimu_box_thickness: int = 1
+    max_draw_points: int = 72
+    use_antialias: bool = False
 
 
 class BulletTrackerDebugView:
@@ -59,20 +68,89 @@ class BulletTrackerDebugView:
 
         vis = roi_bgr.copy()
         dbg: Dict[str, Any] = self.tracker.get_debug() or {}
+        linetype = cv2.LINE_AA if bool(self.cfg.use_antialias) else cv2.LINE_8
 
         pts: List[Tuple[float, float]] = dbg.get("points", []) or []
         topk: List[Tuple[float, float]] = dbg.get("points_topk", []) or []
         pc = dbg.get("player_center_roi", None)
+        pb = dbg.get("player_bbox_roi", None)
+        ps: Dict[str, Any] = dbg.get("player_suppress", {}) or {}
+        reimu_boxes: List[Tuple[int, int, int, int]] = dbg.get("reimu_boxes", []) or []
 
+        max_pts = int(max(0, self.cfg.max_draw_points))
+        if max_pts > 0 and len(pts) > max_pts:
+            pts = pts[:max_pts]
         for (x, y) in pts:
-            cv2.circle(vis, (int(x), int(y)), int(self.cfg.r_points), self.cfg.color_points, -1)
+            cv2.circle(vis, (int(x), int(y)), int(self.cfg.r_points), self.cfg.color_points, -1, linetype)
 
         for (x, y) in topk:
-            cv2.circle(vis, (int(x), int(y)), int(self.cfg.r_topk), self.cfg.color_topk, 2)
+            cv2.circle(vis, (int(x), int(y)), int(self.cfg.r_topk), self.cfg.color_topk, 2, linetype)
 
         if pc is not None:
             px, py = pc
-            cv2.circle(vis, (int(px), int(py)), 4, self.cfg.color_player, 2)
+            cv2.circle(vis, (int(px), int(py)), 4, self.cfg.color_player, 2, linetype)
+        if self.cfg.show_player_bbox:
+            mode = str(ps.get("mode", ""))
+            ec = ps.get("ellipse_center", None)
+            ea = ps.get("ellipse_axes", None)
+            eb = ps.get("expanded_bbox", None)
+            if ec is not None and ea is not None and ("ellipse" in mode):
+                cx, cy = map(int, ec)
+                rx, ry = map(int, ea)
+                cv2.ellipse(
+                    vis,
+                    (cx, cy),
+                    (max(1, rx), max(1, ry)),
+                    0.0,
+                    0.0,
+                    360.0,
+                    self.cfg.color_player_bbox,
+                    int(max(1, self.cfg.player_bbox_thickness)),
+                    linetype,
+                )
+            elif eb is not None:
+                bx, by, bw, bh = map(int, eb)
+                cv2.rectangle(
+                    vis,
+                    (bx, by),
+                    (bx + max(1, bw) - 1, by + max(1, bh) - 1),
+                    self.cfg.color_player_bbox,
+                    int(max(1, self.cfg.player_bbox_thickness)),
+                    linetype,
+                )
+            elif pb is not None:
+                bx, by, bw, bh = map(int, pb)
+                cv2.rectangle(
+                    vis,
+                    (bx, by),
+                    (bx + max(1, bw) - 1, by + max(1, bh) - 1),
+                    self.cfg.color_player_bbox,
+                    int(max(1, self.cfg.player_bbox_thickness)),
+                    linetype,
+                )
+
+            # Optional visual for keep-ring if enabled
+            if pc is not None:
+                rin = int(ps.get("ring_in", 0))
+                rout = int(ps.get("ring_out", 0))
+                if rout > 0:
+                    px, py = map(int, pc)
+                    cv2.circle(vis, (px, py), rout, self.cfg.color_player_ring, 1, linetype)
+                    if rin > 0:
+                        cv2.circle(vis, (px, py), rin, self.cfg.color_player_ring, 1, linetype)
+
+        if self.cfg.show_reimu_boxes:
+            th = int(max(1, self.cfg.reimu_box_thickness))
+            for b in reimu_boxes:
+                bx, by, bw, bh = map(int, b)
+                cv2.rectangle(
+                    vis,
+                    (bx, by),
+                    (bx + max(1, bw) - 1, by + max(1, bh) - 1),
+                    self.cfg.color_reimu_boxes,
+                    th,
+                    linetype,
+                )
 
         cv2.putText(
             vis,
@@ -82,6 +160,7 @@ class BulletTrackerDebugView:
             0.7,
             (255, 255, 255),
             2,
+            linetype,
         )
 
         cv2.imshow(self.cfg.window_name, vis)
