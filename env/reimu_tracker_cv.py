@@ -51,7 +51,7 @@ class TrackerConfig:
     roi_bottom_margin: int = 10
 
     # 재탐색 시 ROI 확장(벽 근처 대응)
-    reacq_expand_sec: float = 1.25
+    reacq_expand_sec: float = 2.0
     reacq_left: int = 0
     reacq_right_margin: int = 0
     # top/bottom은 기존 유지
@@ -91,13 +91,13 @@ class TrackerConfig:
     peak_check_min_wh: int = 26 * 38    # ~988
 
     # Association / lock
-    assoc_dist: float = 60.0
-    cand_ttl_sec: float = 0.15
+    assoc_dist: float = 82.0
+    cand_ttl_sec: float = 0.30
 
     # hold 시간 내에 "지속적으로 관측된 트랙"만 락 후보
     lock_hold_sec: float = 0.19
 
-    lock_pad_px: int = 6
+    lock_pad_px: int = 12
 
     # 후보 수 줄이기
     max_candidates_per_frame: int = 45
@@ -128,7 +128,7 @@ class TrackerConfig:
     action_verify_min_pairs: int = 2
     action_verify_motion_min_px: float = 0.3
     action_verify_cos_thr: float = 0.15
-    action_verify_pass_ratio: float = 0.50
+    action_verify_pass_ratio: float = 0.40
     action_verify_score_bonus: float = 0.50
 
 

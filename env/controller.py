@@ -98,7 +98,8 @@ def _send_scancode(scan: int, is_down: bool, extended: bool = False) -> bool:
 SCAN = {
     "z": (0x2C, False),     # Z
     "x": (0x2D, False),     # X (bomb)
-    "shift": (0x2A, False), # LSHIFT
+    #"shift": (0x2A, False), # LSHIFT
+    "ctrl": (0x1D, False),  # LCTRL
     "left": (0x4B, True),
     "right": (0x4D, True),
     "up": (0x48, True),
@@ -113,7 +114,9 @@ MOVE_KEYS = {
     "RIGHT": "right",
     "UP": "up",
     "DOWN": "down",
-    "SLOW": "shift",
+    #"SLOW": "shift",
+    "SLOW": "ctrl",
+
 }
 
 # ---- internal state ----
@@ -265,9 +268,11 @@ def cleanup_inputs_on_exit():
     time.sleep(0.05)
 
     # 2) 물리적 안전장치: Shift 토글 탭
-    sc, ext = SCAN["shift"]
+    #sc, ext = SCAN["shift"]
+    sc, ext = SCAN["ctrl"]
     _send_scancode(sc, is_down=True, extended=ext)
     time.sleep(0.03)
     _send_scancode(sc, is_down=False, extended=ext)
 
-    print("[CTRL] cleanup_inputs_on_exit: Shift safely released")
+    #print("[CTRL] cleanup_inputs_on_exit: ㅊㅊ safely released")
+    print("[CTRL] cleanup_inputs_on_exit: Ctrl safely released")
