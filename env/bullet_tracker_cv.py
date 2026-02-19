@@ -145,7 +145,7 @@ class BulletTrackerConfig:
     player_sprite_ry: int = 20
     player_sprite_center_y_offset: int = -3
     player_sprite_extra_top: int = 6
-    player_sprite_extra_bottom: int = 4
+    player_sprite_extra_bottom: int = 6
 
     # 5) item suppression (template + color + ttl)
     use_item_reject: bool = True

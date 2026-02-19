@@ -13,6 +13,7 @@ from env.reimu_tracker_debug_view import ReimuTrackerDebugView, DebugViewConfig
 # ✅ 추가: bullet tracker imports
 from env.bullet_tracker_cv import BulletTrackerCV
 from env.bullet_tracker_debug_view import BulletTrackerDebugView, BulletDebugViewConfig
+from env.actions import ACTIONS
 
 
 class ObsBuilder:
@@ -385,12 +386,42 @@ class ObsBuilder:
         cv2.circle(vis_bgr, (x, y), max(1, up), c_out, thickness=-1, lineType=cv2.LINE_AA)
         cv2.circle(vis_bgr, (x, y), max(1, up // 2), c_in, thickness=-1, lineType=cv2.LINE_AA)
 
+    def _action_idx_to_move_vec(self, action_idx: Optional[int]) -> Optional[Tuple[float, float]]:
+        if action_idx is None:
+            return None
+        try:
+            i = int(action_idx)
+        except Exception:
+            return None
+        if not (0 <= i < len(ACTIONS)):
+            return None
+        try:
+            keys = set(getattr(ACTIONS[i], "value", []) or [])
+        except Exception:
+            keys = set()
+        if "BOMB" in keys:
+            return None
+        dx = 0.0
+        dy = 0.0
+        if "LEFT" in keys:
+            dx -= 1.0
+        if "RIGHT" in keys:
+            dx += 1.0
+        if "UP" in keys:
+            dy -= 1.0
+        if "DOWN" in keys:
+            dy += 1.0
+        if abs(dx) < 1e-6 and abs(dy) < 1e-6:
+            return None
+        return (dx, dy)
+
     # -------------------------
     # main
     # -------------------------
-    def make_state(self, img_bgr: np.ndarray) -> np.ndarray:
+    def make_state(self, img_bgr: np.ndarray, action_idx: Optional[int] = None) -> np.ndarray:
         # 1) reimu tracker
         now = time.time()
+        expected_move_vec = self._action_idx_to_move_vec(action_idx)
         if self._pause_active and now < float(self._pause_until):
             bbox, conf = None, 0.0
         else:
@@ -401,7 +432,7 @@ class ObsBuilder:
                     pass
                 self._pause_reset_pending = False
                 self._pause_active = False
-            bbox, conf = self.tracker.step(img_bgr)
+            bbox, conf = self.tracker.step(img_bgr, expected_move_vec=expected_move_vec)
 
         if bbox is not None:
             x, y, w, h = map(int, bbox)

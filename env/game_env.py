@@ -178,7 +178,7 @@ class GameEnv:
         self.s.last_action_mask_img = img
 
         g = self.screen.gray(img)
-        state = self.obs.make_state(img)
+        state = self.obs.make_state(img, action_idx=getattr(self.s, "exec_action_idx", None))
         self.packer.reset_stack_fill(state)
 
         ui_ok = self.screen.ui_panel_present(img, gray=g)
@@ -335,7 +335,7 @@ class GameEnv:
 
             if self.s.ui_absent_count >= self.s.ui_absent_needed:
                 try:
-                    st = self.obs.make_state(pre_img)
+                    st = self.obs.make_state(pre_img, action_idx=getattr(self.s, "exec_action_idx", None))
                     self.packer.push_prev_state(self.packer.as_chw(st), is_dup=bool(pre_is_dup))
                 except Exception:
                     pass
@@ -376,7 +376,7 @@ class GameEnv:
                     release_all()
                     time.sleep(0.02)
                 try:
-                    st = self.obs.make_state(img)
+                    st = self.obs.make_state(img, action_idx=getattr(self.s, "exec_action_idx", None))
                     self.packer.push_prev_state(self.packer.as_chw(st))
                 except Exception:
                     pass
@@ -386,7 +386,7 @@ class GameEnv:
                 return self.packer.pack_frames_concat(), float(total_reward), True
 
             # obs
-            state = self.obs.make_state(img)
+            state = self.obs.make_state(img, action_idx=getattr(self.s, "exec_action_idx", None))
             state_chw = self.packer.as_chw(state)
 
             # ===== reward compose (순서 고정) =====
@@ -441,7 +441,7 @@ class GameEnv:
                     last_img, last_g, last_ui_ok = img, g, ui_ok
 
                 self.s.last_action_mask_img = last_img
-                state2 = self.obs.make_state(last_img)
+                state2 = self.obs.make_state(last_img, action_idx=getattr(self.s, "exec_action_idx", None))
                 state2_chw = self.packer.as_chw(state2)
 
                 # reflect lives after skip

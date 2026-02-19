@@ -122,6 +122,15 @@ class TrackerConfig:
     smooth_max_step_px: float = 2.0
     smooth_dir_std_deg: float = 12.0
 
+    # Action-motion consistency gate before first LOCK
+    action_verify_enable: bool = True
+    action_verify_window: int = 10
+    action_verify_min_pairs: int = 2
+    action_verify_motion_min_px: float = 0.3
+    action_verify_cos_thr: float = 0.15
+    action_verify_pass_ratio: float = 0.50
+    action_verify_score_bonus: float = 0.50
+
 
 def _clamp_bbox(b: BBox, W: int, H: int) -> BBox:
     x, y, w, h = b
@@ -301,6 +310,12 @@ class ReimuTrackerCV:
         self._dbg_candidates_full: List[BBox] = []
         self._dbg_lock_cand_full: Optional[BBox] = None
         self._dbg_fg_roi: Optional[np.ndarray] = None
+        self._dbg_action_verify_ratio: float = -1.0
+        self._dbg_action_verify_pairs: int = 0
+
+        self._recent_action_vecs: Deque[Optional[Tuple[float, float]]] = deque(
+            maxlen=max(4, int(self.cfg.action_verify_window) * 4)
+        )
 
     def reset(self):
         self.bg = cv2.createBackgroundSubtractorMOG2(
@@ -323,6 +338,9 @@ class ReimuTrackerCV:
         self._dbg_candidates_full = []
         self._dbg_lock_cand_full = None
         self._dbg_fg_roi = None
+        self._dbg_action_verify_ratio = -1.0
+        self._dbg_action_verify_pairs = 0
+        self._recent_action_vecs.clear()
 
     def get_debug(self):
         return {
@@ -333,6 +351,8 @@ class ReimuTrackerCV:
             "fg_roi": self._dbg_fg_roi,
             "locked": bool(self.locked),
             "reacq_expand_until": float(self._reacq_expand_until),
+            "action_verify_ratio": float(self._dbg_action_verify_ratio),
+            "action_verify_pairs": int(self._dbg_action_verify_pairs),
         }
 
     def _force_unlock_and_reacq(self, now: float):
@@ -351,16 +371,69 @@ class ReimuTrackerCV:
 
         self._lock_last_center = None
         self._lock_static_since = None
+        self._recent_action_vecs.clear()
 
         self._reacq_expand_until = float(now) + float(self.cfg.reacq_expand_sec)
 
-    def step(self, frame_bgr: np.ndarray, now: Optional[float] = None) -> Tuple[Optional[BBox], float]:
+    def _push_expected_action(self, expected_move_vec: Optional[Tuple[float, float]]) -> None:
+        if expected_move_vec is None:
+            self._recent_action_vecs.append(None)
+            return
+        ax, ay = map(float, expected_move_vec)
+        n = float(math.hypot(ax, ay))
+        if n <= 1e-6:
+            self._recent_action_vecs.append(None)
+            return
+        self._recent_action_vecs.append((ax / n, ay / n))
+
+    def _action_motion_match_ratio(self, pts: List[Tuple[float, float, float, BBox]]) -> Tuple[float, int]:
+        m = len(pts) - 1
+        if m <= 0:
+            return -1.0, 0
+        acts = list(self._recent_action_vecs)
+        if len(acts) < m:
+            return -1.0, 0
+        acts = acts[-m:]
+
+        pass_n = 0
+        used = 0
+        cos_thr = float(self.cfg.action_verify_cos_thr)
+        min_motion = float(max(0.01, self.cfg.action_verify_motion_min_px))
+
+        for i in range(m):
+            a = acts[i]
+            if a is None:
+                continue
+            dx = float(pts[i + 1][1] - pts[i][1])
+            dy = float(pts[i + 1][2] - pts[i][2])
+            md = float(math.hypot(dx, dy))
+            if md < min_motion:
+                continue
+            used += 1
+            cosv = (dx * a[0] + dy * a[1]) / max(1e-6, md)
+            if cosv >= cos_thr:
+                pass_n += 1
+
+        if used <= 0:
+            return -1.0, 0
+        return float(pass_n) / float(used), int(used)
+
+    def step(
+        self,
+        frame_bgr: np.ndarray,
+        now: Optional[float] = None,
+        expected_move_vec: Optional[Tuple[float, float]] = None,
+    ) -> Tuple[Optional[BBox], float]:
         if frame_bgr is None or frame_bgr.size == 0:
             return None, 0.0
 
         frame_bgr = _ensure_uint8_bgr(frame_bgr)
         if frame_bgr is None or frame_bgr.size == 0:
             return None, 0.0
+
+        self._push_expected_action(expected_move_vec)
+        self._dbg_action_verify_ratio = -1.0
+        self._dbg_action_verify_pairs = 0
 
         H, W = frame_bgr.shape[:2]
         if now is None:
@@ -637,6 +710,17 @@ class ReimuTrackerCV:
             cy_last = float(pts[-1][2])
 
             score = (t1 - t0) * 10.0 + (b_last[2] * b_last[3]) * 0.001
+
+            if bool(self.cfg.action_verify_enable):
+                ratio, used = self._action_motion_match_ratio(pts)
+                if ratio < 0.0 or used < int(self.cfg.action_verify_min_pairs):
+                    continue
+                if ratio < float(self.cfg.action_verify_pass_ratio):
+                    continue
+                score += float(self.cfg.action_verify_score_bonus) * ratio
+                if score > best_score:
+                    self._dbg_action_verify_ratio = float(ratio)
+                    self._dbg_action_verify_pairs = int(used)
 
             if roi_h > 0 and y_w > 0.0:
                 y_norm = max(0.0, min(1.0, cy_last / float(roi_h)))
