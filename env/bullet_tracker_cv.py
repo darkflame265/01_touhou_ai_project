@@ -128,6 +128,8 @@ class BulletTrackerConfig:
     debug_max_draw: int = 120
     debug_grid_size: int = 64
     debug_grid_gain: float = 0.8
+    debug_grid_use_final_points: bool = True
+    debug_grid_point_radius_cells: int = 1
     debug_grid_suppress_player: bool = False
     debug_grid_player_rx_scale: float = 0.48
     debug_grid_player_ry_scale: float = 0.56
@@ -140,7 +142,7 @@ class BulletTrackerConfig:
     debug_grid_player_donut_sigma: float = 0.9
     debug_grid_player_donut_strength: float = 1.0
     # new: reject player sprite from hitbox center (independent of old clear/gaussian)
-    player_sprite_reject_enable: bool = True
+    player_sprite_reject_enable: bool = False
     player_sprite_rx: int = 14
     player_sprite_ry: int = 20
     player_sprite_center_y_offset: int = -3
@@ -177,7 +179,7 @@ class BulletTrackerConfig:
     track_ttl_frames: int = 6
     track_slow_speed_thr: float = 0.20
     track_min_age_for_slow_reject: int = 5
-    reject_upward_motion: bool = True
+    reject_upward_motion: bool = False
     track_upward_vy_thr: float = -0.40
     track_min_age_for_upward_reject: int = 2
     use_near_player_shape_filter: bool = True
@@ -188,8 +190,9 @@ class BulletTrackerConfig:
     near_player_max_area: float = 200.0
     # simple near-player new-track rejection
     reject_new_near_player: bool = True
-    new_near_player_radius_px: float = 20.0
-    new_near_player_max_age: int = 2
+    new_near_player_radius_px: float = 40.0
+    new_near_player_max_age: int = 6
+    new_near_player_enter_margin_px: float = 3.0
     # short near-player hold memory (no vector prediction)
     hold_near_player_on_miss: bool = True
     hold_near_player_radius_px: float = 40.0
@@ -628,6 +631,8 @@ class BulletTrackerCV:
                 self._tracks[tid] = {
                     "x": float(x),
                     "y": float(y),
+                    "prev_x": None,
+                    "prev_y": None,
                     "vx": 0.0,
                     "vy": 0.0,
                     "speed": 0.0,
@@ -638,9 +643,13 @@ class BulletTrackerCV:
                 used_tracks.add(tid)
             else:
                 tr = self._tracks[best_tid]
+                px_prev = float(tr.get("x", x))
+                py_prev = float(tr.get("y", y))
                 dx = float(x) - float(tr["x"])
                 dy = float(y) - float(tr["y"])
                 speed = float(math.hypot(dx, dy))
+                tr["prev_x"] = px_prev
+                tr["prev_y"] = py_prev
                 tr["vx"] = 0.5 * float(tr.get("vx", 0.0)) + 0.5 * dx
                 tr["vy"] = 0.5 * float(tr.get("vy", 0.0)) + 0.5 * dy
                 tr["speed"] = 0.5 * float(tr.get("speed", 0.0)) + 0.5 * speed
@@ -673,6 +682,8 @@ class BulletTrackerCV:
         use_new_near = bool(self.cfg.reject_new_near_player)
         near_r = float(max(1.0, self.cfg.new_near_player_radius_px))
         near_r2 = near_r * near_r
+        enter_margin = float(max(0.0, self.cfg.new_near_player_enter_margin_px))
+        near_outer2 = (near_r + enter_margin) * (near_r + enter_margin)
         near_age = int(max(1, self.cfg.new_near_player_max_age))
         pcx = pcy = None
         if player_center_roi is not None:
@@ -695,6 +706,18 @@ class BulletTrackerCV:
                 dyp = float(p[1]) - pcy
                 d2p = dxp * dxp + dyp * dyp
                 if age <= near_age and d2p <= near_r2:
+                    entered_from_outside = False
+                    px0 = tr.get("prev_x", None)
+                    py0 = tr.get("prev_y", None)
+                    if px0 is not None and py0 is not None:
+                        ddx = float(px0) - pcx
+                        ddy = float(py0) - pcy
+                        prev_d2 = ddx * ddx + ddy * ddy
+                        if prev_d2 > near_outer2:
+                            entered_from_outside = True
+                    if entered_from_outside:
+                        out.append(p)
+                        continue
                     rej_new_near += 1
                     continue
             if use_up and age >= up_age_thr and vy <= up_vy_thr:
@@ -943,17 +966,28 @@ class BulletTrackerCV:
 
         # Debug spatial grids (ID-free): occupancy + temporal delta
         g = int(max(2, self.cfg.debug_grid_size))
-        # Use mask coverage (not point centers) so all overlapped cells are highlighted.
-        grid_mask = mask
-        if mask is not None and mask.size > 0 and bool(self.cfg.debug_grid_suppress_player):
-            pcore = self._player_core_mask_for_grid((h, w), player_center_roi, player_bbox_roi)
-            if pcore is not None and pcore.size > 0:
-                grid_mask = cv2.bitwise_and(mask, cv2.bitwise_not(pcore))
-
-        if grid_mask is not None and grid_mask.size > 0:
-            occ_small = cv2.resize(grid_mask, (g, g), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
-        else:
+        if bool(self.cfg.debug_grid_use_final_points):
             occ_small = np.zeros((g, g), dtype=np.float32)
+            r = int(max(0, self.cfg.debug_grid_point_radius_cells))
+            for (x, y) in pts:
+                gx = int(np.clip(round(float(x) * (g - 1) / max(1.0, float(w - 1))), 0, g - 1))
+                gy = int(np.clip(round(float(y) * (g - 1) / max(1.0, float(h - 1))), 0, g - 1))
+                x1 = max(0, gx - r)
+                x2 = min(g, gx + r + 1)
+                y1 = max(0, gy - r)
+                y2 = min(g, gy + r + 1)
+                occ_small[y1:y2, x1:x2] = 1.0
+        else:
+            # Legacy debug mode: raw mask coverage
+            grid_mask = mask
+            if mask is not None and mask.size > 0 and bool(self.cfg.debug_grid_suppress_player):
+                pcore = self._player_core_mask_for_grid((h, w), player_center_roi, player_bbox_roi)
+                if pcore is not None and pcore.size > 0:
+                    grid_mask = cv2.bitwise_and(mask, cv2.bitwise_not(pcore))
+            if grid_mask is not None and grid_mask.size > 0:
+                occ_small = cv2.resize(grid_mask, (g, g), interpolation=cv2.INTER_AREA).astype(np.float32) / 255.0
+            else:
+                occ_small = np.zeros((g, g), dtype=np.float32)
         occ_small = self._apply_player_donut_on_grid(
             occ_small,
             player_center_roi=player_center_roi,
