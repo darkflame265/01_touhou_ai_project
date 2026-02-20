@@ -711,16 +711,14 @@ class ReimuTrackerCV:
 
             score = (t1 - t0) * 10.0 + (b_last[2] * b_last[3]) * 0.001
 
+            ratio = -1.0
+            used = 0
             if bool(self.cfg.action_verify_enable):
                 ratio, used = self._action_motion_match_ratio(pts)
-                if ratio < 0.0 or used < int(self.cfg.action_verify_min_pairs):
-                    continue
-                if ratio < float(self.cfg.action_verify_pass_ratio):
-                    continue
-                score += float(self.cfg.action_verify_score_bonus) * ratio
-                if score > best_score:
-                    self._dbg_action_verify_ratio = float(ratio)
-                    self._dbg_action_verify_pairs = int(used)
+                # Soft scoring only: do not reject lock candidates by action verify.
+                if ratio >= 0.0 and used >= int(self.cfg.action_verify_min_pairs):
+                    pass_thr = float(self.cfg.action_verify_pass_ratio)
+                    score += float(self.cfg.action_verify_score_bonus) * float(ratio - pass_thr)
 
             if roi_h > 0 and y_w > 0.0:
                 y_norm = max(0.0, min(1.0, cy_last / float(roi_h)))
@@ -729,5 +727,8 @@ class ReimuTrackerCV:
             if score > best_score:
                 best_score = score
                 best = b_last
+                if ratio >= 0.0:
+                    self._dbg_action_verify_ratio = float(ratio)
+                    self._dbg_action_verify_pairs = int(used)
 
         return best

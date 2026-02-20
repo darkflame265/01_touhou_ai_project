@@ -453,6 +453,7 @@ class ObsBuilder:
         px, py = self.player_center
         px_pf = int(np.clip(px - self._x0, 0, self._pw - 1))
         py_pf = int(np.clip(py - self._y0, 0, self._ph - 1))
+        player_center_pf = None
 
         bbox_pf = None
         if bbox is not None:
@@ -463,10 +464,11 @@ class ObsBuilder:
             bh_pf = int(max(1, min(self._ph - by_pf, bh)))
             if bw_pf > 0 and bh_pf > 0:
                 bbox_pf = (bx_pf, by_pf, bw_pf, bh_pf)
+                player_center_pf = (px_pf, py_pf)
 
         pts_pf = self.bullet_tracker.step(
             pf,
-            player_center_roi=(px_pf, py_pf),
+            player_center_roi=player_center_pf,
             player_bbox_roi=bbox_pf,
         )
 
@@ -507,7 +509,7 @@ class ObsBuilder:
             float(py_n),
             float(self.last_conf),
             bullet_mask_u8=getattr(self.bullet_tracker, "last_mask_u8", None),
-            player_center_roi=(px_pf, py_pf),
+            player_center_roi=player_center_pf,
             player_bbox_roi=bbox_pf,
         )
 
