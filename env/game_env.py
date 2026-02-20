@@ -385,6 +385,27 @@ class GameEnv:
                 total_reward += pen_r
                 return self.packer.pack_frames_concat(), float(total_reward), True
 
+            # Immediate tracker reset on UI-life drop so debug/player lock is cleared
+            # before state construction in this frame.
+            try:
+                ui_peek = self.ui.ui_lives_safe(img, ui_ok)
+            except Exception:
+                ui_peek = None
+            try:
+                prev_ui = getattr(self.s, "prev_ui_lives", None)
+                hit_cd = float(getattr(self.s, "hit_cooldown", 0.25))
+                last_hit = float(getattr(self.s, "last_hit_time", 0.0))
+                now_ui_peek = time.time()
+                if (
+                    ui_peek is not None
+                    and prev_ui is not None
+                    and int(ui_peek) < int(prev_ui)
+                    and (now_ui_peek - last_hit) > hit_cd
+                ):
+                    self._safe_reset_tracker()
+            except Exception:
+                pass
+
             # obs
             state = self.obs.make_state(img, action_idx=getattr(self.s, "exec_action_idx", None))
             state_chw = self.packer.as_chw(state)
