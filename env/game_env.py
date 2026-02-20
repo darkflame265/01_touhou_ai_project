@@ -116,6 +116,9 @@ class GameEnv:
         self.diff_risk_mix = 0.35
         self.diff_risk_use_local = True
         self.diff_risk_clip = 1.0
+        # tracker reset throttle for hit-fx path
+        self._hit_fx_reset_cooldown = 0.15
+        self._last_hit_fx_reset_t = 0.0
 
     # -------------------------
     # misc helpers
@@ -164,6 +167,7 @@ class GameEnv:
         self.s.episode_end_reason = ""
         self.s.episode_end_pen = 0.0
         self.s.ep_total_reward = 0.0
+        self._last_hit_fx_reset_t = 0.0
 
         now = time.time()
         self.s.episode_start_time = float(now)
@@ -360,6 +364,19 @@ class GameEnv:
 
             # DUP skip
             if is_dup and self.fs.cfg.skip_dup_frames:
+                # Even on DUP frames, check UI-life drop so tracker reset is not delayed.
+                try:
+                    ui_ok_dup = self.screen.ui_panel_present(img)
+                    ui_peek_dup = self.ui.ui_lives_safe(img, ui_ok_dup)
+                    prev_ui_dup = getattr(self.s, "prev_ui_lives", None)
+                    if (
+                        ui_peek_dup is not None
+                        and prev_ui_dup is not None
+                        and int(ui_peek_dup) < int(prev_ui_dup)
+                    ):
+                        self._safe_reset_tracker()
+                except Exception:
+                    pass
                 r = float(self.reward_engine.alive_reward) if not self.dup_reward_zero else 0.0
                 self.packer.push_prev_state(self.s.prev_state, is_dup=True)
                 total_reward += r
@@ -393,14 +410,10 @@ class GameEnv:
                 ui_peek = None
             try:
                 prev_ui = getattr(self.s, "prev_ui_lives", None)
-                hit_cd = float(getattr(self.s, "hit_cooldown", 0.25))
-                last_hit = float(getattr(self.s, "last_hit_time", 0.0))
-                now_ui_peek = time.time()
                 if (
                     ui_peek is not None
                     and prev_ui is not None
                     and int(ui_peek) < int(prev_ui)
-                    and (now_ui_peek - last_hit) > hit_cd
                 ):
                     self._safe_reset_tracker()
             except Exception:
@@ -433,7 +446,14 @@ class GameEnv:
             masked_idx = int(r1.masked_idx)
 
             # death FX
-            _, gameover_fx = self.screen.detect_death(img, gray=g)
+            hit_fx, gameover_fx = self.screen.detect_death(img, gray=g)
+            # Fast path: reset tracker on hit-flash itself (not only UI-life/drop or gameover).
+            # This avoids stale lock lingering when UI-lives signal is delayed/noisy.
+            if bool(hit_fx):
+                now_hit_fx = time.time()
+                if (now_hit_fx - float(self._last_hit_fx_reset_t)) >= float(self._hit_fx_reset_cooldown):
+                    self._safe_reset_tracker()
+                    self._last_hit_fx_reset_t = now_hit_fx
             now_fx = time.time()
             term, reason, pen = self.reward_engine.on_death_fx(
                 gameover_fx, now_fx, reset_tracker_cb=self._safe_reset_tracker

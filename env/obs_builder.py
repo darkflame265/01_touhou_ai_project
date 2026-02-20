@@ -252,6 +252,19 @@ class ObsBuilder:
             self.tracker.reset()
         except Exception:
             pass
+        # Clear player state immediately so stale marker/debug does not linger.
+        self.last_conf = 0.0
+        self.last_xy_norm = (0.5, 0.78)
+        self.player_center = (self.W // 2, int(self.H * 0.78))
+        self._update_uv()
+        # Also clear bullet tracker debug/state bound to previous player anchor.
+        try:
+            self.bullet_tracker.reset()
+        except Exception:
+            pass
+        self.last_bullets_xy_norm = []
+        self.last_bullets_dxdy = []
+        self.last_bullets_vdxdy = []
 
     def on_bomb_used(self, pause_sec: float = 2.0):
         now = time.time()
