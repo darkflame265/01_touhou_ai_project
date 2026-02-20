@@ -108,9 +108,11 @@ class TrackerConfig:
     # LOCK 상태 이상 감지: 1초간 위치가 거의 안 변하면 재탐색
     lock_static_sec: float = 1.0
     lock_static_move_thr_px: float = 2.0
+    lock_static_min_frames: int = 4
 
     # CSRT update 실패 시에도 재탐색 트리거
     unlock_on_csrt_fail: bool = True
+    unlock_fail_consecutive: int = 3
 
     # =========================
     # ✅ 배경 트랙 억제(LOCK 후보 선정용)
@@ -130,6 +132,13 @@ class TrackerConfig:
     action_verify_cos_thr: float = 0.15
     action_verify_pass_ratio: float = 0.40
     action_verify_score_bonus: float = 0.50
+
+    # Respawn/reacquire mode (temporary relaxed lock conditions)
+    respawn_mode_sec: float = 1.0
+    respawn_lock_hold_sec: float = 0.10
+    respawn_min_track_points: int = 2
+    respawn_disable_smooth_reject: bool = True
+    respawn_y_prior_weight: float = 0.55
 
 
 def _clamp_bbox(b: BBox, W: int, H: int) -> BBox:
@@ -303,8 +312,11 @@ class ReimuTrackerCV:
 
         self._lock_last_center: Optional[Tuple[float, float]] = None
         self._lock_static_since: Optional[float] = None
+        self._lock_static_streak: int = 0
+        self._lock_fail_streak: int = 0
 
         self._reacq_expand_until: float = 0.0
+        self._respawn_mode_until: float = 0.0
 
         self._dbg_roi_xyxy: Optional[Tuple[int, int, int, int]] = None
         self._dbg_candidates_full: List[BBox] = []
@@ -332,7 +344,10 @@ class ReimuTrackerCV:
 
         self._lock_last_center = None
         self._lock_static_since = None
+        self._lock_static_streak = 0
+        self._lock_fail_streak = 0
         self._reacq_expand_until = 0.0
+        self._respawn_mode_until = time.time() + float(self.cfg.respawn_mode_sec)
 
         self._dbg_roi_xyxy = None
         self._dbg_candidates_full = []
@@ -351,6 +366,7 @@ class ReimuTrackerCV:
             "fg_roi": self._dbg_fg_roi,
             "locked": bool(self.locked),
             "reacq_expand_until": float(self._reacq_expand_until),
+            "respawn_mode_until": float(self._respawn_mode_until),
             "action_verify_ratio": float(self._dbg_action_verify_ratio),
             "action_verify_pairs": int(self._dbg_action_verify_pairs),
         }
@@ -371,9 +387,12 @@ class ReimuTrackerCV:
 
         self._lock_last_center = None
         self._lock_static_since = None
+        self._lock_static_streak = 0
+        self._lock_fail_streak = 0
         self._recent_action_vecs.clear()
 
         self._reacq_expand_until = float(now) + float(self.cfg.reacq_expand_sec)
+        self._respawn_mode_until = float(now) + float(self.cfg.respawn_mode_sec)
 
     def _push_expected_action(self, expected_move_vec: Optional[Tuple[float, float]]) -> None:
         if expected_move_vec is None:
@@ -453,13 +472,16 @@ class ReimuTrackerCV:
                     ok, b = False, None
 
             if (not ok or b is None):
+                self._lock_fail_streak += 1
                 if bool(self.cfg.unlock_on_csrt_fail):
-                    self._force_unlock_and_reacq(now)
+                    if self._lock_fail_streak >= int(max(1, self.cfg.unlock_fail_consecutive)):
+                        self._force_unlock_and_reacq(now)
                 else:
                     self._dbg_candidates_full = []
                     self._dbg_lock_cand_full = None
                     return self.lock_bbox, 1.0
             else:
+                self._lock_fail_streak = 0
                 self.lock_bbox = _clamp_bbox(tuple(map(int, b)), W, H)
 
                 cx, cy = _bbox_center(self.lock_bbox)
@@ -468,20 +490,26 @@ class ReimuTrackerCV:
                 if self._lock_last_center is None:
                     self._lock_last_center = (cx, cy)
                     self._lock_static_since = None
+                    self._lock_static_streak = 0
                 else:
                     dx = float(cx - self._lock_last_center[0])
                     dy = float(cy - self._lock_last_center[1])
                     d2 = dx * dx + dy * dy
 
                     if d2 <= thr2:
+                        self._lock_static_streak += 1
                         if self._lock_static_since is None:
                             self._lock_static_since = now
                         else:
-                            if (now - self._lock_static_since) >= float(self.cfg.lock_static_sec):
+                            if (
+                                (now - self._lock_static_since) >= float(self.cfg.lock_static_sec)
+                                and self._lock_static_streak >= int(max(1, self.cfg.lock_static_min_frames))
+                            ):
                                 self._force_unlock_and_reacq(now)
                     else:
                         self._lock_last_center = (cx, cy)
                         self._lock_static_since = None
+                        self._lock_static_streak = 0
 
             if self.locked and self.lock_bbox is not None:
                 self._dbg_candidates_full = []
@@ -574,6 +602,8 @@ class ReimuTrackerCV:
         cx, cy = _bbox_center(self.lock_bbox)
         self._lock_last_center = (float(cx), float(cy))
         self._lock_static_since = None
+        self._lock_static_streak = 0
+        self._lock_fail_streak = 0
 
         self._reacq_expand_until = 0.0
 
@@ -682,14 +712,16 @@ class ReimuTrackerCV:
         best: Optional[BBox] = None
         best_score = -1.0
 
-        hold = float(self.cfg.lock_hold_sec)
-        y_w = float(self.cfg.lock_y_prior_weight)
-        use_smooth_reject = bool(self.cfg.reject_smooth_bg)
+        in_respawn = bool(float(now) <= float(self._respawn_mode_until))
+        hold = float(self.cfg.respawn_lock_hold_sec if in_respawn else self.cfg.lock_hold_sec)
+        y_w = float(self.cfg.respawn_y_prior_weight if in_respawn else self.cfg.lock_y_prior_weight)
+        use_smooth_reject = bool((not self.cfg.respawn_disable_smooth_reject) if in_respawn else self.cfg.reject_smooth_bg)
+        min_pts = int(max(2, self.cfg.respawn_min_track_points if in_respawn else 3))
 
         for tr in self._tracks.values():
             pts = [p for p in tr.hist if (now - p[0]) <= hold]
             n = len(pts)
-            if n < 3:
+            if n < min_pts:
                 continue
 
             t0 = pts[0][0]

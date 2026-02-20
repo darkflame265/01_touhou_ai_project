@@ -2,6 +2,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional, Tuple
+import time
 
 import numpy as np
 
@@ -45,13 +46,19 @@ class MaskingConfig:
 
     disable_bomb: bool = True   # 학습 중 폭탄 완전 금지
 
+    # After hit, block DOWN actions until re-lock (or timeout) to prevent
+    # immediately sticking to bottom wall during respawn.
+    block_down_until_relock_after_hit: bool = True
+    block_down_after_hit_window_sec: float = 2.0
+
 
 
 class ActionMasker:
-    def __init__(self, screen, obs, cfg: MaskingConfig):
+    def __init__(self, screen, obs, cfg: MaskingConfig, state=None):
         self.screen = screen
         self.obs = obs
         self.cfg = cfg
+        self.state = state
 
         # BOMB 인덱스 캐시(없을 수도 있으니 안전하게)
         self._bomb_idx = None
@@ -157,6 +164,21 @@ class ActionMasker:
         near_top = (top_d <= margin_px)
         near_bot = (bot_d <= margin_px)
 
+        block_down_until_relock = False
+        if bool(getattr(self.cfg, "block_down_until_relock_after_hit", False)):
+            s = self.state
+            if s is not None:
+                last_hit = float(getattr(s, "last_hit_time", 0.0))
+                window = float(max(0.0, getattr(self.cfg, "block_down_after_hit_window_sec", 0.0)))
+                recently_hit = (last_hit > 0.0) and ((time.time() - last_hit) <= window)
+                tracker_locked = False
+                try:
+                    tracker_locked = bool(getattr(getattr(self.obs, "tracker", None), "locked", False))
+                except Exception:
+                    tracker_locked = False
+                if recently_hit and (not tracker_locked):
+                    block_down_until_relock = True
+
         # top-limit: py가 너무 위면 UP 방향 금지
         top_forbid = False
         if self.cfg.top_limit_px is not None:
@@ -180,6 +202,8 @@ class ActionMasker:
                 mask[i] = False
 
             if top_forbid and dy < 0:
+                mask[i] = False
+            if block_down_until_relock and dy > 0:
                 mask[i] = False
 
         # ===== BOMB gating 적용 =====

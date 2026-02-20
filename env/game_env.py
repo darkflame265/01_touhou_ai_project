@@ -66,7 +66,7 @@ class GameEnv:
             disable_bomb=True,
             enable_bomb_gate=True,
         )
-        self.masker = ActionMasker(self.screen, self.obs, m_cfg)
+        self.masker = ActionMasker(self.screen, self.obs, m_cfg, state=self.s)
         self.act = ActionExecutor(self.s, self.masker)
 
         # frame skipper
