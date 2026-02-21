@@ -35,6 +35,7 @@ from typing import Deque, Dict, List, Optional, Tuple
 import heapq
 import time
 import math
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -106,14 +107,22 @@ class TrackerConfig:
     debug_max_candidates: int = 80
 
     # LOCK 상태 이상 감지: 1초간 위치가 거의 안 변하면 재탐색
-    lock_static_unlock_enable: bool = False
-    lock_static_sec: float = 1.0
+    lock_static_unlock_enable: bool = True
+    lock_static_sec: float = 2.0
     lock_static_move_thr_px: float = 2.0
     lock_static_min_frames: int = 4
 
     # CSRT update 실패 시에도 재탐색 트리거
-    unlock_on_csrt_fail: bool = True
+    unlock_on_csrt_fail: bool = False
     unlock_fail_consecutive: int = 6
+
+    # Template gate: allow LOCK only when MOG2 candidate overlaps reimu template match.
+    template_gate_enable: bool = False
+    template_glob: str = "assets/reimu_*.png"
+    template_match_thr: float = 0.66
+    template_scales: Tuple[float, ...] = (0.90, 1.00, 1.10)
+    template_max_boxes: int = 64
+    template_match_iou_thr: float = 0.10
 
     # =========================
     # ✅ 배경 트랙 억제(LOCK 후보 선정용)
@@ -154,6 +163,22 @@ def _clamp_bbox(b: BBox, W: int, H: int) -> BBox:
 def _bbox_center(b: BBox) -> Tuple[float, float]:
     x, y, w, h = b
     return (x + w * 0.5, y + h * 0.5)
+
+
+def _bbox_iou(a: BBox, b: BBox) -> float:
+    ax, ay, aw, ah = map(int, a)
+    bx, by, bw, bh = map(int, b)
+    ax2, ay2 = ax + aw, ay + ah
+    bx2, by2 = bx + bw, by + bh
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+    inter = float(iw * ih)
+    if inter <= 0.0:
+        return 0.0
+    ua = float(max(1, aw * ah))
+    ub = float(max(1, bw * bh))
+    return inter / max(1e-6, (ua + ub - inter))
 
 
 def _roi_rect(W: int, H: int, left: int, top: int, right_margin: int, bottom_margin: int) -> Tuple[int, int, int, int]:
@@ -329,6 +354,8 @@ class ReimuTrackerCV:
         self._recent_action_vecs: Deque[Optional[Tuple[float, float]]] = deque(
             maxlen=max(4, int(self.cfg.action_verify_window) * 4)
         )
+        self._tmpl_gray: List[np.ndarray] = self._load_reimu_templates()
+        self._dbg_template_candidates_full: List[BBox] = []
 
     def reset(self):
         self.bg = cv2.createBackgroundSubtractorMOG2(
@@ -352,6 +379,7 @@ class ReimuTrackerCV:
 
         self._dbg_roi_xyxy = None
         self._dbg_candidates_full = []
+        self._dbg_template_candidates_full = []
         self._dbg_lock_cand_full = None
         self._dbg_fg_roi = None
         self._dbg_action_verify_ratio = -1.0
@@ -362,6 +390,7 @@ class ReimuTrackerCV:
         return {
             "roi_xyxy": self._dbg_roi_xyxy,
             "candidates": list(self._dbg_candidates_full),
+            "template_candidates": list(self._dbg_template_candidates_full),
             "lock_cand": self._dbg_lock_cand_full,
             "locked_bbox": self.lock_bbox if self.locked else None,
             "fg_roi": self._dbg_fg_roi,
@@ -371,6 +400,60 @@ class ReimuTrackerCV:
             "action_verify_ratio": float(self._dbg_action_verify_ratio),
             "action_verify_pairs": int(self._dbg_action_verify_pairs),
         }
+
+    def _load_reimu_templates(self) -> List[np.ndarray]:
+        out: List[np.ndarray] = []
+        try:
+            for p in sorted(Path(".").glob(str(self.cfg.template_glob))):
+                im = cv2.imread(str(p), cv2.IMREAD_UNCHANGED)
+                if im is None:
+                    continue
+                if im.ndim == 3 and im.shape[2] == 4:
+                    im = cv2.cvtColor(im, cv2.COLOR_BGRA2BGR)
+                if im.ndim == 3:
+                    im = cv2.cvtColor(im, cv2.COLOR_BGR2GRAY)
+                if im.dtype != np.uint8:
+                    im = np.clip(im, 0, 255).astype(np.uint8)
+                h, w = im.shape[:2]
+                if h >= 6 and w >= 6:
+                    out.append(im)
+        except Exception:
+            pass
+        return out
+
+    def _detect_template_candidates_roi(self, roi_bgr: np.ndarray) -> List[BBox]:
+        if (not bool(self.cfg.template_gate_enable)) or (len(self._tmpl_gray) == 0):
+            return []
+        h, w = roi_bgr.shape[:2]
+        if h < 6 or w < 6:
+            return []
+        gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+        thr = float(self.cfg.template_match_thr)
+        boxes: List[BBox] = []
+        max_boxes = int(max(1, self.cfg.template_max_boxes))
+
+        for t in self._tmpl_gray:
+            th0, tw0 = t.shape[:2]
+            for sc in self.cfg.template_scales:
+                tw = int(max(6, round(tw0 * float(sc))))
+                th = int(max(6, round(th0 * float(sc))))
+                if tw >= w or th >= h:
+                    continue
+                tt = cv2.resize(t, (tw, th), interpolation=cv2.INTER_AREA if sc < 1.0 else cv2.INTER_LINEAR)
+                res = cv2.matchTemplate(gray, tt, cv2.TM_CCOEFF_NORMED)
+                ys, xs = np.where(res >= thr)
+                for yy, xx in zip(ys.tolist(), xs.tolist()):
+                    b = (int(xx), int(yy), int(tw), int(th))
+                    keep = True
+                    for ob in boxes:
+                        if _bbox_iou(b, ob) >= 0.35:
+                            keep = False
+                            break
+                    if keep:
+                        boxes.append(b)
+                        if len(boxes) >= max_boxes:
+                            return boxes
+        return boxes
 
     def _force_unlock_and_reacq(self, now: float):
         self._csrt = None
@@ -391,6 +474,7 @@ class ReimuTrackerCV:
         self._lock_static_streak = 0
         self._lock_fail_streak = 0
         self._recent_action_vecs.clear()
+        self._dbg_template_candidates_full = []
 
         self._reacq_expand_until = float(now) + float(self.cfg.reacq_expand_sec)
         self._respawn_mode_until = float(now) + float(self.cfg.respawn_mode_sec)
@@ -515,6 +599,7 @@ class ReimuTrackerCV:
 
             if self.locked and self.lock_bbox is not None:
                 self._dbg_candidates_full = []
+                self._dbg_template_candidates_full = []
                 self._dbg_lock_cand_full = None
                 self._dbg_fg_roi = None
                 self._dbg_roi_xyxy = None
@@ -552,15 +637,21 @@ class ReimuTrackerCV:
 
         cands_roi, fg = self._detect_candidates_roi(roi)
         self._dbg_fg_roi = fg
+        tmpl_roi = self._detect_template_candidates_roi(roi)
 
         self._dbg_candidates_full = []
         for (bx, by, bw, bh) in cands_roi:
             self._dbg_candidates_full.append(_clamp_bbox((x0 + bx, y0 + by, bw, bh), W, H))
         if len(self._dbg_candidates_full) > int(self.cfg.debug_max_candidates):
             self._dbg_candidates_full = self._dbg_candidates_full[: int(self.cfg.debug_max_candidates)]
+        self._dbg_template_candidates_full = []
+        for (bx, by, bw, bh) in tmpl_roi:
+            self._dbg_template_candidates_full.append(_clamp_bbox((x0 + bx, y0 + by, bw, bh), W, H))
+        if len(self._dbg_template_candidates_full) > int(self.cfg.debug_max_candidates):
+            self._dbg_template_candidates_full = self._dbg_template_candidates_full[: int(self.cfg.debug_max_candidates)]
 
         self._update_tracks(cands_roi, now)
-        lock_roi_bbox = self._pick_lock_candidate(now, roi_h=(y1 - y0))
+        lock_roi_bbox = self._pick_lock_candidate(now, roi_h=(y1 - y0), tmpl_roi=tmpl_roi)
 
         if lock_roi_bbox is None:
             self._dbg_lock_cand_full = None
@@ -710,9 +801,12 @@ class ReimuTrackerCV:
             )
             self._next_id += 1
 
-    def _pick_lock_candidate(self, now: float, roi_h: int) -> Optional[BBox]:
+    def _pick_lock_candidate(self, now: float, roi_h: int, tmpl_roi: Optional[List[BBox]] = None) -> Optional[BBox]:
         best: Optional[BBox] = None
         best_score = -1.0
+        tmpl_roi = tmpl_roi or []
+        use_gate = bool(self.cfg.template_gate_enable)
+        iou_thr = float(max(0.0, self.cfg.template_match_iou_thr))
 
         in_respawn = bool(float(now) <= float(self._respawn_mode_until))
         hold = float(self.cfg.respawn_lock_hold_sec if in_respawn else self.cfg.lock_hold_sec)
@@ -741,6 +835,14 @@ class ReimuTrackerCV:
                     continue
 
             b_last = pts[-1][3]
+            if use_gate:
+                ok_match = False
+                for tb in tmpl_roi:
+                    if _bbox_iou(b_last, tb) >= iou_thr:
+                        ok_match = True
+                        break
+                if not ok_match:
+                    continue
             cy_last = float(pts[-1][2])
 
             score = (t1 - t0) * 10.0 + (b_last[2] * b_last[3]) * 0.001
