@@ -253,7 +253,10 @@ class ObsBuilder:
 
     def on_player_death(self):
         try:
-            self.tracker.reset()
+            if hasattr(self.tracker, "on_player_death"):
+                self.tracker.on_player_death()
+            else:
+                self.tracker.reset()
         except Exception:
             pass
         # Clear player state immediately so stale marker/debug does not linger.

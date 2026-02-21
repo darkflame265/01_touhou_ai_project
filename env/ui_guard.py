@@ -91,3 +91,21 @@ class UIGuard:
 
         # ✅ stabilize
         return self._stabilize_lives(v)
+
+    def ui_lives_raw(self, img_bgr, ui_panel_ok: bool):
+        """
+        Raw lives count without stabilization.
+        Used for immediate drop-trigger handling.
+        """
+        if not ui_panel_ok:
+            return None
+        try:
+            v = count_lives_from_img(img_bgr, debug=False)
+        except Exception:
+            return None
+        if v is None or (not isinstance(v, (int, np.integer))):
+            return None
+        v = int(v)
+        if v < 0 or v > 12:
+            return None
+        return v

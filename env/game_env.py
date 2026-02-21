@@ -153,6 +153,7 @@ class GameEnv:
 
         self.s.lives = 3
         self.s.prev_ui_lives = None
+        self.s.prev_ui_lives_raw = None
         self.s.last_hit_time = 0.0
         self.s.slow_streak = 0
         self.s.step_i = 0
@@ -183,7 +184,9 @@ class GameEnv:
 
         ui_ok = self.screen.ui_panel_present(img, gray=g)
         ui_lives = self.ui.ui_lives_safe(img, ui_ok)
+        ui_lives_raw = self.ui.ui_lives_raw(img, ui_ok)
         self.reward_engine.reset(ui_lives)
+        self.s.prev_ui_lives_raw = ui_lives_raw
 
         if hasattr(self.obs, "reset"):
             self.obs.reset()
@@ -412,6 +415,24 @@ class GameEnv:
                     and int(ui_peek) < int(prev_ui)
                 ):
                     self._safe_reset_tracker()
+            except Exception:
+                pass
+
+            # Raw UI drop path: immediate tracker cancel/reacquire trigger.
+            try:
+                ui_raw = self.ui.ui_lives_raw(img, ui_ok)
+            except Exception:
+                ui_raw = None
+            try:
+                prev_raw = getattr(self.s, "prev_ui_lives_raw", None)
+                if (
+                    ui_raw is not None
+                    and prev_raw is not None
+                    and int(ui_raw) < int(prev_raw)
+                ):
+                    self._safe_reset_tracker()
+                if ui_raw is not None:
+                    self.s.prev_ui_lives_raw = int(ui_raw)
             except Exception:
                 pass
 

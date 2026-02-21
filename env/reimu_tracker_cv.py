@@ -112,8 +112,8 @@ class TrackerConfig:
     lock_static_min_frames: int = 4
 
     # CSRT update 실패 시에도 재탐색 트리거
-    unlock_on_csrt_fail: bool = False
-    unlock_fail_consecutive: int = 6
+    unlock_on_csrt_fail: bool = True
+    unlock_fail_consecutive: int = 3
 
 
     # =========================
@@ -141,6 +141,24 @@ class TrackerConfig:
     respawn_min_track_points: int = 2
     respawn_disable_smooth_reject: bool = True
     respawn_y_prior_weight: float = 0.55
+    # After player-death reset, keep tracker blind briefly to avoid locking burst items.
+    death_reacq_blind_sec: float = 0.5
+    # After blind, temporarily lock only near expected respawn zone.
+    death_reacq_center_gate_sec: float = 1.2
+    death_reacq_center_x_norm: float = 0.50
+    death_reacq_center_y_norm: float = 0.72
+    death_reacq_center_radius_px: float = 140.0
+    # Reacquire focus: search lower region first after death.
+    death_reacq_focus_sec: float = 1.2
+    death_reacq_focus_top_ratio: float = 0.52
+    # Shape-profile gate after death: accept only candidates similar to learned Reimu bbox.
+    death_reacq_shape_gate_sec: float = 2.0
+    shape_profile_ema_alpha: float = 0.18
+    shape_gate_aspect_tol: float = 0.28
+    shape_gate_area_ratio_min: float = 0.60
+    shape_gate_area_ratio_max: float = 2.00
+    shape_gate_h_ratio_min: float = 0.75
+    shape_gate_h_ratio_max: float = 1.35
 
 
 def _clamp_bbox(b: BBox, W: int, H: int) -> BBox:
@@ -319,6 +337,11 @@ class ReimuTrackerCV:
 
         self._reacq_expand_until: float = 0.0
         self._respawn_mode_until: float = 0.0
+        self._death_blind_until: float = 0.0
+        self._death_center_gate_until: float = 0.0
+        self._death_shape_gate_until: float = 0.0
+        self._death_focus_until: float = 0.0
+        self._shape_ref: Optional[Dict[str, float]] = None
 
         self._dbg_roi_xyxy: Optional[Tuple[int, int, int, int]] = None
         self._dbg_candidates_full: List[BBox] = []
@@ -350,6 +373,10 @@ class ReimuTrackerCV:
         self._lock_fail_streak = 0
         self._reacq_expand_until = 0.0
         self._respawn_mode_until = time.time() + float(self.cfg.respawn_mode_sec)
+        self._death_blind_until = 0.0
+        self._death_center_gate_until = 0.0
+        self._death_shape_gate_until = 0.0
+        self._death_focus_until = 0.0
 
         self._dbg_roi_xyxy = None
         self._dbg_candidates_full = []
@@ -369,9 +396,24 @@ class ReimuTrackerCV:
             "locked": bool(self.locked),
             "reacq_expand_until": float(self._reacq_expand_until),
             "respawn_mode_until": float(self._respawn_mode_until),
+            "death_blind_until": float(self._death_blind_until),
+            "death_center_gate_until": float(self._death_center_gate_until),
+            "death_shape_gate_until": float(self._death_shape_gate_until),
+            "death_focus_until": float(self._death_focus_until),
+            "shape_ref": dict(self._shape_ref) if self._shape_ref is not None else None,
             "action_verify_ratio": float(self._dbg_action_verify_ratio),
             "action_verify_pairs": int(self._dbg_action_verify_pairs),
         }
+
+    def on_player_death(self, now: Optional[float] = None) -> None:
+        if now is None:
+            now = time.time()
+        now = float(now)
+        self._force_unlock_and_reacq(now)
+        self._death_blind_until = float(now) + float(max(0.0, self.cfg.death_reacq_blind_sec))
+        self._death_center_gate_until = self._death_blind_until + float(max(0.0, self.cfg.death_reacq_center_gate_sec))
+        self._death_shape_gate_until = self._death_blind_until + float(max(0.0, self.cfg.death_reacq_shape_gate_sec))
+        self._death_focus_until = self._death_blind_until + float(max(0.0, self.cfg.death_reacq_focus_sec))
 
     def _force_unlock_and_reacq(self, now: float):
         self._csrt = None
@@ -406,6 +448,47 @@ class ReimuTrackerCV:
             self._recent_action_vecs.append(None)
             return
         self._recent_action_vecs.append((ax / n, ay / n))
+
+    def _update_shape_profile(self, bbox: BBox) -> None:
+        x, y, w, h = map(int, bbox)
+        _ = x, y
+        if w <= 0 or h <= 0:
+            return
+        a = float(max(1e-3, self.cfg.shape_profile_ema_alpha))
+        area = float(w * h)
+        aspect = float(w) / float(max(1, h))
+        hval = float(h)
+        if self._shape_ref is None:
+            self._shape_ref = {"area": area, "aspect": aspect, "h": hval}
+            return
+        self._shape_ref["area"] = (1.0 - a) * float(self._shape_ref["area"]) + a * area
+        self._shape_ref["aspect"] = (1.0 - a) * float(self._shape_ref["aspect"]) + a * aspect
+        self._shape_ref["h"] = (1.0 - a) * float(self._shape_ref["h"]) + a * hval
+
+    def _shape_profile_accept(self, bbox: BBox) -> bool:
+        if self._shape_ref is None:
+            return True
+        _, _, w, h = map(int, bbox)
+        if w <= 0 or h <= 0:
+            return False
+        area = float(w * h)
+        aspect = float(w) / float(max(1, h))
+        hval = float(h)
+        ref_area = float(max(1.0, self._shape_ref.get("area", area)))
+        ref_aspect = float(max(1e-6, self._shape_ref.get("aspect", aspect)))
+        ref_h = float(max(1.0, self._shape_ref.get("h", hval)))
+
+        aratio = area / ref_area
+        hratio = hval / ref_h
+        aspect_diff = abs(aspect - ref_aspect)
+
+        if not (float(self.cfg.shape_gate_area_ratio_min) <= aratio <= float(self.cfg.shape_gate_area_ratio_max)):
+            return False
+        if not (float(self.cfg.shape_gate_h_ratio_min) <= hratio <= float(self.cfg.shape_gate_h_ratio_max)):
+            return False
+        if aspect_diff > float(self.cfg.shape_gate_aspect_tol):
+            return False
+        return True
 
     def _action_motion_match_ratio(self, pts: List[Tuple[float, float, float, BBox]]) -> Tuple[float, int]:
         m = len(pts) - 1
@@ -461,6 +544,14 @@ class ReimuTrackerCV:
             now = time.time()
         now = float(now)
 
+        # Temporary blind window after death reset to skip burst item frames.
+        if now < float(self._death_blind_until):
+            self._dbg_candidates_full = []
+            self._dbg_lock_cand_full = None
+            self._dbg_fg_roi = None
+            self._dbg_roi_xyxy = None
+            return None, 0.0
+
         # =========================
         # LOCK
         # =========================
@@ -485,6 +576,7 @@ class ReimuTrackerCV:
             else:
                 self._lock_fail_streak = 0
                 self.lock_bbox = _clamp_bbox(tuple(map(int, b)), W, H)
+                self._update_shape_profile(self.lock_bbox)
 
                 if bool(self.cfg.lock_static_unlock_enable):
                     cx, cy = _bbox_center(self.lock_bbox)
@@ -542,6 +634,13 @@ class ReimuTrackerCV:
                 bottom_margin=int(self.cfg.roi_bottom_margin),
             )
 
+        # Right after death, bias detection to lower playfield region.
+        if now < float(self._death_focus_until):
+            focus_top = int(np.clip(float(H) * float(self.cfg.death_reacq_focus_top_ratio), 0, H - 1))
+            y0 = max(y0, focus_top)
+            if y1 <= y0:
+                y1 = min(H, y0 + 1)
+
         self._dbg_roi_xyxy = (x0, y0, x1, y1)
 
         roi = frame_bgr[y0:y1, x0:x1]
@@ -560,7 +659,7 @@ class ReimuTrackerCV:
             self._dbg_candidates_full = self._dbg_candidates_full[: int(self.cfg.debug_max_candidates)]
 
         self._update_tracks(cands_roi, now)
-        lock_roi_bbox = self._pick_lock_candidate(now, roi_h=(y1 - y0))
+        lock_roi_bbox = self._pick_lock_candidate(now, roi_h=(y1 - y0), roi_w=(x1 - x0))
 
         if lock_roi_bbox is None:
             self._dbg_lock_cand_full = None
@@ -600,6 +699,7 @@ class ReimuTrackerCV:
         self._csrt = trk
         self.locked = True
         self.lock_bbox = cand_full
+        self._update_shape_profile(self.lock_bbox)
 
         cx, cy = _bbox_center(self.lock_bbox)
         self._lock_last_center = (float(cx), float(cy))
@@ -710,11 +810,13 @@ class ReimuTrackerCV:
             )
             self._next_id += 1
 
-    def _pick_lock_candidate(self, now: float, roi_h: int) -> Optional[BBox]:
+    def _pick_lock_candidate(self, now: float, roi_h: int, roi_w: int) -> Optional[BBox]:
         best: Optional[BBox] = None
         best_score = -1.0
 
         in_respawn = bool(float(now) <= float(self._respawn_mode_until))
+        in_center_gate = bool(float(now) <= float(self._death_center_gate_until))
+        in_shape_gate = bool(float(now) <= float(self._death_shape_gate_until))
         hold = float(self.cfg.respawn_lock_hold_sec if in_respawn else self.cfg.lock_hold_sec)
         y_w = float(self.cfg.respawn_y_prior_weight if in_respawn else self.cfg.lock_y_prior_weight)
         use_smooth_reject = bool((not self.cfg.respawn_disable_smooth_reject) if in_respawn else self.cfg.reject_smooth_bg)
@@ -741,7 +843,20 @@ class ReimuTrackerCV:
                     continue
 
             b_last = pts[-1][3]
+            if in_shape_gate and (self._shape_ref is not None):
+                if not self._shape_profile_accept(b_last):
+                    continue
             cy_last = float(pts[-1][2])
+            cx_last = float(pts[-1][1])
+
+            if in_center_gate and roi_w > 0 and roi_h > 0:
+                tx = float(np.clip(self.cfg.death_reacq_center_x_norm, 0.0, 1.0)) * float(roi_w)
+                ty = float(np.clip(self.cfg.death_reacq_center_y_norm, 0.0, 1.0)) * float(roi_h)
+                rr = float(max(1.0, self.cfg.death_reacq_center_radius_px))
+                dx = cx_last - tx
+                dy = cy_last - ty
+                if (dx * dx + dy * dy) > (rr * rr):
+                    continue
 
             score = (t1 - t0) * 10.0 + (b_last[2] * b_last[3]) * 0.001
 

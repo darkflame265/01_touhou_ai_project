@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 class EnvState:
     lives: int = 3
     prev_ui_lives: int | None = None
+    prev_ui_lives_raw: int | None = None
     last_hit_time: float = 0.0
     hit_cooldown: float = 0.6
 
