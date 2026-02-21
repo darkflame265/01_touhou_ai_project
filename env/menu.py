@@ -9,6 +9,7 @@ import cv2
 import numpy as np
 
 from env.screen import find_touhou_window
+from ppo_runner.hotkeys import esc_pressed
 
 # =========================
 # WinAPI SendInput (FULL STRUCT)
@@ -128,6 +129,13 @@ def _match_template(gray: np.ndarray, tmpl: np.ndarray) -> float:
     return float(res.max())
 
 
+def _abort_requested() -> bool:
+    try:
+        return bool(esc_pressed())
+    except Exception:
+        return False
+
+
 # =========================
 # Focus helper
 # =========================
@@ -189,6 +197,8 @@ def focus_touhou_window(max_try: int = 5, sleep: float = 0.05) -> bool:
         return GetForegroundWindow() == hwnd
 
     for _ in range(max_try):
+        if _abort_requested():
+            return False
         try:
             win32gui.ShowWindow(hwnd, SW_RESTORE)
         except Exception:
@@ -411,6 +421,9 @@ def enter_practice_from_cursor():
 
     t0 = time.time()
     for i in range(6):
+        if _abort_requested():
+            print("[MENU][STOP] abort requested during practice entry")
+            return
         tap_scancode(SC_Z, label=f"Z{i+1}/6", press=0.02, gap=0.02)
         time.sleep(0.7)
     dt = time.time() - t0
@@ -428,6 +441,9 @@ def recover_from_score_to_lobby(screen, max_sec=3.0) -> bool:
     z_sent = False
 
     while (time.time() - t0) < max_sec:
+        if _abort_requested():
+            print("[MENU][STOP] abort requested during score recovery")
+            return False
         img = screen.capture()
         try:
             if not screen.is_score_screen(img):
@@ -478,6 +494,9 @@ def recover_to_lobby(
     cycles = 0
 
     while (time.time() - t0) < max_sec:
+        if _abort_requested():
+            print("[MENU][STOP] abort requested during lobby recovery")
+            return False
         img = screen.capture()
         st = detect_location(screen, img=img, need_selected=False)
         state = st.get("state")
@@ -494,6 +513,9 @@ def recover_to_lobby(
 
         # OTHER: X burst
         for i in range(other_x_presses):
+            if _abort_requested():
+                print("[MENU][STOP] abort requested during OTHER->LOBBY inputs")
+                return False
             tap_scancode(SC_X, label=f"X(back){cycles}-{i+1}", press=0.02, gap=0.02)
             time.sleep(other_x_interval)
 
@@ -524,6 +546,9 @@ def ensure_practice_cursor_from_lobby(screen, verify=True, max_try=3) -> bool:
         return False
 
     for attempt in range(max_try):
+        if _abort_requested():
+            print("[MENU][STOP] abort requested during cursor align")
+            return False
         img0 = screen.capture()
         st = detect_location(screen, img=img0, need_selected=False)
         if st.get("state") != "LOBBY":
@@ -534,6 +559,9 @@ def ensure_practice_cursor_from_lobby(screen, verify=True, max_try=3) -> bool:
         time.sleep(0.25)
 
         for i in range(5):
+            if _abort_requested():
+                print("[MENU][STOP] abort requested during cursor align inputs")
+                return False
             tap_scancode(SC_UP, extended=True, label=f"UP{i+1}/5", press=0.02, gap=0.02)
             time.sleep(0.12)
 
@@ -563,15 +591,24 @@ def boot_into_practice(screen, max_sec_lobby: float = 10.0) -> bool:
       3) enter_practice_from_cursor()
     """
     print("[MENU][BOOT2] start -> make LOBBY then enter PRACTICE")
+    if _abort_requested():
+        print("[MENU][STOP] abort requested before boot")
+        raise KeyboardInterrupt("ESC/P pressed in menu")
 
     ok = recover_to_lobby(screen, max_sec=max_sec_lobby)
     if not ok:
+        if _abort_requested():
+            raise KeyboardInterrupt("ESC/P pressed in menu")
         print("[MENU][BOOT2] failed: cannot recover to lobby")
         return False
 
     ok = ensure_practice_cursor_from_lobby(screen, verify=True, max_try=3)
     if not ok:
         print("[MENU][BOOT2] failed: cannot align practice cursor (continue anyway)")
+        if _abort_requested():
+            raise KeyboardInterrupt("ESC/P pressed in menu")
 
     enter_practice_from_cursor()
+    if _abort_requested():
+        raise KeyboardInterrupt("ESC/P pressed in menu")
     return True

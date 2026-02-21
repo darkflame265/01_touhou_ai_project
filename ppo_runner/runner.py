@@ -778,6 +778,9 @@ def run(
             if (not use_sim) and (ep < int(episodes)):
                 time.sleep(0.02)
 
+    except KeyboardInterrupt:
+        stop_requested = True
+        print("[STOP] ESC/P pressed during menu prep -> stopping.")
     finally:
         cleanup_inputs_on_exit()
         if not no_render:
