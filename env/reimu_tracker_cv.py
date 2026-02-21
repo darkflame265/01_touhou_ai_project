@@ -109,7 +109,7 @@ class TrackerConfig:
     # LOCK 상태 이상 감지: 1초간 위치가 거의 안 변하면 재탐색
     lock_static_unlock_enable: bool = True
     lock_static_sec: float = 2.0
-    lock_static_move_thr_px: float = 2.0
+    lock_static_move_thr_px: float = 6.0
     lock_static_min_frames: int = 4
 
     # CSRT update 실패 시에도 재탐색 트리거

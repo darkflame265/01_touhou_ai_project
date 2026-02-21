@@ -51,9 +51,11 @@ class ObsBuilder:
 
         # tracker (full-frame)
         self.tracker = ReimuTrackerCV()
-        self.last_xy_norm: Tuple[float, float] = (0.5, 0.78)
+        default_cx = int(np.clip((self._x0 + self._x1) // 2, 0, self.W - 1))
+        default_cy = int(np.clip(int(self.H * 0.78), 0, self.H - 1))
+        self.last_xy_norm: Tuple[float, float] = self._xy_norm(default_cx, default_cy)
         self.last_conf: float = 0.0
-        self.player_center: Tuple[int, int] = (self.W // 2, int(self.H * 0.78))
+        self.player_center: Tuple[int, int] = (default_cx, default_cy)
         self._uv = (self.s // 2, self.s // 2)
 
         # meta/marker (ch0 only)
@@ -129,8 +131,10 @@ class ObsBuilder:
         except Exception:
             pass
 
-        self.player_center = (self.W // 2, int(self.H * 0.78))
-        self.last_xy_norm = (0.5, 0.78)
+        default_cx = int(np.clip((self._x0 + self._x1) // 2, 0, self.W - 1))
+        default_cy = int(np.clip(int(self.H * 0.78), 0, self.H - 1))
+        self.player_center = (default_cx, default_cy)
+        self.last_xy_norm = self._xy_norm(default_cx, default_cy)
         self.last_conf = 0.0
         self._uv = (self.s // 2, self.s // 2)
 
@@ -254,8 +258,10 @@ class ObsBuilder:
             pass
         # Clear player state immediately so stale marker/debug does not linger.
         self.last_conf = 0.0
-        self.last_xy_norm = (0.5, 0.78)
-        self.player_center = (self.W // 2, int(self.H * 0.78))
+        default_cx = int(np.clip((self._x0 + self._x1) // 2, 0, self.W - 1))
+        default_cy = int(np.clip(int(self.H * 0.78), 0, self.H - 1))
+        self.last_xy_norm = self._xy_norm(default_cx, default_cy)
+        self.player_center = (default_cx, default_cy)
         self._update_uv()
         # Also clear bullet tracker debug/state bound to previous player anchor.
         try:
@@ -484,6 +490,7 @@ class ObsBuilder:
             pf,
             player_center_roi=player_center_pf,
             player_bbox_roi=bbox_pf,
+            player_locked=bool(getattr(self.tracker, "locked", False)),
         )
 
         bul_norm: List[Tuple[float, float]] = []

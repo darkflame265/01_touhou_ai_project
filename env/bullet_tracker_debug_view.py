@@ -122,8 +122,9 @@ class BulletTrackerDebugView:
             vis = self._overlay_occ_grid(vis, np.asarray(occ))
 
         if bool(self.cfg.show_player_hitbox):
+            p_locked = bool(dbg.get("player_locked", True))
             pc = dbg.get("player_center_roi", None)
-            if pc is not None:
+            if p_locked and pc is not None:
                 px, py = map(int, pc)
                 cv2.circle(
                     vis,

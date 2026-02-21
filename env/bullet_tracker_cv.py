@@ -946,6 +946,7 @@ class BulletTrackerCV:
         roi_bgr: np.ndarray,
         player_center_roi: Optional[Tuple[int, int]] = None,
         player_bbox_roi: Optional[BBox] = None,
+        player_locked: bool = True,
     ) -> List[Pt]:
         roi_bgr = ensure_uint8_bgr(roi_bgr)
         h, w = roi_bgr.shape[:2]
@@ -1079,6 +1080,7 @@ class BulletTrackerCV:
             "near_hold_n": int(len(self._near_hold)),
             "reject_track_total": int(rej_track_slow + rej_track_up + rej_new_near + rej_player_attached),
             "player_center_roi": player_center_roi,
+            "player_locked": bool(player_locked),
             "K": K,
         }
         return topk
