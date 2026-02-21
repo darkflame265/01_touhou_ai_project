@@ -106,13 +106,14 @@ class TrackerConfig:
     debug_max_candidates: int = 80
 
     # LOCK 상태 이상 감지: 1초간 위치가 거의 안 변하면 재탐색
+    lock_static_unlock_enable: bool = False
     lock_static_sec: float = 1.0
     lock_static_move_thr_px: float = 2.0
     lock_static_min_frames: int = 4
 
     # CSRT update 실패 시에도 재탐색 트리거
     unlock_on_csrt_fail: bool = True
-    unlock_fail_consecutive: int = 3
+    unlock_fail_consecutive: int = 6
 
     # =========================
     # ✅ 배경 트랙 억제(LOCK 후보 선정용)
@@ -484,32 +485,33 @@ class ReimuTrackerCV:
                 self._lock_fail_streak = 0
                 self.lock_bbox = _clamp_bbox(tuple(map(int, b)), W, H)
 
-                cx, cy = _bbox_center(self.lock_bbox)
-                thr = float(self.cfg.lock_static_move_thr_px)
-                thr2 = thr * thr
-                if self._lock_last_center is None:
-                    self._lock_last_center = (cx, cy)
-                    self._lock_static_since = None
-                    self._lock_static_streak = 0
-                else:
-                    dx = float(cx - self._lock_last_center[0])
-                    dy = float(cy - self._lock_last_center[1])
-                    d2 = dx * dx + dy * dy
-
-                    if d2 <= thr2:
-                        self._lock_static_streak += 1
-                        if self._lock_static_since is None:
-                            self._lock_static_since = now
-                        else:
-                            if (
-                                (now - self._lock_static_since) >= float(self.cfg.lock_static_sec)
-                                and self._lock_static_streak >= int(max(1, self.cfg.lock_static_min_frames))
-                            ):
-                                self._force_unlock_and_reacq(now)
-                    else:
+                if bool(self.cfg.lock_static_unlock_enable):
+                    cx, cy = _bbox_center(self.lock_bbox)
+                    thr = float(self.cfg.lock_static_move_thr_px)
+                    thr2 = thr * thr
+                    if self._lock_last_center is None:
                         self._lock_last_center = (cx, cy)
                         self._lock_static_since = None
                         self._lock_static_streak = 0
+                    else:
+                        dx = float(cx - self._lock_last_center[0])
+                        dy = float(cy - self._lock_last_center[1])
+                        d2 = dx * dx + dy * dy
+
+                        if d2 <= thr2:
+                            self._lock_static_streak += 1
+                            if self._lock_static_since is None:
+                                self._lock_static_since = now
+                            else:
+                                if (
+                                    (now - self._lock_static_since) >= float(self.cfg.lock_static_sec)
+                                    and self._lock_static_streak >= int(max(1, self.cfg.lock_static_min_frames))
+                                ):
+                                    self._force_unlock_and_reacq(now)
+                        else:
+                            self._lock_last_center = (cx, cy)
+                            self._lock_static_since = None
+                            self._lock_static_streak = 0
 
             if self.locked and self.lock_bbox is not None:
                 self._dbg_candidates_full = []
