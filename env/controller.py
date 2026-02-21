@@ -98,7 +98,7 @@ def _send_scancode(scan: int, is_down: bool, extended: bool = False) -> bool:
 SCAN = {
     "z": (0x2C, False),     # Z
     "x": (0x2D, False),     # X (bomb)
-    #"shift": (0x2A, False), # LSHIFT
+    "shift": (0x2A, False), # LSHIFT
     "ctrl": (0x1D, False),  # LCTRL
     "left": (0x4B, True),
     "right": (0x4D, True),
@@ -114,17 +114,18 @@ MOVE_KEYS = {
     "RIGHT": "right",
     "UP": "up",
     "DOWN": "down",
-    #"SLOW": "shift",
-    "SLOW": "ctrl",
+    "SLOW": "shift",
 
 }
 
 # ---- internal state ----
 _HELD = set()
 _ATTACK_HOLD = True
+_ALWAYS_ATTACK = True
 
 # ✅ 항상 SLOW(Shift) 유지 모드
 _ALWAYS_SLOW = False
+_ALWAYS_CTRL = True
 
 
 # =========================
@@ -133,7 +134,7 @@ _ALWAYS_SLOW = False
 def set_attack_hold(enabled: bool):
     global _ATTACK_HOLD
     _ATTACK_HOLD = bool(enabled)
-    if not _ATTACK_HOLD:
+    if (not _ATTACK_HOLD) and (not _ALWAYS_ATTACK):
         _key_up(ATTACK_KEY)
 
 
@@ -149,6 +150,18 @@ def set_always_slow(enabled: bool):
         _key_down(slow_key)
     else:
         _key_up(slow_key)
+
+
+def set_always_ctrl(enabled: bool):
+    """
+    enabled=True면 Ctrl을 항상 누른 상태로 유지.
+    """
+    global _ALWAYS_CTRL
+    _ALWAYS_CTRL = bool(enabled)
+    if _ALWAYS_CTRL:
+        _key_down("ctrl")
+    else:
+        _key_up("ctrl")
 
 
 # =========================
@@ -197,7 +210,7 @@ def press_keys(action_keys):
         action_keys = [k for k in action_keys if k != "BOMB"]
 
     # 1) 공격키 유지
-    if _ATTACK_HOLD:
+    if _ALWAYS_ATTACK or _ATTACK_HOLD:
         _key_down(ATTACK_KEY)
     else:
         _key_up(ATTACK_KEY)
@@ -215,6 +228,11 @@ def press_keys(action_keys):
             _key_up(slow_key)
 
     # 3) 방향키 처리
+    if _ALWAYS_CTRL:
+        _key_down("ctrl")
+    else:
+        _key_up("ctrl")
+
     for name, key in MOVE_KEYS.items():
         if name == slow_name:
             continue
@@ -232,14 +250,16 @@ def release_all(force: bool = False):
       - ALWAYS_SLOW 무시
       - Shift 포함 전부 해제
     """
-    global _ALWAYS_SLOW
+    global _ALWAYS_SLOW, _ALWAYS_CTRL
 
     if force:
         _ALWAYS_SLOW = False
+        _ALWAYS_CTRL = False
 
     # 방향/슬로우 해제
     for _, key in MOVE_KEYS.items():
         _key_up(key)
+    _key_up("ctrl")
 
     # 공격 해제
     _key_up(ATTACK_KEY)
@@ -260,8 +280,9 @@ def cleanup_inputs_on_exit():
     - Shift 토글 탭(Down → Up)으로
       Windows 키 상태 꼬임을 물리적으로 복구
     """
-    global _ALWAYS_SLOW
+    global _ALWAYS_SLOW, _ALWAYS_CTRL
     _ALWAYS_SLOW = False
+    _ALWAYS_CTRL = False
 
     # 1) 논리적 해제
     release_all(force=True)
