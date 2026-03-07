@@ -749,6 +749,15 @@ def run(
                     break
                 continue
 
+            # Post-episode update: flush partial rollout buffer (handles short episodes)
+            if not aborted:
+                post_updates = 0
+                while agent.should_update():
+                    agent.update(last_state=state, last_done=True)
+                    post_updates += 1
+                if post_updates > 0:
+                    print(f"[PPO] post-episode updates={post_updates} {_ppo_debug_line(agent)}")
+
             ep_tag = f"({ep}/{episodes})"
             try:
                 with open(log_path, "a", encoding="utf-8") as f:

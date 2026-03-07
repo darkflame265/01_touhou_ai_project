@@ -179,6 +179,11 @@ class GameEnv:
         self.s.last_action_mask_img = img
 
         g = self.screen.gray(img)
+
+        # Reset obs trackers BEFORE make_state so MLP spatial vec is valid after reset
+        if hasattr(self.obs, "reset"):
+            self.obs.reset()
+
         state = self.obs.make_state(img, action_idx=getattr(self.s, "exec_action_idx", None))
         self.packer.reset_stack_fill(state)
 
@@ -187,9 +192,6 @@ class GameEnv:
         ui_lives_raw = self.ui.ui_lives_raw(img, ui_ok)
         self.reward_engine.reset(ui_lives)
         self.s.prev_ui_lives_raw = ui_lives_raw
-
-        if hasattr(self.obs, "reset"):
-            self.obs.reset()
 
         release_all()
         set_attack_hold(False)
